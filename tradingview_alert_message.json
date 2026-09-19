@@ -1,0 +1,6 @@
+{
+  "ticker": "{{ticker}}",
+  "signal": "{{strategy.order.action}}",
+  "price": "{{close}}",
+  "time": "{{time}}"
+}
