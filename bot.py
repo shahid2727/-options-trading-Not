@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from scanner import scan_symbols
 from telegram_bot import send_telegram
 from config import cfg
+from worker import start as start_scanner, status as scanner_status
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
@@ -15,7 +16,11 @@ def home():
 
 @app.get('/health')
 def health():
-    return jsonify(status='ok', service='options-opportunity-bot')
+    return jsonify(status='ok', service='options-opportunity-bot', scanner=scanner_status())
+
+@app.get('/status')
+def status():
+    return jsonify(scanner=scanner_status(), symbols=cfg.scan_symbols, interval_seconds=cfg.scan_interval_seconds)
 
 def format_alert(x, signal='ALERT'):
     return (f"🚨 OPTIONS OPPORTUNITY\n\n{x['symbol']} {x['contract']}\nSignal: {signal}\n"
@@ -48,6 +53,8 @@ def webhook():
     if results:
         send_telegram(format_alert(results[0], signal))
     return jsonify({'ticker': ticker, 'signal': signal, 'results': results})
+
+start_scanner()
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', '10000')))

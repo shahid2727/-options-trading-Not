@@ -3,6 +3,7 @@ services:
     name: options-opportunity-bot
     runtime: docker
     plan: free
+    healthCheckPath: /health
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
@@ -10,3 +11,19 @@ services:
         sync: false
       - key: TRADINGVIEW_WEBHOOK_SECRET
         sync: false
+      - key: RISK_BUDGET
+        value: "100"
+      - key: SCAN_INTERVAL_SECONDS
+        value: "300"
+      - key: SCAN_SYMBOLS
+        value: "SPY,QQQ,IWM,NVDA,AMD,TSLA,AAPL,AMZN,META,MSFT,GOOGL,MU,AVGO,PLTR,SMCI"
+      - key: MAX_ALERTS_PER_SCAN
+        value: "5"
+      - key: ALERT_COOLDOWN_MINUTES
+        value: "30"
+      - key: MIN_ALERT_SCORE
+        value: "7"
+      - key: MARKET_ONLY
+        value: "true"
+      - key: RUN_SCANNER
+        value: "true"

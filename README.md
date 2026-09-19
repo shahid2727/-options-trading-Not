@@ -1,62 +1,34 @@
-# Options Opportunity Bot V2
+# Options Opportunity Bot V5
 
-Alert/research bot for U.S. options. It screens option chains and produces a structured trade plan with **entry zone, stop-loss, TP1, TP2, TP3 and an exit-management plan**.
+Alert/research bot for U.S. options. It does **not** place brokerage orders.
 
-## Trade-plan logic
-
-For an option premium `P`:
-
-- Entry zone: `0.95P – 1.05P`
-- Stop-loss: `0.70P`
-- TP1: `1.50P`
-- TP2: `2.00P`
-- TP3: `3.00P`
-
-Exit management:
-
-1. At TP1, consider partial profit and move stop toward breakeven.
-2. At TP2, consider another partial profit and trail the remainder.
-3. At TP3, consider closing the remainder.
-4. If the stop-loss is hit, exit the position.
-5. Review/close before expiry rather than letting the contract expire by accident.
-
-These are configurable screening rules, not guarantees or investment advice. The bot does **not** place brokerage orders.
-
-## Local setup
-
-1. Install Python 3.11+
-2. Copy `.env.example` to `.env`
-3. Fill Telegram credentials if desired.
-4. `pip install -r requirements.txt`
-5. `python bot.py`
-6. Open `http://localhost:10000/health`
-
-## TradingView webhook
-
-URL: `https://YOUR-DOMAIN/webhook`
-
-Header: `X-Webhook-Secret: YOUR_SECRET`
-
-Example body:
-
-```json
-{"ticker":"NVDA","price":178.25,"signal":"BREAKOUT"}
-```
+## V5 additions
+- Automatic scanner loop during U.S. regular market hours.
+- Telegram alerts without requiring a TradingView webhook.
+- Configurable scan interval and ticker universe.
+- Alert de-duplication/cooldown.
+- `/health` and `/status` endpoints.
+- Existing entry, stop-loss, TP1/TP2/TP3, R:R and position-risk calculations.
+- TradingView webhook remains available.
 
 ## Render
+The Docker service runs Gunicorn with one worker. Keep one worker so the background scanner does not duplicate alerts.
 
-Push the folder to GitHub and create a Render Web Service from the repository, or use `render.yaml`.
+### Required environment variables
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
 
-## Next upgrades
+### Optional settings
+- `RISK_BUDGET=100`
+- `SCAN_INTERVAL_SECONDS=300` (5 minutes)
+- `SCAN_SYMBOLS=SPY,QQQ,...`
+- `MAX_ALERTS_PER_SCAN=5`
+- `ALERT_COOLDOWN_MINUTES=30`
+- `MIN_ALERT_SCORE=7`
+- `MARKET_ONLY=true`
 
-- Dedicated real-time options-data API instead of relying on Yahoo alone.
-- Underlying technical levels (support/resistance/ATR) to improve stops and exits.
-- Persistent database and signal outcome tracking.
-- Historical backtesting.
-- Dashboard.
-- Paper-trading execution.
-- Broker integration only after paper-trading validation.
+## Important limitation
+Render Free can sleep/stop idle services. Therefore V5's in-process scanner is automatic while the service is running, but **not a guaranteed 24/7 market scanner on the Free plan**. For continuous operation, use an always-on/paid service or a dedicated worker.
 
-
-## V4 trade plan
-Each alert includes an entry zone, option stop loss, underlying reference stop, TP1/TP2/TP3, expected profit per contract in dollars and percent, R:R, and a suggested whole-contract size based on `RISK_BUDGET`. The options multiplier of 100 is used for dollar P/L. These are screening/reference calculations, not guaranteed outcomes.
+## Data limitation
+The current scanner uses yfinance. Option Greeks such as delta may be unavailable from the feed; the risk module therefore uses a conservative proxy when needed. For production-grade real-time options scanning, replace the market-data layer with a dedicated options-data provider.

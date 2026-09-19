@@ -54,7 +54,7 @@ def scan_symbols(symbols):
                     for _,row in df.iterrows():
                         r=row.to_dict(); score,premium,spread,reasons=score_row(r)
                         vol=int(num(r.get('volume'))); oi=int(num(r.get('openInterest')))
-                        if not (premium>0 and vol>=cfg.min_volume and oi>=cfg.min_oi and cfg.min_premium<=premium<=cfg.max_premium and spread<=cfg.max_spread_pct): continue
+                        if not (premium>0 and vol>=cfg.min_volume and oi>=cfg.min_oi and cfg.min_premium<=premium<=cfg.max_premium and spread<=cfg.max_spread_pct and score>=cfg.min_score): continue
                         delta=num(r.get('delta'))
                         plan=build_trade_plan(premium,price,side,delta,atr,support,resistance)
                         out.append({
