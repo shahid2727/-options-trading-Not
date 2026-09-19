@@ -2,7 +2,7 @@ import os, logging
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from scanner import scan_symbols
-from telegram_bot import send_telegram, telegram_configured
+from telegram_bot import send_telegram, telegram_configured, send_test_message
 from config import cfg
 from worker import start as start_scanner, status as scanner_status
 
@@ -55,6 +55,13 @@ def webhook():
     return jsonify({'ticker': ticker, 'signal': signal, 'results': results})
 
 start_scanner()
+
+# One-time Telegram connectivity test on startup when explicitly enabled.
+if (os.getenv('TELEGRAM_TEST_ON_START') or '').strip().lower() in ('1', 'true', 'yes', 'on'):
+    if send_test_message():
+        logging.getLogger(__name__).info('Telegram startup test sent successfully')
+    else:
+        logging.getLogger(__name__).error('Telegram startup test failed')
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', '10000')))

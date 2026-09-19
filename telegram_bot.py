@@ -36,3 +36,12 @@ def send_telegram(text):
     except requests.RequestException as exc:
         log.error("Telegram send failed: %s", exc)
         return False
+
+
+def send_test_message():
+    """Send a harmless one-time connectivity test message."""
+    return send_telegram(
+        "✅ Telegram connection test successful\n\n"
+        "Options Opportunity Bot is connected and ready.\n"
+        "Alert mode only — no brokerage orders are executed."
+    )

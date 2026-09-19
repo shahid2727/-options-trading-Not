@@ -39,3 +39,12 @@ The current scanner uses yfinance. Option Greeks such as delta may be unavailabl
 - Logs only whether Telegram is configured; never logs the bot token.
 - Handles NaN/invalid option-chain values without aborting a symbol scan.
 - `/health` and `/status` expose a non-secret `telegram_configured` flag.
+
+
+### Telegram connectivity test
+
+To test Telegram immediately, add this Render environment variable temporarily:
+
+`TELEGRAM_TEST_ON_START=true`
+
+Deploy/restart the service. On startup it sends one test message to `TELEGRAM_CHAT_ID`. After receiving it, remove the variable or set it to `false`, then redeploy/restart.
