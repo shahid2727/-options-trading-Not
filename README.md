@@ -1,56 +1,49 @@
-# Options Opportunity Bot V5
+# Options Opportunity Bot V6
 
-Alert/research bot for U.S. options. It does **not** place brokerage orders.
+Alert/research bot for U.S. options. **It does not place brokerage orders.**
 
-## V5 additions
-- Automatic scanner loop during U.S. regular market hours.
-- Telegram alerts without requiring a TradingView webhook.
-- Configurable scan interval and ticker universe.
-- Alert de-duplication/cooldown.
-- `/health` and `/status` endpoints.
-- Existing entry, stop-loss, TP1/TP2/TP3, R:R and position-risk calculations.
-- TradingView webhook remains available.
+## V6 features
+- Automatic scan every 5 minutes while the Render service is running.
+- Option quality scoring on a 0–100 scale.
+- Underlying 5-day and 20-day momentum.
+- Volume-ratio / volume-surge detection.
+- 20-day breakout proximity for calls and puts.
+- Liquidity filters: volume, OI, premium and spread.
+- Entry zone, stop loss, TP1/TP2/TP3, R:R and risk-budget sizing.
+- Telegram alerts with deduplication/cooldown.
+- Manual `/scan?secret=...` endpoint.
+- `/health`, `/status`, `/telegram-test`.
+- TradingView `/webhook` remains available.
+- Telegram API errors are now returned safely without exposing the bot token.
 
-## Render
-The Docker service runs Gunicorn with one worker. Keep one worker so the background scanner does not duplicate alerts.
-
-### Required environment variables
+## Render environment
+Required:
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 
-### Optional settings
+Recommended:
+- `TELEGRAM_TEST_SECRET` (temporary; remove after testing)
 - `RISK_BUDGET=100`
-- `SCAN_INTERVAL_SECONDS=300` (5 minutes)
-- `SCAN_SYMBOLS=SPY,QQQ,...`
+- `SCAN_INTERVAL_SECONDS=300`
 - `MAX_ALERTS_PER_SCAN=5`
 - `ALERT_COOLDOWN_MINUTES=30`
 - `MIN_ALERT_SCORE=7`
 - `MARKET_ONLY=true`
+- `RUN_SCANNER=true`
 
-## Important limitation
-Render Free can sleep/stop idle services. Therefore V5's in-process scanner is automatic while the service is running, but **not a guaranteed 24/7 market scanner on the Free plan**. For continuous operation, use an always-on/paid service or a dedicated worker.
+## Test Telegram
+Open:
+`https://YOUR-SERVICE.onrender.com/telegram-test?secret=YOUR_TELEGRAM_TEST_SECRET`
 
-## Data limitation
-The current scanner uses yfinance. Option Greeks such as delta may be unavailable from the feed; the risk module therefore uses a conservative proxy when needed. For production-grade real-time options scanning, replace the market-data layer with a dedicated options-data provider.
+A successful response contains `"ok": true` and sends a test message.
 
+## Manual scan
+Open:
+`https://YOUR-SERVICE.onrender.com/scan?secret=YOUR_TELEGRAM_TEST_SECRET`
 
-## V5.1 fixes
-- Reads Telegram credentials directly from Render environment variables at send time.
-- Logs only whether Telegram is configured; never logs the bot token.
-- Handles NaN/invalid option-chain values without aborting a symbol scan.
-- `/health` and `/status` expose a non-secret `telegram_configured` flag.
+This forces a scan and also sends the top candidates through Telegram.
 
-
-### Telegram connectivity test
-
-To test Telegram immediately, add this Render environment variable temporarily:
-
-`TELEGRAM_TEST_ON_START=true`
-
-Deploy/restart the service. On startup it sends one test message to `TELEGRAM_CHAT_ID`. After receiving it, remove the variable or set it to `false`, then redeploy/restart.
-
-
-### Telegram manual test (V5.3)
-Set `TELEGRAM_TEST_SECRET` in Render to a temporary secret (or reuse `TRADINGVIEW_WEBHOOK_SECRET`). After deploy, open:
-`https://YOUR-SERVICE.onrender.com/telegram-test?secret=YOUR_SECRET`
-A successful response is JSON with `"ok": true`, and the bot sends a test message to the configured chat. Remove `TELEGRAM_TEST_SECRET` after testing if it was added only for this test. Never put the bot token in the URL.
+## Important limitations
+- Render Free can sleep/stop idle services, so the in-process scanner is not guaranteed to run continuously 24/7.
+- yfinance is not a dedicated real-time options feed. Greeks such as delta may be unavailable.
+- Alerts are research signals, not guarantees of profit and not automatic trade execution.

@@ -2,9 +2,9 @@ import os, logging
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from scanner import scan_symbols
-from telegram_bot import send_telegram, telegram_configured, send_test_message, telegram_config
+from telegram_bot import send_telegram, telegram_configured, telegram_config
 from config import cfg
-from worker import start as start_scanner, status as scanner_status
+from worker import start as start_scanner, status as scanner_status, run_once, format_alert
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
@@ -22,6 +22,15 @@ def health():
 def status():
     return jsonify(scanner=scanner_status(), symbols=cfg.scan_symbols, interval_seconds=cfg.scan_interval_seconds, telegram_configured=telegram_configured())
 
+@app.get('/scan')
+def manual_scan():
+    configured_secret = os.getenv('TELEGRAM_TEST_SECRET', '').strip() or cfg.webhook_secret
+    supplied = request.headers.get('X-Webhook-Secret', '').strip() or request.args.get('secret', '').strip()
+    if configured_secret and supplied != configured_secret:
+        return jsonify(ok=False, error='unauthorized'), 401
+    results = run_once(force=True)
+    return jsonify(ok=True, count=len(results), results=results[:cfg.max_alerts_per_scan])
+
 @app.get('/telegram-test')
 def telegram_test():
     """Send a Telegram test message. Requires TRADINGVIEW_WEBHOOK_SECRET or TELEGRAM_TEST_SECRET."""
@@ -37,12 +46,12 @@ def telegram_test():
     if not token or not chat_id:
         return jsonify(ok=False, configured=False, error='missing Telegram environment variables'), 503
 
-    ok = send_test_message()
+    ok, err = send_telegram('✅ Telegram connection test successful\n\nOptions Opportunity Bot V6 is connected and ready.\nAlert/research mode only — no brokerage orders are executed.', return_error=True)
     if ok:
         logging.getLogger(__name__).info('Telegram manual test sent successfully')
         return jsonify(ok=True, configured=True, message='Telegram test message sent successfully')
-    logging.getLogger(__name__).error('Telegram manual test failed')
-    return jsonify(ok=False, configured=True, error='Telegram API send failed; check Render logs for the exact API error'), 502
+    logging.getLogger(__name__).error('Telegram manual test failed: %s', err)
+    return jsonify(ok=False, configured=True, error=err), 502
 
 def format_alert(x, signal='ALERT'):
     return (f"🚨 OPTIONS OPPORTUNITY\n\n{x['symbol']} {x['contract']}\nSignal: {signal}\n"
