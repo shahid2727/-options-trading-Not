@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 from config import cfg
 from scanner import scan_symbols
-from telegram_bot import send_telegram
+from telegram_bot import send_telegram, telegram_configured
 
 log = logging.getLogger(__name__)
 NY = ZoneInfo('America/New_York')
@@ -82,11 +82,12 @@ def run_once():
 
 
 def status():
-    return {'running': _thread is not None and _thread.is_alive(), 'last_scan': _last_scan, 'last_error': _last_error}
+    return {'running': _thread is not None and _thread.is_alive(), 'last_scan': _last_scan, 'last_error': _last_error, 'telegram_configured': telegram_configured()}
 
 
 def _loop():
     log.info('Auto scanner started: every %ss; symbols=%s', cfg.scan_interval_seconds, ','.join(cfg.scan_symbols))
+    log.info('Telegram configured: %s', 'YES' if telegram_configured() else 'NO')
     while True:
         try:
             run_once()

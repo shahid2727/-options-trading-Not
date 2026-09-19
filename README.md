@@ -32,3 +32,10 @@ Render Free can sleep/stop idle services. Therefore V5's in-process scanner is a
 
 ## Data limitation
 The current scanner uses yfinance. Option Greeks such as delta may be unavailable from the feed; the risk module therefore uses a conservative proxy when needed. For production-grade real-time options scanning, replace the market-data layer with a dedicated options-data provider.
+
+
+## V5.1 fixes
+- Reads Telegram credentials directly from Render environment variables at send time.
+- Logs only whether Telegram is configured; never logs the bot token.
+- Handles NaN/invalid option-chain values without aborting a symbol scan.
+- `/health` and `/status` expose a non-secret `telegram_configured` flag.
