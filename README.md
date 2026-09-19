@@ -48,3 +48,9 @@ To test Telegram immediately, add this Render environment variable temporarily:
 `TELEGRAM_TEST_ON_START=true`
 
 Deploy/restart the service. On startup it sends one test message to `TELEGRAM_CHAT_ID`. After receiving it, remove the variable or set it to `false`, then redeploy/restart.
+
+
+### Telegram manual test (V5.3)
+Set `TELEGRAM_TEST_SECRET` in Render to a temporary secret (or reuse `TRADINGVIEW_WEBHOOK_SECRET`). After deploy, open:
+`https://YOUR-SERVICE.onrender.com/telegram-test?secret=YOUR_SECRET`
+A successful response is JSON with `"ok": true`, and the bot sends a test message to the configured chat. Remove `TELEGRAM_TEST_SECRET` after testing if it was added only for this test. Never put the bot token in the URL.

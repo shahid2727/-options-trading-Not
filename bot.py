@@ -2,7 +2,7 @@ import os, logging
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from scanner import scan_symbols
-from telegram_bot import send_telegram, telegram_configured, send_test_message
+from telegram_bot import send_telegram, telegram_configured, send_test_message, telegram_config
 from config import cfg
 from worker import start as start_scanner, status as scanner_status
 
@@ -21,6 +21,28 @@ def health():
 @app.get('/status')
 def status():
     return jsonify(scanner=scanner_status(), symbols=cfg.scan_symbols, interval_seconds=cfg.scan_interval_seconds, telegram_configured=telegram_configured())
+
+@app.get('/telegram-test')
+def telegram_test():
+    """Send a Telegram test message. Requires TRADINGVIEW_WEBHOOK_SECRET or TELEGRAM_TEST_SECRET."""
+    configured_secret = os.getenv('TELEGRAM_TEST_SECRET', '').strip() or cfg.webhook_secret
+    if not configured_secret:
+        return jsonify(ok=False, error='test secret is not configured'), 503
+
+    supplied = request.headers.get('X-Webhook-Secret', '').strip() or request.args.get('secret', '').strip()
+    if supplied != configured_secret:
+        return jsonify(ok=False, error='unauthorized'), 401
+
+    token, chat_id = telegram_config()
+    if not token or not chat_id:
+        return jsonify(ok=False, configured=False, error='missing Telegram environment variables'), 503
+
+    ok = send_test_message()
+    if ok:
+        logging.getLogger(__name__).info('Telegram manual test sent successfully')
+        return jsonify(ok=True, configured=True, message='Telegram test message sent successfully')
+    logging.getLogger(__name__).error('Telegram manual test failed')
+    return jsonify(ok=False, configured=True, error='Telegram API send failed; check Render logs for the exact API error'), 502
 
 def format_alert(x, signal='ALERT'):
     return (f"🚨 OPTIONS OPPORTUNITY\n\n{x['symbol']} {x['contract']}\nSignal: {signal}\n"
@@ -56,12 +78,6 @@ def webhook():
 
 start_scanner()
 
-# One-time Telegram connectivity test on startup when explicitly enabled.
-if (os.getenv('TELEGRAM_TEST_ON_START') or '').strip().lower() in ('1', 'true', 'yes', 'on'):
-    if send_test_message():
-        logging.getLogger(__name__).info('Telegram startup test sent successfully')
-    else:
-        logging.getLogger(__name__).error('Telegram startup test failed')
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', '10000')))
