@@ -37,7 +37,6 @@ def format_alert(x):
     return (f"{badge} | {x['signal']} | {x['symbol']} {x['contract']}\n"
             + upside_line +
             f"Market: {x['market_regime']} | 4H: {x['trend_4h']} | Confidence: {x['confidence']:.0f}%\n"
-            f"Market: {x['market_regime']} | 4H: {x['trend_4h']} | Confidence: {x['confidence']:.0f}%\n"
             f"Estimated target reach (model): TP1 {x['tp1_confidence']:.0f}% | TP2 {x['tp2_confidence']:.0f}% | TP3 {x['tp3_confidence']:.0f}%\n"
             f"Risk: {'LOW' if x['score']>=85 else 'MEDIUM'} | Score: {x['score']:.0f}/100 | ADX 4H: {x['adx_4h']:.1f}\n"
             f"Data: {x['data_mode']} options / IEX underlying | DTE: {x['dte']}\n\n"
@@ -178,7 +177,7 @@ def telegram_command_loop():
                             lines.append(f"{i}. {x['signal']} {x['symbol']} {x['contract']} | {x['confidence']:.0f}% | {x['market_regime']} | Entry ${x['entry_low']:.2f}-${x['entry_high']:.2f} | SL ${x['stop_loss']:.2f} | TP1 ${x['tp1']:.2f}")
                         send_message('\\n'.join(lines), chat_id)
                 else:
-                    send_message('الأوامر المتاحة: /status /scan /top /help', chat_id)
+                    send_message('الأوامر المتاحة: /status /scan /top /help\n\n/scan و /scan/status عبر الويب محميان بـ SCAN_SECRET، أما من Telegram فلا تحتاج Secret.', chat_id)
         except Exception:
             time.sleep(3)
 

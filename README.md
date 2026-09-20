@@ -19,3 +19,11 @@ Research/alert-only US options scanner. No automatic trading.
 4. Verify `/health`, then run `/scan` with your existing scan secret.
 
 No brokerage order execution is implemented.
+
+
+## V9.8 changes
+- Telegram `/status`, `/scan`, and `/top` are available to the configured admin chat without entering `SCAN_SECRET`.
+- `/scan` and `/scan/status` HTTP endpoints remain protected by `SCAN_SECRET`.
+- Public Telegram `/start`, `/help`, and `/privacy` remain available.
+- Removed a duplicated Market/4H line from opportunity alerts.
+- No brokerage order execution.
