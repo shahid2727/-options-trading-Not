@@ -18,3 +18,10 @@ See `.env.example`.
 `SCAN_SECRET` protects `/scan` and `/scan/status`.
 `TELEGRAM_TEST_SECRET` protects `/telegram-test`.
 Never commit real secrets.
+
+
+V8.1 additions:
+- Intraday 5-minute momentum/volume-surge/breakout detection during enabled sessions.
+- Nasdaq-100 index symbol NDX plus QQQ scanning.
+- Intraday candidates use a higher score threshold (INTRADAY_MIN_SCORE).
+- Intraday detection is based on underlying 5-minute data; option quote freshness depends on the yfinance data available.

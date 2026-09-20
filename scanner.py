@@ -2,10 +2,10 @@ import os, math, statistics
 from datetime import datetime, date
 import yfinance as yf
 
-SYMBOLS=[s.strip().upper() for s in os.getenv('SYMBOLS','SPY,QQQ,IWM,NVDA,AMD,TSLA,AAPL,AMZN,META,MSFT,GOOGL,MU,AVGO,PLTR,SMCI,SPXW').split(',') if s.strip()]
+SYMBOLS=[s.strip().upper() for s in os.getenv('SYMBOLS','SPY,QQQ,NDX,IWM,NVDA,AMD,TSLA,AAPL,AMZN,META,MSFT,GOOGL,MU,AVGO,PLTR,SMCI,SPXW').split(',') if s.strip()]
 RISK=float(os.getenv('RISK_BUDGET','100'))
 MIN_PREMIUM=float(os.getenv('MIN_PREMIUM','0.30')); MAX_PREMIUM=float(os.getenv('MAX_PREMIUM','2.00'))
-MIN_SCORE=float(os.getenv('MIN_SCORE','65')); MIN_OI=int(os.getenv('MIN_OI','100')); MIN_VOLUME=int(os.getenv('MIN_VOLUME','50')); MAX_SPREAD=float(os.getenv('MAX_SPREAD_PCT','15'))
+MIN_SCORE=float(os.getenv('MIN_SCORE','65')); INTRADAY_MIN_SCORE=float(os.getenv('INTRADAY_MIN_SCORE','70')); INTRADAY_ENABLED=os.getenv('INTRADAY_ENABLED','true').lower()=='true'; MIN_OI=int(os.getenv('MIN_OI','100')); MIN_VOLUME=int(os.getenv('MIN_VOLUME','50')); MAX_SPREAD=float(os.getenv('MAX_SPREAD_PCT','15'))
 MAX_DTE=int(os.getenv('MAX_DTE','30')); MIN_DTE=int(os.getenv('MIN_DTE','0'))
 
 
@@ -44,7 +44,7 @@ def score_candidate(symbol,side,ret5,ret20,vol_ratio,breakout,oi,vol,spread,delt
     if 0.18<=abs(delta)<=0.50: s+=4; reasons.append('usable delta')
     if dte<=7: s+=3; reasons.append('near-term catalyst window')
     if premium<=1.0: s+=2; reasons.append('low premium')
-    if symbol=='SPXW': s+=3; reasons.append('SPXW')
+    if symbol in ('SPXW','NDX'): s+=3; reasons.append(symbol+' index')
     # Directional alignment
     bullish=ret5>=0 or ret20>=0
     if (side=='C' and bullish) or (side=='P' and not bullish): s+=5; reasons.append('directional alignment')
@@ -52,7 +52,7 @@ def score_candidate(symbol,side,ret5,ret20,vol_ratio,breakout,oi,vol,spread,delt
     return min(100,max(0,s)), reasons
 
 def scan_one(symbol,phase):
-    ticker_symbol='^SPX' if symbol=='SPXW' else symbol
+    ticker_symbol='^SPX' if symbol=='SPXW' else ('^NDX' if symbol=='NDX' else symbol)
     t=yf.Ticker(ticker_symbol)
     try: spot=num(t.fast_info.get('last_price'))
     except Exception: spot=0
@@ -68,6 +68,24 @@ def scan_one(symbol,phase):
     vol_ratio=latest_vol/avg_vol if avg_vol>0 else 1
     hi=float(close.tail(20).max()); lo=float(close.tail(20).min())
     breakout=spot>=hi*0.995 or spot<=lo*1.005
+    intraday=False; intraday_score=0; intraday_reasons=[]
+    if INTRADAY_ENABLED and phase in ('PRE_MARKET','REGULAR','AFTER_HOURS'):
+        try:
+            ih=t.history(period='1d',interval='5m',prepost=True)
+            if not ih.empty and len(ih)>=8:
+                ic=ih['Close'].dropna(); iv=ih['Volume'].dropna() if 'Volume' in ih else None
+                if len(ic)>=8:
+                    last=float(ic.iloc[-1]); prev=float(ic.iloc[-2]); r5=pct(last,float(ic.iloc[-2])); r30=pct(last,float(ic.iloc[-7]))
+                    if iv is not None and len(iv)>=7:
+                        base=float(iv.iloc[-7:-1].mean()); surge=float(iv.iloc[-1])/base if base>0 else 1
+                    else: surge=1
+                    intraday = abs(r5)>=0.35 or abs(r30)>=0.75 or surge>=2.0
+                    if abs(r5)>=0.35: intraday_score+=10; intraday_reasons.append('5m momentum')
+                    if abs(r30)>=0.75: intraday_score+=10; intraday_reasons.append('30m momentum')
+                    if surge>=2.0: intraday_score+=12; intraday_reasons.append('intraday volume surge')
+                    day_hi=float(ic.tail(12).max()); day_lo=float(ic.tail(12).min())
+                    if last>=day_hi*0.998 or last<=day_lo*1.002: intraday_score+=12; intraday_reasons.append('intraday breakout')
+        except Exception: pass
     try: exps=t.options
     except Exception: return []
     out=[]
@@ -90,13 +108,17 @@ def scan_one(symbol,phase):
                     delta=num(r.get('delta'),float('nan'))
                     if not math.isfinite(delta) or abs(delta)<0.01: delta=estimate_delta(spot,strike,d,side,premium)
                     score,reasons=score_candidate(symbol,side,ret5,ret20,vol_ratio,breakout,oi,vol,spread,delta,d,premium)
-                    if score<MIN_SCORE: continue
+                    if intraday:
+                        score=min(100,score+intraday_score)
+                        reasons += intraday_reasons
+                    threshold=INTRADAY_MIN_SCORE if intraday else MIN_SCORE
+                    if score<threshold: continue
                     entry_low=round(premium*0.97,2); entry_high=round(premium*1.03,2)
                     risk=max(entry_high*0.25,premium*0.15,0.10)
                     stop=max(0.05,entry_low-risk)
                     tp1=entry_high+risk; tp2=entry_high+2*risk; tp3=entry_high+3*risk
                     contracts=max(0,int(R//(risk*100)))
-                    out.append({'market':'SPXW' if symbol=='SPXW' else 'STOCK','symbol':symbol,'contract':f"{int(strike)}{side}",'expiration':exp,'dte':d,'premium':round(premium,2),'entry_low':entry_low,'entry_high':entry_high,'stop_loss':round(stop,2),'tp1':round(tp1,2),'tp2':round(tp2,2),'tp3':round(tp3,2),'risk_per_contract':round(risk,2),'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'risk_budget':R,'score':round(score,1),'volume':vol,'open_interest':oi,'spread_pct':round(spread,1),'ret5':round(ret5,2),'ret20':round(ret20,2),'volume_ratio':round(vol_ratio,2),'breakout':breakout,'delta':round(delta,3),'reasons':reasons})
+                    out.append({'market':'SPXW' if symbol=='SPXW' else 'STOCK','symbol':symbol,'contract':f"{int(strike)}{side}",'expiration':exp,'dte':d,'premium':round(premium,2),'entry_low':entry_low,'entry_high':entry_high,'stop_loss':round(stop,2),'tp1':round(tp1,2),'tp2':round(tp2,2),'tp3':round(tp3,2),'risk_per_contract':round(risk,2),'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'risk_budget':R,'score':round(score,1),'volume':vol,'open_interest':oi,'spread_pct':round(spread,1),'ret5':round(ret5,2),'ret20':round(ret20,2),'volume_ratio':round(vol_ratio,2),'breakout':breakout,'intraday':intraday,'intraday_score':intraday_score,'delta':round(delta,3),'reasons':reasons})
         except Exception: continue
     return out
 
