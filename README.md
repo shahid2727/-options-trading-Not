@@ -19,3 +19,12 @@ Alert/research-only U.S. options scanner. No brokerage order execution.
 ## Render environment
 Keep your existing secrets. Optional settings:
 `PREMARKET_ENABLED=true`, `REGULAR_ENABLED=true`, `AFTERHOURS_ENABLED=false`, `SCAN_INTERVAL_SECONDS=300`, `MAX_ALERTS=5`, `RISK_BUDGET=100`.
+
+
+### V7.3 endpoints
+- `/health` — service and scanner status.
+- `/scan?secret=YOUR_SCAN_SECRET` — starts a background scan and returns immediately.
+- `/scan/status?secret=YOUR_SCAN_SECRET` — scan status.
+- `/telegram-test?secret=YOUR_TELEGRAM_TEST_SECRET` — sends a Telegram test message.
+
+Set `SCAN_SECRET` in Render separately from `TELEGRAM_TEST_SECRET`. Do not put secrets in GitHub.

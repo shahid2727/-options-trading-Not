@@ -73,15 +73,24 @@ def loop():
 def health():
     with lock: s=dict(state)
     s['telegram_configured']=bool(os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID'))
+    s['scan_secret_configured']=bool(os.getenv('SCAN_SECRET'))
+    s['telegram_test_secret_configured']=bool(os.getenv('TELEGRAM_TEST_SECRET'))
     return jsonify({'service':'options-opportunity-bot','status':'ok','phase':phase(),'scanner':s})
 
 @app.get('/status')
 def status(): return health()
 
+def check_secret():
+    # SCAN_SECRET is dedicated to scanner endpoints. TELEGRAM_TEST_SECRET is
+    # retained only for the Telegram test endpoint.
+    secret=os.getenv('SCAN_SECRET')
+    if not secret:
+        return True
+    return request.args.get('secret') == secret
+
 @app.route('/scan',methods=['GET','POST'])
 def scan():
-    secret=os.getenv('TELEGRAM_TEST_SECRET')
-    if secret and request.args.get('secret')!=secret: return jsonify({'ok':False,'error':'unauthorized'}),401
+    if not check_secret(): return jsonify({'ok':False,'error':'unauthorized'}),401
     p=phase()
     scan_id,started=start_scan(p)
     if not started:
@@ -90,10 +99,20 @@ def scan():
 
 @app.get('/scan/status')
 def scan_status():
-    secret=os.getenv('TELEGRAM_TEST_SECRET')
-    if secret and request.args.get('secret')!=secret: return jsonify({'ok':False,'error':'unauthorized'}),401
+    if not check_secret(): return jsonify({'ok':False,'error':'unauthorized'}),401
     with lock: s=dict(state)
     return jsonify({'ok':True,**s,'phase':phase()})
+
+
+@app.get('/telegram-test')
+def telegram_test():
+    secret=os.getenv('TELEGRAM_TEST_SECRET')
+    if secret and request.args.get('secret') != secret:
+        return jsonify({'ok':False,'error':'unauthorized'}),401
+    if not os.getenv('TELEGRAM_BOT_TOKEN') or not os.getenv('TELEGRAM_CHAT_ID'):
+        return jsonify({'ok':False,'configured':False,'error':'Telegram is not configured'}),200
+    ok=send_message('✅ Options Bot V7.3 Telegram test successful')
+    return jsonify({'ok':ok,'configured':True,'message':'Telegram test message sent successfully' if ok else 'Telegram send failed'}),200
 
 if __name__=='__main__':
     threading.Thread(target=loop,daemon=True).start()
