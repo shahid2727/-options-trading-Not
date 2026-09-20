@@ -1,5 +1,5 @@
 import os, math, statistics
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import requests
 
 ALPACA = 'https://data.alpaca.markets/v2'
@@ -41,13 +41,25 @@ def rsi(values,n=14):
     return 100-(100/(1+ag/al))
 
 def indicators(symbol):
-    # Alpaca Basic: IEX real-time equity data. Bars are used for intraday confirmation.
-    end=datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
-    data=req(f'{ALPACA}/stocks/{symbol}/bars', {'timeframe':'5Min','start':None,'end':end,'limit':100,'feed':'iex'})
+    # Use recent historical 5-minute bars so the scanner still has indicators
+    # when manually triggered while the US market is closed. During the session
+    # Alpaca IEX supplies the latest available bars; outside the session this
+    # falls back naturally to the most recent completed bars.
+    end_dt=datetime.now(timezone.utc)
+    start_dt=end_dt-timedelta(days=7)
+    data=req(f'{ALPACA}/stocks/{symbol}/bars', {
+        'timeframe':'5Min',
+        'start':start_dt.isoformat().replace('+00:00','Z'),
+        'end':end_dt.isoformat().replace('+00:00','Z'),
+        'limit':1000,
+        'feed':'iex',
+        'sort':'asc'
+    })
     bars=data.get('bars') or []
     closes=[num(x.get('c')) for x in bars if num(x.get('c'))>0]
     vols=[num(x.get('v')) for x in bars]
-    if len(closes)<25: raise RuntimeError(f'not enough bars for {symbol}: {len(closes)}')
+    if len(closes)<25:
+        raise RuntimeError(f'not enough historical 5m bars for {symbol}: {len(closes)}')
     last=closes[-1]; e9=ema(closes[-30:],9); e21=ema(closes[-30:],21); rr=rsi(closes,14)
     typical=[]; pv=0; vv=0
     for b in bars:
@@ -93,7 +105,8 @@ def scan_underlying(symbol, session, contract_prefix=None):
         premium=(bid+ask)/2 if bid>0 and ask>0 else last
         if premium<MIN_PREMIUM or premium>MAX_PREMIUM: continue
         spread=((ask-bid)/premium*100) if premium and ask>=bid else 999
-        vol=int(num(trade.get('s'))); oi=int(num(details.get('open_interest') or details.get('openInterest')))
+        daily_bar=snap.get('dailyBar') or snap.get('daily_bar') or {}; vol=int(num(daily_bar.get('v'))); oi=int(num(details.get('open_interest') or details.get('openInterest')))
+        if vol <= 0: vol=int(num(trade.get('s'))) if trade else 0
         if spread>MAX_SPREAD or vol<MIN_VOL or oi<MIN_OI: continue
         delta=num(greeks.get('delta'), 0.25 if typ=='CALL' else -0.25)
         bullish=ind['underlying']>ind['vwap'] and ind['ema9']>ind['ema21'] and ind['macd_state']=='BULLISH' and ind['rsi']>=52
