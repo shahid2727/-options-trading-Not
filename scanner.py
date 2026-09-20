@@ -27,10 +27,14 @@ def scan_one(symbol,phase,diag=None):
     t=yf.Ticker(ticker_symbol)
     try: spot=num(t.fast_info.get('last_price'))
     except Exception: spot=0
-    if not spot:
-        if diag is not None: diag['symbols_no_price']+=1
+    try:
+        hist=t.history(period='3mo',interval='1d',prepost=True)
+    except Exception:
+        if diag is not None: diag['history_errors']+=1
         return []
-    try: hist=t.history(period='3mo',interval='1d',prepost=True)
+    # Outside regular hours fast_info may not expose last_price. Fall back to
+    # the latest daily close so diagnostics and option-chain discovery can
+    # still run when the market is CLOSED.
     except Exception as e:
         if diag is not None: diag['history_errors']+=1
         return []
@@ -42,7 +46,7 @@ def scan_one(symbol,phase,diag=None):
     vol_ratio=latest_vol/avg_vol if avg_vol>0 else 1
     hi=float(close.tail(20).max()); lo=float(close.tail(20).min()); breakout=spot>=hi*0.995 or spot<=lo*1.005
     intraday=False; intraday_score=0; intraday_reasons=[]
-    if INTRADAY_ENABLED and phase in ('PRE_MARKET','REGULAR','AFTER_HOURS'):
+    if INTRADAY_ENABLED and (phase in ('PRE_MARKET','REGULAR','AFTER_HOURS') or DIAGNOSTIC_MODE):
         try:
             ih=t.history(period='1d',interval='5m',prepost=True)
             if not ih.empty and len(ih)>=8:
@@ -61,6 +65,7 @@ def scan_one(symbol,phase,diag=None):
         if diag is not None: diag['option_chain_errors']+=1
         return []
     out=[]; today=date.today()
+    if not exps and diag is not None: diag['option_chain_empty']+=1
     for exp in exps[:20]:
         try:
             d=(datetime.strptime(exp,'%Y-%m-%d').date()-today).days
@@ -110,7 +115,7 @@ def scan_one(symbol,phase,diag=None):
     return out
 
 def scan_all(phase, diagnostics=False):
-    results=[]; diag={'symbols_seen':0,'symbols_no_price':0,'history_errors':0,'option_chain_errors':0,'by_symbol':{}}
+    results=[]; diag={'symbols_seen':0,'symbols_no_price':0,'history_errors':0,'option_chain_errors':0,'option_chain_empty':0,'by_symbol':{}}
     for s in SYMBOLS:
         try: results.extend(scan_one(s,phase,diag if diagnostics else None))
         except Exception: continue

@@ -20,3 +20,11 @@ Keep your existing Telegram values and `SCAN_SECRET`. Optional settings are in `
 - `/telegram-test?secret=TELEGRAM_TEST_SECRET`
 
 This bot is an alert/research tool. It does not place brokerage orders.
+
+
+## V8.3 changes
+- Falls back to the latest daily close when `fast_info.last_price` is unavailable, so scans can discover option chains outside market hours.
+- Diagnostic mode can inspect recent 5-minute history even while the market is closed.
+- Adds `option_chain_empty` diagnostic count.
+- Keep `DIAGNOSTIC_MODE=true` while validating the deployment; set it to `false` after validation if desired.
+- This bot is alert/research only and does not place brokerage orders.
