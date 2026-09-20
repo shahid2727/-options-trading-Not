@@ -1,7 +1,5 @@
-Flask>=3.0,<4
-requests>=2.31,<3
-pandas>=2.0,<3
-numpy>=1.26,<3
-yfinance>=0.2.40,<2
-python-dotenv>=1.0,<2
-gunicorn>=22,<24
+Flask>=3.0
+requests>=2.31
+yfinance>=0.2.40
+pandas>=2.0
+numpy>=1.24

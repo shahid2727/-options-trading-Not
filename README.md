@@ -1,27 +1,21 @@
-# Options Opportunity Bot V7.1
+# Options Opportunity Bot V7.2
 
-Alert/research scanner only. No brokerage orders are executed.
+Alert/research-only U.S. options scanner. No brokerage order execution.
 
-## What changed
-- Scans configured equities plus **SPXW** via the SPX index underlying (`^SPX`).
-- SPXW is handled separately and filters for option contract symbols containing `SPXW` when the data provider exposes that field.
-- SPXW Global Trading Hours are recognized (8:15 PM–9:25 AM ET); regular SPX/SPXW hours are 9:30 AM–4:15 PM ET. Cboe also has a 4:15–5:00 PM ET curb session.
-- Equity pre-market scans are setup/watch alerts; U.S. equity options are not treated as executable during the stock pre-market.
-- Uses provider Greeks when valid and Black-Scholes delta approximation when missing/invalid.
-- SPX/SPXW option tick-size aware risk plan: $0.05 below $3 and $0.10 at/above $3.
-- Better liquidity, volume/OI, spread, momentum and breakout scoring.
-- Top 5 alerts only by default, with deduplication.
-- Telegram errors should never expose the bot token.
-
-## Render environment
-Set the variables in `.env.example`. Never commit real Telegram tokens.
+## Features
+- Stocks + SPXW scan target (SPXW is resolved through `^SPX` because market-data providers may not expose `SPXW` as a normal ticker).
+- Pre-market 04:00–09:30 ET, regular 09:30–16:00 ET, optional after-hours 16:00–20:00 ET.
+- Background `/scan` to prevent Render gateway timeouts.
+- `/scan/status` for scan progress/results.
+- Telegram alerts, max 5 by default.
+- Risk/entry/SL/TP estimates are research estimates, not execution instructions.
 
 ## Endpoints
-- GET `/health`
-- GET `/status`
-- GET `/scan?secret=YOUR_TELEGRAM_TEST_SECRET`
-- GET `/telegram-test?secret=YOUR_TELEGRAM_TEST_SECRET`
-- POST `/webhook` with `X-Webhook-Secret`
+- `/health`
+- `/status`
+- `/scan?secret=YOUR_TEST_SECRET`
+- `/scan/status?secret=YOUR_TEST_SECRET`
 
-## Important
-`yfinance` is a research-data source and may have delayed, incomplete, or missing option Greeks/quotes. Verify bid/ask and the live contract on your broker before acting. This bot does not guarantee returns and does not place orders.
+## Render environment
+Keep your existing secrets. Optional settings:
+`PREMARKET_ENABLED=true`, `REGULAR_ENABLED=true`, `AFTERHOURS_ENABLED=false`, `SCAN_INTERVAL_SECONDS=300`, `MAX_ALERTS=5`, `RISK_BUDGET=100`.
