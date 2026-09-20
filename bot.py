@@ -83,19 +83,25 @@ def telegram_command_loop():
                 msg = u.get('message') or {}
                 chat = msg.get('chat') or {}
                 chat_id = str(chat.get('id', '')).strip()
-                if not chat_id or (allowed_chat and chat_id != allowed_chat):
+                if not chat_id:
                     continue
                 text = (msg.get('text') or '').strip()
                 if not text:
                     continue
                 cmd = text.split()[0].split('@')[0].lower()
-                if cmd == '/help' or cmd == '/start':
+                # /start and /help are public. Control/data commands stay private.
+                if cmd in ('/start', '/help'):
                     send_message(
-                        '🤖 Options Opportunity Bot\\n\\n'
-                        '/status — حالة البوت وآخر فحص\\n'
-                        '/scan — تشغيل فحص يدوي\\n'
-                        '/top — أفضل الفرص في آخر فحص\\n'
-                        '/help — عرض الأوامر', chat_id)
+                        '🤖 Options Opportunity Bot\n\n'
+                        'أهلًا بك 👋\n'
+                        'هذا البوت لمراقبة فرص عقود الخيارات وإرسال التنبيهات.\n\n'
+                        'الأوامر العامة:\n'
+                        '/start — بدء البوت\n'
+                        '/help — عرض المساعدة\n\n'
+                        'أوامر الفحص والبيانات متاحة للمستخدم المصرّح له فقط.', chat_id)
+                    continue
+                if not allowed_chat or chat_id != allowed_chat:
+                    continue
                 elif cmd == '/status':
                     with lock: s = dict(state)
                     send_message(
