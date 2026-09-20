@@ -31,27 +31,70 @@ def secret_ok():
     secret = os.getenv('SCAN_SECRET')
     return not secret or request.args.get('secret') == secret
 
+def pct_change(target, entry):
+    try:
+        return (target / entry - 1.0) * 100.0 if entry else 0.0
+    except Exception:
+        return 0.0
+
+def points_text(target, entry, positive_label=True):
+    pts = target - entry
+    sign = '+' if pts >= 0 else ''
+    return f"{sign}{pts:.2f} pts"
+
 def format_alert(x):
     badge = '🚨 1000%+ ANALYZED UPSIDE 🚨' if x.get('extreme_upside') else '🔥 STRONG SETUP'
-    upside_line = (f"🚀 Technical projected upside: +{x['projected_upside_pct']:.0f}% | Target premium: ${x['projected_premium']:.2f} | Underlying target: ${x['projected_underlying_target']:.2f}\n" if x.get('extreme_upside') else f"📈 Technical projected upside: +{x['projected_upside_pct']:.0f}% | Target premium: ${x['projected_premium']:.2f}\n")
-    return (f"{badge} | {x['signal']} | {x['symbol']} {x['contract']}\n"
-            + upside_line +
-            f"Market: {x['market_regime']} | 4H: {x['trend_4h']} | Confidence: {x['confidence']:.0f}%\n"
-            f"Estimated target reach (model): TP1 {x['tp1_confidence']:.0f}% | TP2 {x['tp2_confidence']:.0f}% | TP3 {x['tp3_confidence']:.0f}%\n"
-            f"Risk: {'LOW' if x['score']>=85 else 'MEDIUM'} | Score: {x['score']:.0f}/100 | ADX 4H: {x['adx_4h']:.1f}\n"
-            f"Data: {x['data_mode']} options / IEX underlying | DTE: {x['dte']}\n\n"
-            f"🎯 Contract Entry: ${x['entry_low']:.2f}-${x['entry_high']:.2f}\n"
-            f"🛑 Contract SL: ${x['stop_loss']:.2f}\n"
-            f"🎯 TP1: ${x['tp1']:.2f} | TP2: ${x['tp2']:.2f} | TP3: ${x['tp3']:.2f}\n\n"
-            f"📍 Underlying: ${x['underlying_entry']:.2f}\n"
-            f"🛑 Underlying SL: ${x['underlying_stop_loss']:.2f}\n"
-            f"🎯 Underlying TP1: {x['underlying_tp1']:.2f} | TP2: {x['underlying_tp2']:.2f} | TP3: {x['underlying_tp3']:.2f}\n\n"
-            f"4H RSI: {x['rsi_4h']:.1f} | 5M RSI: {x['rsi']:.1f} | Volume: {x['volume_ratio']:.1f}x | Breakout: {x['breakout']}\n"
-            f"Option Vol: {x['volume']} | OI: {x['open_interest']} | Spread: {x['spread_pct']:.1f}% | Delta: {x['delta']:.2f}\n"
-            f"📦 Contracts: {x['suggested_contracts']} | Risk/contract: ${x['risk_dollars_per_contract']:.0f} | Max loss: ${x['max_loss']:.0f}\n"
-            f"💰 Expected profit: TP1 ${x['expected_profit_tp1']:.0f} | TP2 ${x['expected_profit_tp2']:.0f} | TP3 ${x['expected_profit_tp3']:.0f}\n"
-            f"Why: {', '.join(x['reasons'])}\n\n"
-            f"⚠️ Confidence/target percentages are model estimates, not guarantees.")
+    contract_entry = x.get('entry_high', x.get('premium', 0.0))
+    ctp1 = pct_change(x['tp1'], contract_entry)
+    ctp2 = pct_change(x['tp2'], contract_entry)
+    ctp3 = pct_change(x['tp3'], contract_entry)
+    underlying = x.get('symbol','')
+    direction = x.get('signal','')
+    market = x.get('market_regime','MIXED')
+    data_mode = x.get('data_mode','INDICATIVE').upper()
+    trend4 = x.get('trend_4h','NEUTRAL')
+    trend1 = x.get('trend_1h','NEUTRAL')
+    trend15 = x.get('trend_15m','NEUTRAL')
+    trend5 = x.get('trend_5m','NEUTRAL')
+    upside_line = (f"🚀 Analyzed upside scenario: +{x['projected_upside_pct']:.0f}% | Target premium: ${x['projected_premium']:.2f} | Underlying target: ${x['projected_underlying_target']:.2f}\n"
+                   if x.get('extreme_upside') else f"📈 Analyzed upside scenario: +{x['projected_upside_pct']:.0f}% | Target premium: ${x['projected_premium']:.2f}\n")
+    return (
+        f"{badge}\n\n"
+        f"{underlying} {direction} — STRONG SETUP\n\n"
+        f"🎯 Contract\n"
+        f"• Entry: ${contract_entry:.2f}\n"
+        f"• SL: ${x['stop_loss']:.2f} → {pct_change(x['stop_loss'], contract_entry):+.0f}%\n"
+        f"• TP1: ${x['tp1']:.2f} → {ctp1:+.0f}%\n"
+        f"• TP2: ${x['tp2']:.2f} → {ctp2:+.0f}%\n"
+        f"• TP3: ${x['tp3']:.2f} → {ctp3:+.0f}%\n\n"
+        f"📍 Underlying / {underlying}\n"
+        f"• Entry: {x['underlying_entry']:.2f}\n"
+        f"• SL: {x['underlying_stop_loss']:.2f} → {points_text(x['underlying_stop_loss'], x['underlying_entry'])}\n"
+        f"• TP1: {x['underlying_tp1']:.2f} → {points_text(x['underlying_tp1'], x['underlying_entry'])}\n"
+        f"• TP2: {x['underlying_tp2']:.2f} → {points_text(x['underlying_tp2'], x['underlying_entry'])}\n"
+        f"• TP3: {x['underlying_tp3']:.2f} → {points_text(x['underlying_tp3'], x['underlying_entry'])}\n\n"
+        f"📊 Analysis\n"
+        f"• 4H: {trend4.title()}\n"
+        f"• 1H: {trend1.title()}\n"
+        f"• 15M: {trend15.title()}\n"
+        f"• 5M: {trend5.title()}\n"
+        f"• Market: {market.title()}\n"
+        f"• Score: {x['score']:.0f}/100\n"
+        f"• Confidence: {x['confidence']:.0f}/100\n"
+        f"• R:R: 1:{max(0.1, (x['tp1']-contract_entry)/max(contract_entry-x['stop_loss'],0.01)):.1f}\n\n"
+        f"💰 Risk\n"
+        f"• Risk/contract: ${x['risk_dollars_per_contract']:.0f}\n"
+        f"• Suggested contracts: {x['suggested_contracts']}\n"
+        f"• Max loss: ${x['max_loss']:.0f}\n\n"
+        f"{upside_line}"
+        f"📦 Contract: {x['contract']} | DTE: {x['dte']} | Delta: {x['delta']:.2f}\n"
+        f"📊 Volume: {x['volume']} | OI: {x['open_interest']} | Spread: {x['spread_pct']:.1f}%\n"
+        f"💵 Expected profit: TP1 ${x['expected_profit_tp1']:.0f} | TP2 ${x['expected_profit_tp2']:.0f} | TP3 ${x['expected_profit_tp3']:.0f}\n"
+        f"📡 Data: {data_mode} options / IEX underlying\n"
+        f"Why: {', '.join(x['reasons'])}\n\n"
+        f"⚠️ Confidence and upside are model estimates, not guarantees.\n"
+        f"⚠️ Free Alpaca options data may be delayed/indicative; it is not OPRA real-time."
+    )
 
 def market_warning(diagnostics):
     regs=[d.get('market_regime') for d in diagnostics.values() if isinstance(d,dict) and d.get('market_regime')]
@@ -172,10 +215,8 @@ def telegram_command_loop():
                     if not top:
                         send_message('ℹ️ لا توجد فرص في آخر فحص حتى الآن.', chat_id)
                     else:
-                        lines = ['🏆 Top opportunities from last scan']
-                        for i, x in enumerate(top, 1):
-                            lines.append(f"{i}. {x['signal']} {x['symbol']} {x['contract']} | {x['confidence']:.0f}% | {x['market_regime']} | Entry ${x['entry_low']:.2f}-${x['entry_high']:.2f} | SL ${x['stop_loss']:.2f} | TP1 ${x['tp1']:.2f}")
-                        send_message('\\n'.join(lines), chat_id)
+                        for x in top:
+                            send_message(format_alert(x), chat_id)
                 else:
                     send_message('الأوامر المتاحة: /status /scan /top /help\n\n/scan و /scan/status عبر الويب محميان بـ SCAN_SECRET، أما من Telegram فلا تحتاج Secret.', chat_id)
         except Exception:
