@@ -1,27 +1,22 @@
-# Options Opportunity Bot V8
+# Options Opportunity Bot V8.2
 
-Research/alert bot for U.S. listed options. It does not place brokerage orders.
+V8.2 adds diagnostic visibility to the V8.1 scanner while keeping the same Render/Telegram endpoints.
 
-## V8 highlights
-- Pre-market 04:00–09:30 ET, regular 09:30–16:00 ET, optional after-hours 16:00–20:00 ET.
-- Score 0–100 using momentum, volume surge, breakout proximity, liquidity, spread, OI, option volume, delta availability, DTE and premium.
-- Filters and risk budget are configurable with environment variables.
-- Best 5 candidates are sent to Telegram.
-- Background scans avoid blocking the web endpoint.
-- `/health`, `/scan`, `/scan/status`, `/telegram-test` endpoints.
-- SPXW is represented through the configured SPXW symbol path; verify the upstream option-chain source before treating it as a guaranteed live SPXW feed.
-- Pre-market stock option quotes can be incomplete depending on upstream data availability.
+## Highlights
+- Intraday 5-minute momentum, 30-minute momentum, volume surge and breakout signals.
+- Nasdaq coverage through QQQ and NDX, plus SPXW and liquid U.S. equities.
+- Score, premium, OI, option volume, spread, delta, entry, stop and targets.
+- `last_top` now includes whether a candidate is intraday.
+- Scanner diagnostics report symbols checked, option-chain activity, and how many contracts pass each filter.
+- Set `DIAGNOSTIC_MODE=true` to keep scored candidates in diagnostic output even if they are below alert thresholds. This is for testing; Telegram still sends only the configured top results.
 
-## Environment
-See `.env.example`.
+## Render environment
+Keep your existing Telegram values and `SCAN_SECRET`. Optional settings are in `.env.example`.
 
-`SCAN_SECRET` protects `/scan` and `/scan/status`.
-`TELEGRAM_TEST_SECRET` protects `/telegram-test`.
-Never commit real secrets.
+## Endpoints
+- `/health`
+- `/scan?secret=SCAN_SECRET`
+- `/scan/status?secret=SCAN_SECRET`
+- `/telegram-test?secret=TELEGRAM_TEST_SECRET`
 
-
-V8.1 additions:
-- Intraday 5-minute momentum/volume-surge/breakout detection during enabled sessions.
-- Nasdaq-100 index symbol NDX plus QQQ scanning.
-- Intraday candidates use a higher score threshold (INTRADAY_MIN_SCORE).
-- Intraday detection is based on underlying 5-minute data; option quote freshness depends on the yfinance data available.
+This bot is an alert/research tool. It does not place brokerage orders.

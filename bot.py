@@ -6,7 +6,7 @@ from scanner import scan_all
 from telegram_bot import send_message
 
 app=Flask(__name__); TZ=ZoneInfo('America/New_York'); lock=threading.Lock()
-state={'last_scan':None,'last_candidates':0,'last_alerts':0,'last_error':None,'last_session':'CLOSED','running':True,'scan_id':None,'scan_running':False,'scan_started':None,'scan_finished':None,'last_top':[]}
+state={'last_scan':None,'last_candidates':0,'last_alerts':0,'last_error':None,'last_session':'CLOSED','running':True,'scan_id':None,'scan_running':False,'scan_started':None,'scan_finished':None,'last_top':[],'diagnostics':{}}
 
 def phase():
     n=datetime.now(TZ); t=n.time()
@@ -29,8 +29,8 @@ def format_alert(x,p):
 
 def run_scan_job(p,scan_id):
     try:
-        results=scan_all(p); max_alerts=int(os.getenv('MAX_ALERTS','5')); alerts=0
-        with lock: state['last_top']=[{k:x[k] for k in ('symbol','contract','expiration','score','premium','dte')} for x in results[:max_alerts]]
+        results,diag=scan_all(p, diagnostics=True); max_alerts=int(os.getenv('MAX_ALERTS','5')); alerts=0
+        with lock: state['last_top']=[{k:x[k] for k in ('symbol','contract','expiration','score','premium','dte','intraday')} for x in results[:max_alerts]]; state['diagnostics']=diag
         for x in results[:max_alerts]:
             try:
                 if send_message(format_alert(x,p)): alerts+=1
