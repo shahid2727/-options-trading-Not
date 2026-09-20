@@ -97,10 +97,30 @@ def telegram_command_loop():
                         'هذا البوت لمراقبة فرص عقود الخيارات وإرسال التنبيهات.\n\n'
                         'الأوامر العامة:\n'
                         '/start — بدء البوت\n'
-                        '/help — عرض المساعدة\n\n'
+                        '/help — عرض المساعدة\n'
+                        '/privacy — معلومات الخصوصية\n\n'
+                        'ملاحظة: قد يتم تسجيل رسائل المستخدمين وإرسالها إلى مشرف البوت لأغراض الدعم والإدارة.\n'
                         'أوامر الفحص والبيانات متاحة للمستخدم المصرّح له فقط.', chat_id)
                     continue
+                if cmd == '/privacy':
+                    send_message(
+                        '🔐 الخصوصية\n\n'
+                        'هذا البوت قد يرسل للمشرف رسائل المستخدمين واسم المستخدم/المعرّف لغرض الدعم والإدارة.\n'
+                        'لا يملك البوت صلاحية تنفيذ صفقات تلقائيًا.', chat_id)
+                    continue
                 if not allowed_chat or chat_id != allowed_chat:
+                    # Public users cannot access private control/data commands.
+                    # Their messages may be logged transparently to the configured admin.
+                    admin = allowed_chat
+                    if admin and text and not text.startswith('/'):
+                        username = (msg.get('from') or {}).get('username') or '—'
+                        first_name = (msg.get('from') or {}).get('first_name') or '—'
+                        send_message(
+                            f'📩 رسالة مستخدم جديدة\n'
+                            f'الاسم: {first_name}\n'
+                            f'Username: @{username}\n'
+                            f'Chat ID: {chat_id}\n'
+                            f'الرسالة: {text}', admin)
                     continue
                 elif cmd == '/status':
                     with lock: s = dict(state)
