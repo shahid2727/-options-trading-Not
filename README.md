@@ -1,30 +1,43 @@
-# Options Opportunity Bot V8.2
+# Options Opportunity Bot V9 Free
 
-V8.2 adds diagnostic visibility to the V8.1 scanner while keeping the same Render/Telegram endpoints.
+Free-first options scanner using Alpaca Basic market data, Telegram and an optional TradingView webhook.
 
-## Highlights
-- Intraday 5-minute momentum, 30-minute momentum, volume surge and breakout signals.
-- Nasdaq coverage through QQQ and NDX, plus SPXW and liquid U.S. equities.
-- Score, premium, OI, option volume, spread, delta, entry, stop and targets.
-- `last_top` now includes whether a candidate is intraday.
-- Scanner diagnostics report symbols checked, option-chain activity, and how many contracts pass each filter.
-- Set `DIAGNOSTIC_MODE=true` to keep scored candidates in diagnostic output even if they are below alert thresholds. This is for testing; Telegram still sends only the configured top results.
+## What it does
+- Intraday confirmation: 5-minute EMA 9/21, VWAP, RSI, MACD, volume surge and breakout.
+- Option filters: premium, spread, volume, open interest, DTE and delta when supplied.
+- Score 0-100 and top 5 alerts.
+- Entry zone, stop, TP1/TP2/TP3 and risk sizing.
+- SPXW is handled through SPX as the underlying, matching Alpaca's index-option model.
+- QQQ and selected liquid Nasdaq names are included.
+- Telegram alerts only; no automatic brokerage orders.
+- `/webhook` accepts TradingView alerts and forwards them to Telegram.
 
-## Render environment
-Keep your existing Telegram values and `SCAN_SECRET`. Optional settings are in `.env.example`.
+## Important free-data limitation
+Alpaca Basic provides a free indicative options feed; option trades are delayed and quotes are modified. Equity real-time coverage on Basic is IEX. The bot labels alerts with `Data: INDICATIVE` and does not claim the option quote is OPRA real-time.
+
+NDX index options are not supported by Alpaca's current index-options offering, so NDX is not included in the default scanner. QQQ is included instead.
+
+## Environment variables
+Copy `.env.example` to your Render environment variables. Required:
+- `ALPACA_API_KEY`
+- `ALPACA_API_SECRET`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+
+Recommended secrets:
+- `SCAN_SECRET`
+- `TELEGRAM_TEST_SECRET`
+- `WEBHOOK_SECRET`
 
 ## Endpoints
 - `/health`
-- `/scan?secret=SCAN_SECRET`
-- `/scan/status?secret=SCAN_SECRET`
-- `/telegram-test?secret=TELEGRAM_TEST_SECRET`
+- `/status`
+- `/scan?secret=...`
+- `/scan/status?secret=...`
+- `/telegram-test?secret=...`
+- `POST /webhook?secret=...`
 
-This bot is an alert/research tool. It does not place brokerage orders.
+TradingView webhook URL:
+`https://YOUR-RENDER-URL/webhook?secret=YOUR_WEBHOOK_SECRET`
 
-
-## V8.3 changes
-- Falls back to the latest daily close when `fast_info.last_price` is unavailable, so scans can discover option chains outside market hours.
-- Diagnostic mode can inspect recent 5-minute history even while the market is closed.
-- Adds `option_chain_empty` diagnostic count.
-- Keep `DIAGNOSTIC_MODE=true` while validating the deployment; set it to `false` after validation if desired.
-- This bot is alert/research only and does not place brokerage orders.
+The webhook is for alerts/analysis only and never places trades.

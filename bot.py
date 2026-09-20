@@ -2,89 +2,134 @@ import os, threading, time, uuid
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request
-from scanner import scan_all
+from scanner import scan_all, provider_status
 from telegram_bot import send_message
 
-app=Flask(__name__); TZ=ZoneInfo('America/New_York'); lock=threading.Lock()
-state={'last_scan':None,'last_candidates':0,'last_alerts':0,'last_error':None,'last_session':'CLOSED','running':True,'scan_id':None,'scan_running':False,'scan_started':None,'scan_finished':None,'last_top':[],'diagnostics':{}}
+app = Flask(__name__)
+TZ = ZoneInfo('America/New_York')
+lock = threading.Lock()
+state = {
+    'last_scan': None, 'last_candidates': 0, 'last_alerts': 0, 'last_error': None,
+    'last_session': 'CLOSED', 'running': True, 'scan_id': None,
+    'scan_running': False, 'scan_started': None, 'scan_finished': None,
+    'last_top': [], 'diagnostics': {}
+}
 
 def phase():
-    n=datetime.now(TZ); t=n.time()
-    if dtime(4,0)<=t<dtime(9,30): return 'PRE_MARKET'
-    if dtime(9,30)<=t<dtime(16,0): return 'REGULAR'
-    if dtime(16,0)<=t<dtime(20,0): return 'AFTER_HOURS'
+    n = datetime.now(TZ); t = n.time()
+    if dtime(4,0) <= t < dtime(9,30): return 'PRE_MARKET'
+    if dtime(9,30) <= t < dtime(16,0): return 'REGULAR'
+    if dtime(16,0) <= t < dtime(20,0): return 'AFTER_HOURS'
     return 'CLOSED'
 
-def allowed(p): return ((p=='PRE_MARKET' and os.getenv('PREMARKET_ENABLED','true').lower()=='true') or (p=='REGULAR' and os.getenv('REGULAR_ENABLED','true').lower()=='true') or (p=='AFTER_HOURS' and os.getenv('AFTERHOURS_ENABLED','false').lower()=='true'))
+def allowed(p):
+    return {'PRE_MARKET':'PREMARKET_ENABLED','REGULAR':'REGULAR_ENABLED','AFTER_HOURS':'AFTERHOURS_ENABLED'}.get(p) and os.getenv({'PRE_MARKET':'PREMARKET_ENABLED','REGULAR':'REGULAR_ENABLED','AFTER_HOURS':'AFTERHOURS_ENABLED'}[p], 'false').lower() == 'true'
 
-def format_alert(x,p):
-    return (f"🚨 OPTIONS V8 | {x['market']} {p}\n{x['symbol']} {x['contract']} | Exp {x['expiration']} | DTE {x['dte']}\n"
-            f"⭐ Score: {x['score']:.0f}/100 | Premium: ${x['premium']:.2f}\n"
-            f"Entry: ${x['entry_low']:.2f}-${x['entry_high']:.2f} | SL: ${x['stop_loss']:.2f}\n"
-            f"TP1: ${x['tp1']:.2f} | TP2: ${x['tp2']:.2f} | TP3: ${x['tp3']:.2f}\n"
-            f"Vol: {x['volume']} | OI: {x['open_interest']} | Spread: {x['spread_pct']:.1f}%\n"
-            f"Momentum: 5d {x['ret5']:.1f}% | 20d {x['ret20']:.1f}% | Delta {x['delta']:.2f}\n"
-            f"Vol ratio: {x['volume_ratio']:.2f}x | Contracts: {x['suggested_contracts']} | Risk/contract: ${x['risk_dollars_per_contract']:.0f}\n"
-            f"Why: {', '.join(x['reasons'])}")
+def secret_ok():
+    secret = os.getenv('SCAN_SECRET')
+    return not secret or request.args.get('secret') == secret
 
-def run_scan_job(p,scan_id):
+def format_alert(x):
+    return (f"🚨 {x['signal']} | {x['symbol']} {x['contract']}\n"
+            f"Session: {x['session']} | DTE: {x['dte']} | Data: {x['data_mode']}\n"
+            f"Premium: ${x['premium']:.2f} | Score: {x['score']:.0f}/100\n"
+            f"Entry: ${x['entry_low']:.2f}-${x['entry_high']:.2f}\n"
+            f"SL: ${x['stop_loss']:.2f} | TP1: ${x['tp1']:.2f} | TP2: ${x['tp2']:.2f} | TP3: ${x['tp3']:.2f}\n"
+            f"Underlying: ${x['underlying']:.2f} | VWAP: {x['vwap_state']} | EMA9/21: {x['ema_state']}\n"
+            f"RSI: {x['rsi']:.1f} | MACD: {x['macd_state']} | Vol: {x['volume_ratio']:.1f}x | Breakout: {x['breakout']}\n"
+            f"Option Vol: {x['volume']} | OI: {x['open_interest']} | Spread: {x['spread_pct']:.1f}% | Delta: {x['delta']:.2f}\n"
+            f"Suggested contracts: {x['suggested_contracts']} | Risk: ${x['risk_dollars_per_contract']:.0f}/contract\n"
+            f"Reasons: {', '.join(x['reasons'])}")
+
+def run_scan_job(p, scan_id):
     try:
-        results,diag=scan_all(p, diagnostics=True); max_alerts=int(os.getenv('MAX_ALERTS','5')); alerts=0
-        with lock: state['last_top']=[{k:x[k] for k in ('symbol','contract','expiration','score','premium','dte','intraday')} for x in results[:max_alerts]]; state['diagnostics']=diag
+        results, diagnostics = scan_all(p)
+        alerts = 0
+        max_alerts = max(1, int(os.getenv('MAX_ALERTS','5')))
         for x in results[:max_alerts]:
             try:
-                if send_message(format_alert(x,p)): alerts+=1
-            except Exception: pass
-        with lock: state.update(last_scan=datetime.now(TZ).isoformat(),last_candidates=len(results),last_alerts=alerts,last_error=None,last_session=p,scan_id=scan_id,scan_running=False,scan_finished=datetime.now(TZ).isoformat())
+                if send_message(format_alert(x)): alerts += 1
+            except Exception:
+                pass
+        with lock:
+            state.update(last_scan=datetime.now(TZ).isoformat(), last_candidates=len(results), last_alerts=alerts,
+                         last_error=None, last_session=p, scan_id=scan_id, scan_running=False,
+                         scan_finished=datetime.now(TZ).isoformat(), last_top=results[:max_alerts], diagnostics=diagnostics)
     except Exception as e:
-        with lock: state.update(last_scan=datetime.now(TZ).isoformat(),last_candidates=0,last_alerts=0,last_error=f'{type(e).__name__}: {e}',last_session=p,scan_id=scan_id,scan_running=False,scan_finished=datetime.now(TZ).isoformat())
+        with lock:
+            state.update(last_scan=datetime.now(TZ).isoformat(), last_candidates=0, last_alerts=0,
+                         last_error=f'{type(e).__name__}: {e}', last_session=p, scan_id=scan_id,
+                         scan_running=False, scan_finished=datetime.now(TZ).isoformat())
 
 def start_scan(p):
     with lock:
-        if state['scan_running']: return None,False
-        sid=uuid.uuid4().hex[:10]; state.update(scan_running=True,scan_id=sid,scan_started=datetime.now(TZ).isoformat(),last_error=None,last_session=p)
-    threading.Thread(target=run_scan_job,args=(p,sid),daemon=True).start(); return sid,True
-
-def check_secret():
-    secret=os.getenv('SCAN_SECRET')
-    return (not secret) or request.args.get('secret')==secret
+        if state['scan_running']: return None, False
+        scan_id = uuid.uuid4().hex[:10]
+        state.update(scan_running=True, scan_id=scan_id, scan_started=datetime.now(TZ).isoformat(), last_error=None, last_session=p)
+    threading.Thread(target=run_scan_job, args=(p, scan_id), daemon=True).start()
+    return scan_id, True
 
 def loop():
-    interval=max(30,int(os.getenv('SCAN_INTERVAL_SECONDS','300')))
+    interval = max(60, int(os.getenv('SCAN_INTERVAL_SECONDS','300')))
     while True:
         try:
-            p=phase()
+            p = phase()
             if allowed(p): start_scan(p)
             else:
-                with lock: state['last_session']=p
+                with lock: state['last_session'] = p
         except Exception as e:
-            with lock: state['last_error']=f'{type(e).__name__}: {e}'
+            with lock: state['last_error'] = f'{type(e).__name__}: {e}'
         time.sleep(interval)
+
+@app.get('/')
+def root():
+    return jsonify({'service':'options-opportunity-bot','status':'ok','docs':'/health','scan':'/scan','scan_status':'/scan/status','webhook':'/webhook'})
 
 @app.get('/health')
 def health():
-    with lock: s=dict(state)
-    s.update(scan_secret_configured=bool(os.getenv('SCAN_SECRET')),telegram_test_secret_configured=bool(os.getenv('TELEGRAM_TEST_SECRET')),telegram_configured=bool(os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID')))
+    with lock: s = dict(state)
+    s['telegram_configured'] = bool(os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID'))
+    s['scan_secret_configured'] = bool(os.getenv('SCAN_SECRET'))
+    s['provider'] = provider_status()
     return jsonify({'service':'options-opportunity-bot','status':'ok','phase':phase(),'scanner':s})
+
 @app.get('/status')
 def status(): return health()
-@app.route('/scan',methods=['GET','POST'])
+
+@app.route('/scan', methods=['GET','POST'])
 def scan():
-    if not check_secret(): return jsonify({'ok':False,'error':'unauthorized'}),401
-    p=phase(); sid,started=start_scan(p)
-    if not started: return jsonify({'ok':True,'accepted':False,'message':'scan already running','scan_id':state['scan_id'],'phase':p}),202
-    return jsonify({'ok':True,'accepted':True,'message':'scan started in background','scan_id':sid,'phase':p,'status_url':'/scan/status'}),202
+    if not secret_ok(): return jsonify({'ok':False,'error':'unauthorized'}), 401
+    p = phase(); scan_id, started = start_scan(p)
+    if not started:
+        return jsonify({'ok':True,'accepted':False,'message':'scan already running','scan_id':state['scan_id'],'phase':p}), 202
+    return jsonify({'ok':True,'accepted':True,'message':'scan started in background','scan_id':scan_id,'phase':p,'status_url':'/scan/status'}), 202
+
 @app.get('/scan/status')
 def scan_status():
-    if not check_secret(): return jsonify({'ok':False,'error':'unauthorized'}),401
-    with lock: s=dict(state)
+    if not secret_ok(): return jsonify({'ok':False,'error':'unauthorized'}), 401
+    with lock: s = dict(state)
     return jsonify({'ok':True,**s,'phase':phase()})
+
 @app.get('/telegram-test')
 def telegram_test():
-    secret=os.getenv('TELEGRAM_TEST_SECRET')
-    if secret and request.args.get('secret')!=secret: return jsonify({'ok':False,'error':'unauthorized'}),401
-    if not os.getenv('TELEGRAM_BOT_TOKEN') or not os.getenv('TELEGRAM_CHAT_ID'): return jsonify({'ok':False,'configured':False,'error':'Telegram is not configured'}),200
-    ok=send_message('✅ Options Bot V8 Telegram test successful')
-    return jsonify({'ok':ok,'configured':True,'message':'Telegram test message sent successfully' if ok else 'Telegram send failed'}),200
-if __name__=='__main__':
-    threading.Thread(target=loop,daemon=True).start(); app.run(host='0.0.0.0',port=int(os.getenv('PORT','10000')))
+    secret = os.getenv('TELEGRAM_TEST_SECRET')
+    if secret and request.args.get('secret') != secret: return jsonify({'ok':False,'error':'unauthorized'}), 401
+    ok = send_message('✅ Options bot Telegram test: connection OK')
+    return jsonify({'ok':ok,'configured':bool(os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID')),'message':'Telegram test message sent successfully' if ok else 'Telegram send failed'})
+
+@app.post('/webhook')
+def webhook():
+    # TradingView can POST JSON/text here. This endpoint never executes trades.
+    hook_secret = os.getenv('WEBHOOK_SECRET')
+    if hook_secret and request.args.get('secret') != hook_secret: return jsonify({'ok':False,'error':'unauthorized'}), 401
+    payload = request.get_json(silent=True)
+    text = payload if payload is not None else request.get_data(as_text=True)
+    if isinstance(text, dict):
+        text = ' | '.join(f'{k}={v}' for k,v in text.items())
+    msg = f"📡 TradingView alert\n{text}"
+    sent = send_message(msg)
+    return jsonify({'ok':True,'telegram_sent':sent})
+
+if __name__ == '__main__':
+    threading.Thread(target=loop, daemon=True).start()
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT','10000')))
