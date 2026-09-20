@@ -12,11 +12,13 @@ state = {
     'last_scan': None, 'last_candidates': 0, 'last_alerts': 0, 'last_error': None,
     'last_session': 'CLOSED', 'running': True, 'scan_id': None,
     'scan_running': False, 'scan_started': None, 'scan_finished': None,
-    'last_top': [], 'diagnostics': {}
+    'last_top': [], 'diagnostics': {}, 'last_alert_keys': {}, 'market_warning_sent': None
 }
 
 def phase():
     n = datetime.now(TZ); t = n.time()
+    # Avoid scanning weekends; US equity/options sessions are Monday-Friday.
+    if n.weekday() >= 5: return 'CLOSED'
     if dtime(4,0) <= t < dtime(9,30): return 'PRE_MARKET'
     if dtime(9,30) <= t < dtime(16,0): return 'REGULAR'
     if dtime(16,0) <= t < dtime(20,0): return 'AFTER_HOURS'
@@ -30,36 +32,65 @@ def secret_ok():
     return not secret or request.args.get('secret') == secret
 
 def format_alert(x):
-    return (f"🚨 {x['signal']} | {x['symbol']} {x['contract']}\n"
-            f"Session: {x['session']} | DTE: {x['dte']} | Data: {x['data_mode']}\n"
-            f"Premium: ${x['premium']:.2f} | Score: {x['score']:.0f}/100\n"
-            f"Entry: ${x['entry_low']:.2f}-${x['entry_high']:.2f}\n"
-            f"SL: ${x['stop_loss']:.2f} | TP1: ${x['tp1']:.2f} | TP2: ${x['tp2']:.2f} | TP3: ${x['tp3']:.2f}\n"
-            f"Underlying: ${x['underlying']:.2f} | VWAP: {x['vwap_state']} | EMA9/21: {x['ema_state']}\n"
-            f"RSI: {x['rsi']:.1f} | MACD: {x['macd_state']} | Vol: {x['volume_ratio']:.1f}x | Breakout: {x['breakout']}\n"
+    badge = '🚨 1000%+ ANALYZED UPSIDE 🚨' if x.get('extreme_upside') else '🔥 STRONG SETUP'
+    upside_line = (f"🚀 Technical projected upside: +{x['projected_upside_pct']:.0f}% | Target premium: ${x['projected_premium']:.2f} | Underlying target: ${x['projected_underlying_target']:.2f}\n" if x.get('extreme_upside') else f"📈 Technical projected upside: +{x['projected_upside_pct']:.0f}% | Target premium: ${x['projected_premium']:.2f}\n")
+    return (f"{badge} | {x['signal']} | {x['symbol']} {x['contract']}\n"
+            + upside_line +
+            f"Market: {x['market_regime']} | 4H: {x['trend_4h']} | Confidence: {x['confidence']:.0f}%\n"
+            f"Market: {x['market_regime']} | 4H: {x['trend_4h']} | Confidence: {x['confidence']:.0f}%\n"
+            f"Estimated target reach (model): TP1 {x['tp1_confidence']:.0f}% | TP2 {x['tp2_confidence']:.0f}% | TP3 {x['tp3_confidence']:.0f}%\n"
+            f"Risk: {'LOW' if x['score']>=85 else 'MEDIUM'} | Score: {x['score']:.0f}/100 | ADX 4H: {x['adx_4h']:.1f}\n"
+            f"Data: {x['data_mode']} options / IEX underlying | DTE: {x['dte']}\n\n"
+            f"🎯 Contract Entry: ${x['entry_low']:.2f}-${x['entry_high']:.2f}\n"
+            f"🛑 Contract SL: ${x['stop_loss']:.2f}\n"
+            f"🎯 TP1: ${x['tp1']:.2f} | TP2: ${x['tp2']:.2f} | TP3: ${x['tp3']:.2f}\n\n"
+            f"📍 Underlying: ${x['underlying_entry']:.2f}\n"
+            f"🛑 Underlying SL: ${x['underlying_stop_loss']:.2f}\n"
+            f"🎯 Underlying TP1: {x['underlying_tp1']:.2f} | TP2: {x['underlying_tp2']:.2f} | TP3: {x['underlying_tp3']:.2f}\n\n"
+            f"4H RSI: {x['rsi_4h']:.1f} | 5M RSI: {x['rsi']:.1f} | Volume: {x['volume_ratio']:.1f}x | Breakout: {x['breakout']}\n"
             f"Option Vol: {x['volume']} | OI: {x['open_interest']} | Spread: {x['spread_pct']:.1f}% | Delta: {x['delta']:.2f}\n"
-            f"Suggested contracts: {x['suggested_contracts']} | Risk: ${x['risk_dollars_per_contract']:.0f}/contract\n"
-            f"Reasons: {', '.join(x['reasons'])}")
+            f"📦 Contracts: {x['suggested_contracts']} | Risk/contract: ${x['risk_dollars_per_contract']:.0f} | Max loss: ${x['max_loss']:.0f}\n"
+            f"💰 Expected profit: TP1 ${x['expected_profit_tp1']:.0f} | TP2 ${x['expected_profit_tp2']:.0f} | TP3 ${x['expected_profit_tp3']:.0f}\n"
+            f"Why: {', '.join(x['reasons'])}\n\n"
+            f"⚠️ Confidence/target percentages are model estimates, not guarantees.")
+
+def market_warning(diagnostics):
+    regs=[d.get('market_regime') for d in diagnostics.values() if isinstance(d,dict) and d.get('market_regime')]
+    if not regs:return None
+    side=regs.count('SIDEWAYS'); chop=regs.count('CHOPPY')
+    if side+chop < max(1, len(regs)//2):return None
+    state='SIDEWAYS' if side>=chop else 'CHOPPY'
+    return (f"⚠️ MARKET WARNING — {state}\n\n"
+            f"أغلب الرموز التي تم فحصها تظهر سوقًا {state.lower()}.\n"
+            "الاتجاه ضعيف/متذبذب، واحتمال الكسر الكاذب أعلى.\n"
+            "⛔ البوت لن يرسل صفقات منخفضة الجودة في هذه الحالة.\n"
+            "انتظر اتجاه 4H/1H أو Breakout مدعوم بالحجم قبل الدخول.")
 
 def run_scan_job(p, scan_id):
     try:
         results, diagnostics = scan_all(p)
-        alerts = 0
-        max_alerts = max(1, int(os.getenv('MAX_ALERTS','5')))
+        alerts=0; max_alerts=max(1,int(os.getenv('MAX_ALERTS','5'))); now=datetime.now(TZ)
+        cooldown=max(300,int(os.getenv('ALERT_COOLDOWN_SECONDS','900')))
+        # Deduplicate the same contract so a 5-minute scan does not spam Telegram.
         for x in results[:max_alerts]:
+            key=f"{x['contract']}:{x['signal']}"; last=state.get('last_alert_keys',{}).get(key)
+            if last:
+                try:
+                    if (now-datetime.fromisoformat(last)).total_seconds()<cooldown: continue
+                except Exception: pass
             try:
-                if send_message(format_alert(x)): alerts += 1
-            except Exception:
-                pass
+                if send_message(format_alert(x)):
+                    alerts+=1; state.setdefault('last_alert_keys',{})[key]=now.isoformat()
+            except Exception: pass
+        warning=market_warning(diagnostics)
+        if warning and state.get('market_warning_sent') is None:
+            if send_message(warning): state['market_warning_sent']=now.isoformat()
+        elif not warning:
+            state['market_warning_sent']=None
         with lock:
-            state.update(last_scan=datetime.now(TZ).isoformat(), last_candidates=len(results), last_alerts=alerts,
-                         last_error=None, last_session=p, scan_id=scan_id, scan_running=False,
-                         scan_finished=datetime.now(TZ).isoformat(), last_top=results[:max_alerts], diagnostics=diagnostics)
+            state.update(last_scan=now.isoformat(),last_candidates=len(results),last_alerts=alerts,last_error=None,last_session=p,scan_id=scan_id,scan_running=False,scan_finished=now.isoformat(),last_top=results[:max_alerts],diagnostics=diagnostics)
     except Exception as e:
-        with lock:
-            state.update(last_scan=datetime.now(TZ).isoformat(), last_candidates=0, last_alerts=0,
-                         last_error=f'{type(e).__name__}: {e}', last_session=p, scan_id=scan_id,
-                         scan_running=False, scan_finished=datetime.now(TZ).isoformat())
+        with lock: state.update(last_scan=datetime.now(TZ).isoformat(),last_candidates=0,last_alerts=0,last_error=f'{type(e).__name__}: {e}',last_session=p,scan_id=scan_id,scan_running=False,scan_finished=datetime.now(TZ).isoformat())
 
 def start_scan(p):
     with lock:
@@ -129,7 +160,7 @@ def telegram_command_loop():
                         f"Running: {s['running']}\\nScan running: {s['scan_running']}\\n"
                         f"Last candidates: {s['last_candidates']}\\nLast alerts: {s['last_alerts']}\\n"
                         f"Last scan: {s['last_scan'] or '—'}\\n"
-                        f"Last error: {s['last_error'] or 'None'}", chat_id)
+                        f"Last error: {s['last_error'] or 'None'}\n4H/market diagnostics: {len(s.get('diagnostics') or {})}", chat_id)
                 elif cmd == '/scan':
                     p = phase(); scan_id, started = start_scan(p)
                     if started:
@@ -144,7 +175,7 @@ def telegram_command_loop():
                     else:
                         lines = ['🏆 Top opportunities from last scan']
                         for i, x in enumerate(top, 1):
-                            lines.append(f"{i}. {x['signal']} {x['symbol']} {x['contract']} | Score {x['score']:.0f} | Premium ${x['premium']:.2f} | Entry ${x['entry_low']:.2f}-${x['entry_high']:.2f} | TP1 ${x['tp1']:.2f}")
+                            lines.append(f"{i}. {x['signal']} {x['symbol']} {x['contract']} | {x['confidence']:.0f}% | {x['market_regime']} | Entry ${x['entry_low']:.2f}-${x['entry_high']:.2f} | SL ${x['stop_loss']:.2f} | TP1 ${x['tp1']:.2f}")
                         send_message('\\n'.join(lines), chat_id)
                 else:
                     send_message('الأوامر المتاحة: /status /scan /top /help', chat_id)
