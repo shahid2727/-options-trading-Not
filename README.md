@@ -1,49 +1,27 @@
-# Options Opportunity Bot V6
+# Options Opportunity Bot V7.1
 
-Alert/research bot for U.S. options. **It does not place brokerage orders.**
+Alert/research scanner only. No brokerage orders are executed.
 
-## V6 features
-- Automatic scan every 5 minutes while the Render service is running.
-- Option quality scoring on a 0–100 scale.
-- Underlying 5-day and 20-day momentum.
-- Volume-ratio / volume-surge detection.
-- 20-day breakout proximity for calls and puts.
-- Liquidity filters: volume, OI, premium and spread.
-- Entry zone, stop loss, TP1/TP2/TP3, R:R and risk-budget sizing.
-- Telegram alerts with deduplication/cooldown.
-- Manual `/scan?secret=...` endpoint.
-- `/health`, `/status`, `/telegram-test`.
-- TradingView `/webhook` remains available.
-- Telegram API errors are now returned safely without exposing the bot token.
+## What changed
+- Scans configured equities plus **SPXW** via the SPX index underlying (`^SPX`).
+- SPXW is handled separately and filters for option contract symbols containing `SPXW` when the data provider exposes that field.
+- SPXW Global Trading Hours are recognized (8:15 PM–9:25 AM ET); regular SPX/SPXW hours are 9:30 AM–4:15 PM ET. Cboe also has a 4:15–5:00 PM ET curb session.
+- Equity pre-market scans are setup/watch alerts; U.S. equity options are not treated as executable during the stock pre-market.
+- Uses provider Greeks when valid and Black-Scholes delta approximation when missing/invalid.
+- SPX/SPXW option tick-size aware risk plan: $0.05 below $3 and $0.10 at/above $3.
+- Better liquidity, volume/OI, spread, momentum and breakout scoring.
+- Top 5 alerts only by default, with deduplication.
+- Telegram errors should never expose the bot token.
 
 ## Render environment
-Required:
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
+Set the variables in `.env.example`. Never commit real Telegram tokens.
 
-Recommended:
-- `TELEGRAM_TEST_SECRET` (temporary; remove after testing)
-- `RISK_BUDGET=100`
-- `SCAN_INTERVAL_SECONDS=300`
-- `MAX_ALERTS_PER_SCAN=5`
-- `ALERT_COOLDOWN_MINUTES=30`
-- `MIN_ALERT_SCORE=7`
-- `MARKET_ONLY=true`
-- `RUN_SCANNER=true`
+## Endpoints
+- GET `/health`
+- GET `/status`
+- GET `/scan?secret=YOUR_TELEGRAM_TEST_SECRET`
+- GET `/telegram-test?secret=YOUR_TELEGRAM_TEST_SECRET`
+- POST `/webhook` with `X-Webhook-Secret`
 
-## Test Telegram
-Open:
-`https://YOUR-SERVICE.onrender.com/telegram-test?secret=YOUR_TELEGRAM_TEST_SECRET`
-
-A successful response contains `"ok": true` and sends a test message.
-
-## Manual scan
-Open:
-`https://YOUR-SERVICE.onrender.com/scan?secret=YOUR_TELEGRAM_TEST_SECRET`
-
-This forces a scan and also sends the top candidates through Telegram.
-
-## Important limitations
-- Render Free can sleep/stop idle services, so the in-process scanner is not guaranteed to run continuously 24/7.
-- yfinance is not a dedicated real-time options feed. Greeks such as delta may be unavailable.
-- Alerts are research signals, not guarantees of profit and not automatic trade execution.
+## Important
+`yfinance` is a research-data source and may have delayed, incomplete, or missing option Greeks/quotes. Verify bid/ask and the live contract on your broker before acting. This bot does not guarantee returns and does not place orders.

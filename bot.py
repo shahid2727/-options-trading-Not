@@ -46,7 +46,7 @@ def telegram_test():
     if not token or not chat_id:
         return jsonify(ok=False, configured=False, error='missing Telegram environment variables'), 503
 
-    ok, err = send_telegram('✅ Telegram connection test successful\n\nOptions Opportunity Bot V6 is connected and ready.\nAlert/research mode only — no brokerage orders are executed.', return_error=True)
+    ok, err = send_telegram('✅ Telegram connection test successful\n\nOptions Opportunity Bot V7 is connected and ready.\nAlert/research mode only — no brokerage orders are executed.', return_error=True)
     if ok:
         logging.getLogger(__name__).info('Telegram manual test sent successfully')
         return jsonify(ok=True, configured=True, message='Telegram test message sent successfully')
