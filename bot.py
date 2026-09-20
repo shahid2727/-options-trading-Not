@@ -3,7 +3,7 @@ from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request
 from scanner import scan_all, provider_status
-from telegram_bot import send_message
+from telegram_bot import send_message, get_updates
 
 app = Flask(__name__)
 TZ = ZoneInfo('America/New_York')
@@ -69,6 +69,62 @@ def start_scan(p):
     threading.Thread(target=run_scan_job, args=(p, scan_id), daemon=True).start()
     return scan_id, True
 
+
+
+def telegram_command_loop():
+    """Long-poll Telegram and handle lightweight control commands."""
+    offset = None
+    allowed_chat = str(os.getenv('TELEGRAM_CHAT_ID', '')).strip()
+    while True:
+        try:
+            updates = get_updates(offset=offset, timeout=20)
+            for u in updates:
+                offset = int(u.get('update_id', 0)) + 1
+                msg = u.get('message') or {}
+                chat = msg.get('chat') or {}
+                chat_id = str(chat.get('id', '')).strip()
+                if not chat_id or (allowed_chat and chat_id != allowed_chat):
+                    continue
+                text = (msg.get('text') or '').strip()
+                if not text:
+                    continue
+                cmd = text.split()[0].split('@')[0].lower()
+                if cmd == '/help' or cmd == '/start':
+                    send_message(
+                        '🤖 Options Opportunity Bot\\n\\n'
+                        '/status — حالة البوت وآخر فحص\\n'
+                        '/scan — تشغيل فحص يدوي\\n'
+                        '/top — أفضل الفرص في آخر فحص\\n'
+                        '/help — عرض الأوامر', chat_id)
+                elif cmd == '/status':
+                    with lock: s = dict(state)
+                    send_message(
+                        f"🟢 Bot status\\nPhase: {phase()}\\n"
+                        f"Running: {s['running']}\\nScan running: {s['scan_running']}\\n"
+                        f"Last candidates: {s['last_candidates']}\\nLast alerts: {s['last_alerts']}\\n"
+                        f"Last scan: {s['last_scan'] or '—'}\\n"
+                        f"Last error: {s['last_error'] or 'None'}", chat_id)
+                elif cmd == '/scan':
+                    p = phase(); scan_id, started = start_scan(p)
+                    if started:
+                        send_message(f'🔎 Scan started\\nPhase: {p}\\nScan ID: {scan_id}', chat_id)
+                    else:
+                        with lock: current = state['scan_id']
+                        send_message(f'⏳ A scan is already running.\\nScan ID: {current}', chat_id)
+                elif cmd == '/top':
+                    with lock: top = list(state.get('last_top') or [])
+                    if not top:
+                        send_message('ℹ️ لا توجد فرص في آخر فحص حتى الآن.', chat_id)
+                    else:
+                        lines = ['🏆 Top opportunities from last scan']
+                        for i, x in enumerate(top, 1):
+                            lines.append(f"{i}. {x['signal']} {x['symbol']} {x['contract']} | Score {x['score']:.0f} | Premium ${x['premium']:.2f} | Entry ${x['entry_low']:.2f}-${x['entry_high']:.2f} | TP1 ${x['tp1']:.2f}")
+                        send_message('\\n'.join(lines), chat_id)
+                else:
+                    send_message('الأوامر المتاحة: /status /scan /top /help', chat_id)
+        except Exception:
+            time.sleep(3)
+
 def loop():
     interval = max(60, int(os.getenv('SCAN_INTERVAL_SECONDS','300')))
     while True:
@@ -132,4 +188,6 @@ def webhook():
 
 if __name__ == '__main__':
     threading.Thread(target=loop, daemon=True).start()
+    if os.getenv('TELEGRAM_COMMANDS_ENABLED','true').lower() == 'true':
+        threading.Thread(target=telegram_command_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=int(os.getenv('PORT','10000')))

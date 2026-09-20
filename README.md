@@ -41,3 +41,11 @@ TradingView webhook URL:
 `https://YOUR-RENDER-URL/webhook?secret=YOUR_WEBHOOK_SECRET`
 
 The webhook is for alerts/analysis only and never places trades.
+
+## Telegram commands
+With `TELEGRAM_COMMANDS_ENABLED=true`, the bot listens for commands from the configured `TELEGRAM_CHAT_ID`:
+- `/status` — current bot/scan status
+- `/scan` — start a manual background scan
+- `/top` — show the best results from the last scan
+- `/help` — show commands
+Only the configured Telegram chat ID is accepted. The bot never places trades.
