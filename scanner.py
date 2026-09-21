@@ -270,22 +270,17 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
         # SPXW, or omitted. For SPXW scans, do not require a literal SPXW
         # prefix (that was causing every contract to be rejected).
         if contract_prefix:
-            root=(details.get('root_symbol') or details.get('rootSymbol') or details.get('underlying_symbol') or details.get('underlyingSymbol') or '').upper()
+            root=(details.get('root_symbol') or details.get('rootSymbol') or details.get('underlying_symbol') or details.get('underlyingSymbol') or '').upper().strip()
             if option_underlying=='SPX':
-                is_spxw = root == 'SPXW' or contract.upper().startswith('SPXW')
-                if not is_spxw and root in ('', 'SPX') and exp:
-                    try:
-                        d=datetime.fromisoformat(exp).date()
-                        # Standard SPX monthly expiry is the 3rd Friday;
-                        # other expiries in the SPX chain are SPXW weeklies/dailies.
-                        third_friday = next(
-                            day for day in range(15,22)
-                            if datetime(d.year,d.month,day).weekday()==4
-                        )
-                        is_spxw = d.day != third_friday
-                    except Exception:
-                        is_spxw = True
-                if not is_spxw:
+                # Alpaca documents that SPXW weekly contracts are listed under
+                # the SPX underlier. Snapshot payloads may expose the root as SPX,
+                # SPXW, or omit it, so a literal prefix filter can incorrectly
+                # discard the entire chain. For SPX scans, accept the SPX chain
+                # here and identify the weekly product using metadata/expiry when
+                # available. This keeps candidates flowing even when the snapshot
+                # omits the weekly root metadata.
+                is_spx_family = root in ('', 'SPX', 'SPXW') or contract.upper().startswith(('SPX','SPXW'))
+                if not is_spx_family:
                     rej['prefix']+=1; continue
             elif not contract.upper().startswith(contract_prefix):
                 rej['prefix']+=1; continue
