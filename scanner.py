@@ -259,13 +259,17 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
     # `symbol` is the technical-data symbol; `option_underlying` can override the
     # Alpaca options root. This is used for SPXW: SPY supplies IEX technical bars
     # while SPX supplies the actual SPXW option chain.
-    m=multi_tf(symbol,caches); chain_root=option_underlying or symbol; progress('fetching_options', symbol=chain_root); chain=option_chain(chain_root, root_symbol=('SPXW' if option_underlying=='SPX' else None)); rows=chain.get('snapshots') or {}; out=[]; today=datetime.now(timezone.utc).date()
+    m=multi_tf(symbol,caches); chain_root=option_underlying or symbol; progress('fetching_options', symbol=chain_root); chain=option_chain(chain_root, root_symbol=None); rows=chain.get('snapshots') or {}; out=[]; today=datetime.now(timezone.utc).date()
     rej={'prefix':0,'bad_contract':0,'dte':0,'premium':0,'spread':0,'liquidity':0,'score':0,'alignment':0,'regime':0,'relaxed_candidates':0}
     progress('scoring', symbol=symbol, contracts=len(rows))
     for contract,snap in rows.items():
-        if contract_prefix and not (contract.startswith(contract_prefix) or (option_underlying=='SPX' and (contract.startswith('SPX') or contract.startswith('SPXW')))):
-            rej['prefix']+=1; continue
-        details=snap.get('details') or {}; exp,strike,typ=parse_contract(contract,details)
+        details=snap.get('details') or {}
+        if contract_prefix:
+            root=(details.get('root_symbol') or details.get('rootSymbol') or '').upper()
+            is_spxw = option_underlying=='SPX' and (root=='SPXW' or contract.startswith('SPXW'))
+            if not (contract.startswith(contract_prefix) or is_spxw):
+                rej['prefix']+=1; continue
+        exp,strike,typ=parse_contract(contract,details)
         if not exp or not strike or typ not in ('CALL','PUT'): rej['bad_contract']+=1; continue
         try:dte=(datetime.fromisoformat(exp).date()-today).days
         except Exception: rej['bad_contract']+=1; continue
