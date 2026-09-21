@@ -1,11 +1,11 @@
-# Telegram Options Opportunity Bot V10.0
+# Telegram Options Opportunity Bot V10.1
 
-V10.0 is a direct stability/diagnostics upgrade of the supplied V9.9 codebase. It remains **alert-only**: no brokerage execution and no order placement.
+V10.1 is a direct stability/diagnostics upgrade of the supplied V9.9 codebase. It remains **alert-only**: no brokerage execution and no order placement.
 
 ## V9.9 strategy preserved
-The existing V9.9 multi-timeframe analysis, regime filter, scoring weights, candidate thresholds, premium/risk model, confidence calculation, TP/SL model, SPXW support, symbol list, and alert cooldown are preserved. V10.0 does not lower the V9.9 minimum score or liquidity thresholds.
+The existing V9.9 multi-timeframe analysis, regime filter, scoring weights, candidate thresholds, premium/risk model, confidence calculation, TP/SL model, SPXW support, symbol list, and alert cooldown are preserved. V10.1 does not lower the V9.9 minimum score or liquidity thresholds.
 
-## V10.0 stability changes
+## V10.1 stability changes
 - Telegram long polling runs in its own thread and has independent diagnostics.
 - Scanner runs in a killable worker process. `SCAN_TIMEOUT_SECONDS` prevents an indefinitely stuck scan.
 - Scanner progress reports: `fetching_bars`, `fetching_options`, `scoring`, `alerts`, `complete`/`failed`.
@@ -23,7 +23,7 @@ Required secrets (keep in Render, never commit them):
 - `ALPACA_API_KEY`
 - `ALPACA_API_SECRET`
 
-V10.0 controls:
+V10.1 controls:
 ```text
 TELEGRAM_COMMANDS_ENABLED=true
 PREMARKET_ENABLED=true
@@ -35,7 +35,7 @@ ALPACA_RETRIES=2
 OPTIONS_MAX_PAGES=20
 ```
 
-The V9.9 variables remain supported, including `STOCK_SYMBOLS`, `INDEX_ROOTS=SPXW`, `SCAN_INTERVAL_SECONDS`, `MIN_SCORE`, `MIN_VOLUME`, `MIN_OI`, `MAX_SPREAD_PCT`, premium limits, `ALERT_COOLDOWN_SECONDS`, and `MAX_ALERTS`.
+The V9.9 variables remain supported, including `STOCK_SYMBOLS`, `INDEX_ROOTS=SPXW`, `SCAN_INTERVAL_SECONDS`, `MIN_SCORE`, `MIN_VOLUME`, `MIN_OI`, `MAX_SPREAD_PCT`, premium limits, and `ALERT_COOLDOWN_SECONDS`. Alert delivery limits use `MAX_ALERTS_PER_SCAN` (preferred) with `MAX_ALERTS` retained as a fallback.
 
 ## Telegram commands
 - `/start`
@@ -63,26 +63,28 @@ Use a Render Web Service with the included Dockerfile. Render provides `PORT`; t
 
 No API keys, Telegram tokens, or other secrets belong in GitHub.
 
-## V10.0.1 session fix
-
-The bot now distinguishes `CLOSED`, `OVERNIGHT`, and `scan already running`. `OVERNIGHT_ENABLED=true` enables the 20:00–04:00 ET extended/overnight phase. This label does not imply live options pricing; `data_mode` remains based on the provider feed.
-
-
-## V10.0 diagnostics update
-- Option-chain snapshots remain the source for latest quote/trade/greeks.
-- Read-only option-contract metadata is used to supply daily `open_interest` when the snapshot payload does not include it; no brokerage order/execution is performed.
-- Set `ALPACA_CONTRACTS_URL` to the appropriate Alpaca contracts endpoint for the account environment.
-- `/status` reports separate rejection counters for DTE, premium, spread, volume, open interest, score, trend alignment, and regime.
-- Provider diagnostics preserve HTTP status/timeout/connection information instead of collapsing it to `?`.
+## Alert diagnostics update
+- Alert cooldown is keyed by `symbol + contract`, so another contract for the same symbol is not blocked.
+- Eligible alerts are prioritized by score for delivery; scanner/scoring order is unchanged.
+- `/status` shows symbol, contract, score, premium, bid/ask, delivery status, and rejection reason for recent candidates.
+- `MAX_ALERTS_PER_SCAN` is the configurable per-scan alert cap; candidates beyond the cap are diagnosed as `max alerts per scan reached`, rather than suppressing the entire scan.
+- SPXW errors remain isolated from the other symbols.
 
 
-## V10.0.1 data-sufficiency fix
-- Historical multi-symbol bars now follow `next_page_token`; Alpaca documents that the limit is total across symbols, not per symbol.
-- Symbols with fewer than 55 bars retry individually with a longer lookback before being rejected.
-- SPXW never fabricates SPX bars from SPY; if SPX history is unavailable from the configured feed, it is skipped safely and diagnosed.
-- `/status` reports score min/max/average and how many scored contracts reached the configured threshold.
-- No V9.9 score or filter threshold was changed.
+## V10.1 alert levels
+- Telegram alerts now show the model **Entry Low**, **Entry Zone**, and maximum model entry.
+- Alerts show **Stop Loss**, **TP1/TP2/TP3**, percentage move from the low entry, profit per contract, suggested contracts, and total expected profit.
+- Underlying entry/SL/TP1/TP2/TP3 are also shown.
+- Scanner/scoring/filter logic is unchanged; this release surfaces the levels already calculated by the scanner.
 
-## SPXW data handling in V10.0
 
-SPXW remains configured and is not removed from the bot. However, Alpaca's documented `/v2/stocks/{symbol}/bars` historical endpoint is a stock-bars endpoint, and SPX is an index rather than an equity ticker. V10.0 therefore does **not** substitute SPY for SPX and does not fabricate SPX bars. When SPX history is unavailable, the scanner records `SPXW: skipped` instead of generating a provider error or false indicators. The rest of the scanner and all V9.9 scoring/thresholds are unchanged.
+## V10.2 SPXW fix
+- SPXW weekly index options are queried under the `SPX` underlier, matching Alpaca's index-options API model.
+- SPXW technical indicators use `SPY` as a proxy because Alpaca does not provide spot SPX index bars in the index-options data offering.
+- SPXW is isolated from the stock scan: a SPXW/API error is recorded in diagnostics and does not stop other symbols.
+- `/status` shows SPXW chain count, candidate count, and the exact SPXW error when present.
+- Telegram alerts show model entry-from-low, entry zone, stop, contract TP1/TP2/TP3, per-contract profit, suggested contracts, and underlying levels.
+- This does not change the scoring formula or candidate filters.
+
+### Important Alpaca requirement
+If SPXW still reports `403`, an empty chain, or an entitlement error after deployment, the code is reaching the correct SPX underlier path but the Alpaca account/data entitlement may not include index options. Alpaca documents SPXW as weekly contracts under the SPX underlier.
