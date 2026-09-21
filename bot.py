@@ -77,7 +77,8 @@ def format_alert(x):
         f"{badge}\n\n"
         f"🎯 SYMBOL: {x.get('symbol','')}\n"
         f"📄 CONTRACT: {x.get('contract','')}\n"
-        f"📈 {x.get('signal','')} | Score {x.get('score',0):.0f}/100\n\n"
+        f"📈 {x.get('signal','')} | Score {x.get('score',0):.0f}/100\n"
+        f"💥 EXPLOSIVE SCORE: {x.get('explosive_score',0):.0f}/100 {('🔥' if x.get('explosive_setup') else '')}\n\n"
         f"💰 CURRENT QUOTE\n"
         f"Bid: ${bid:.2f} | Ask: ${ask:.2f} | Mid: ${premium:.2f}\n\n"
         f"🟢 ENTRY FROM LOW\n"
@@ -99,13 +100,14 @@ def format_alert(x):
         f"SL: {x.get('underlying_stop_loss',0):.2f}\n"
         f"TP1 / TP2 / TP3: {x.get('underlying_tp1',0):.2f} / {x.get('underlying_tp2',0):.2f} / {x.get('underlying_tp3',0):.2f}\n\n"
         f"📊 SETUP\n"
+        f"Explosive signals: {', '.join(x.get('explosive_flags',[])) or '—'}\n"
         f"Confidence: {x.get('confidence',0):.0f}/100\n"
         f"Volume: {x.get('volume',0)} | OI: {x.get('open_interest',0)} | Spread: {x.get('spread_pct',0):.1f}%\n"
         f"Delta: {x.get('delta',0):.2f} | DTE: {x.get('dte',0)}\n"
         f"4H: {x.get('trend_4h','NEUTRAL')} | 1H: {x.get('trend_1h','NEUTRAL')} | 15M: {x.get('trend_15m','NEUTRAL')} | 5M: {x.get('trend_5m','NEUTRAL')}\n"
         f"Session: {phase_label(session)}\n"
         f"Data Mode: {data_mode}\n\n"
-        f"📈 Analyzed upside: +{x.get('projected_upside_pct',0):.0f}% | Target premium: ${x.get('projected_premium',0):.2f}\n"
+        f"📈 Model upside scenario: +{x.get('projected_upside_pct',0):.0f}% | Target premium: ${x.get('projected_premium',0):.2f}\n"
         f"Why: {', '.join(x.get('reasons',[]))}\n\n"
         f"⚠️ Entry/targets are model levels derived from the scanner; they are not guaranteed fills or support/resistance.\n"
         f"⚠️ Options data mode is {data_mode}; underlying feed is IEX."
@@ -167,12 +169,12 @@ def _finalize_scan(p, scan_id, results, diagnostics, started_at, error=None):
     alerts=0
     if error is None:
         # Keep scanner/scoring order untouched, but prioritize high-score candidates for alerts.
-        alert_candidates=sorted(list(results), key=lambda x:(x.get('score',0), x.get('confidence',0)), reverse=True)
+        alert_candidates=sorted(list(results), key=lambda x:(x.get('explosive_setup',False),x.get('explosive_score',0),x.get('score',0),x.get('confidence',0)), reverse=True)
         for x in alert_candidates:
             symbol=str(x.get('symbol',''))
             contract=str(x.get('contract',''))
             key=f"{symbol}:{contract}"
-            item={'symbol':symbol,'contract':contract,'score':x.get('score'),
+            item={'symbol':symbol,'contract':contract,'score':x.get('score'),'explosive_score':x.get('explosive_score'),'explosive_setup':x.get('explosive_setup'),
                   'premium':x.get('premium'),'bid':x.get('bid'),'ask':x.get('ask'),
                   'status':'pending','reason':None}
             last=state.get('last_alert_keys',{}).get(key)
@@ -212,7 +214,7 @@ def _finalize_scan(p, scan_id, results, diagnostics, started_at, error=None):
         state.update(last_scan=now.isoformat(), last_candidates=len(results), last_alerts=alerts,
                      last_error=error, last_session=p, scan_id=scan_id, scan_running=False,
                      scan_finished=now.isoformat(), scan_duration=round(duration,2), scan_stage='complete' if error is None else 'failed',
-                     last_top=sorted(list(results), key=lambda x:(x.get('score',0),x.get('confidence',0)), reverse=True)[:max_alerts],
+                     last_top=sorted(list(results), key=lambda x:(x.get('explosive_setup',False),x.get('explosive_score',0),x.get('score',0),x.get('confidence',0)), reverse=True)[:max_alerts],
                      diagnostics=diagnostics or {}, alert_diagnostics=alert_diag,
                      symbols_scanned=meta.get('symbols_scanned',state.get('symbols_scanned',0)),
                      contracts_scanned=meta.get('contracts_scanned',state.get('contracts_scanned',0)), provider_errors=provider_errors,
@@ -313,7 +315,7 @@ def _status_text():
             lines.append(f"{key}: {'OK' if not d.get('error') else 'ERROR'} | Chain: {d.get('chain_items',0)} | Candidates: {d.get('scored',0)}")
             lines.append(f"{key} rejections: Prefix={r.get('prefix',0)} | BadContract={r.get('bad_contract',0)} | DTE={r.get('dte',0)} | Premium={r.get('premium',0)} | Spread/Liquidity={r.get('spread',0)+r.get('liquidity',0)} | Score={r.get('score',0)} | 4H={r.get('alignment',0)} | Regime={r.get('regime',0)} | Relaxed={r.get('relaxed_candidates',0)}")
     for c in (ad.get('candidates') or [])[:50]:
-        lines.append(f"• {c.get('symbol','—')} | {c.get('contract','—')} | score={c.get('score','—')} | premium=${c.get('premium','—')} | bid={c.get('bid','—')} | ask={c.get('ask','—')} | {c.get('status','—')} | {c.get('reason','—')}")
+        lines.append(f"• {c.get('symbol','—')} | {c.get('contract','—')} | score={c.get('score','—')} | explosive={c.get('explosive_score','—')} | premium=${c.get('premium','—')} | bid={c.get('bid','—')} | ask={c.get('ask','—')} | {c.get('status','—')} | {c.get('reason','—')}")
     return "\n".join(lines)
 
 
@@ -366,13 +368,13 @@ def loop():
         time.sleep(interval)
 
 @app.get('/')
-def root(): return jsonify({'service':'options-opportunity-bot','version':'13.2.0','status':'ok','docs':'/health','scan':'/scan','scan_status':'/scan/status'})
+def root(): return jsonify({'service':'options-opportunity-bot','version':'13.1.0','status':'ok','docs':'/health','scan':'/scan','scan_status':'/scan/status'})
 
 @app.get('/health')
 def health():
     with lock: s=dict(state)
     s['telegram_configured']=bool(os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID')); s['scan_secret_configured']=bool(os.getenv('SCAN_SECRET')); s['provider']=provider_status(); s['telegram']=telegram_diagnostics()
-    return jsonify({'service':'options-opportunity-bot','version':'13.2.0','status':'ok','phase':phase(),'scanner':s})
+    return jsonify({'service':'options-opportunity-bot','version':'13.1.0','status':'ok','phase':phase(),'scanner':s})
 
 @app.get('/status')
 def status(): return health()

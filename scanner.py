@@ -16,9 +16,11 @@ MAX_SPREAD = float(os.getenv('MAX_SPREAD_PCT','25')); MIN_OI = int(os.getenv('MI
 MIN_SCORE = max(45.0, float(os.getenv('MIN_SCORE','50')))
 REQUIRE_4H_ALIGNMENT = os.getenv('REQUIRE_4H_ALIGNMENT','false').strip().lower() in ('1','true','yes','on')
 BLOCK_SIDEWAYS_CHOPPY = os.getenv('BLOCK_SIDEWAYS_CHOPPY','false').strip().lower() in ('1','true','yes','on')
-FALLBACK_MIN_SCORE = max(35.0, float(os.getenv('FALLBACK_MIN_SCORE','40')))
+FALLBACK_MIN_SCORE = max(45.0, float(os.getenv('FALLBACK_MIN_SCORE','45')))
+EXPLOSIVE_MIN_SCORE = max(65.0, float(os.getenv('EXPLOSIVE_MIN_SCORE','72')))
+EXPLOSIVE_MIN_VOLUME_RATIO = max(1.0, float(os.getenv('EXPLOSIVE_MIN_VOLUME_RATIO','1.5')))
+EXPLOSIVE_MAX_DTE = max(0, int(os.getenv('EXPLOSIVE_MAX_DTE','14')))
 RELAXED_MAX_SPREAD = float(os.getenv('RELAXED_MAX_SPREAD_PCT','35'))
-DISCOVERY_FALLBACK_SCORE = max(30.0, float(os.getenv('DISCOVERY_FALLBACK_SCORE','35')))
 RELAXED_MIN_OI = int(os.getenv('RELAXED_MIN_OI','5'))
 RELAXED_MIN_VOL = int(os.getenv('RELAXED_MIN_VOLUME','1'))
 ALERT_COOLDOWN = int(os.getenv('ALERT_COOLDOWN_SECONDS','900'))
@@ -100,6 +102,9 @@ def req(url, params=None, timeout=None):
                     time.sleep(min(4.0, 0.8 * (attempt + 1)))
                     continue
                 raise ProviderRequestError(f'Alpaca HTTP {r.status_code}', endpoint=endpoint, status_code=r.status_code, retry_count=attempt)
+            if r.status_code >= 400:
+                body = (r.text or '')[:500].replace('\n',' ')
+                raise ProviderRequestError(f'Alpaca HTTP {r.status_code}: {body}', endpoint=endpoint, status_code=r.status_code, retry_count=attempt)
             r.raise_for_status()
             try:
                 data=r.json()
@@ -263,29 +268,108 @@ def multi_tf(symbol,caches=None):
     reg=regime(f4,f1,f15,f5)
     return {'5m':f5,'15m':f15,'1h':f1,'4h':f4,'vwap':vwap,'volume_ratio':vr,'breakout':breakout,'regime':reg,'recent_high':recent_high,'recent_low':recent_low}
 
+def _option_contracts_fallback(underlying, side=None, root_symbol=None):
+    """Fallback universe from Alpaca Trading API, then hydrate quotes/greeks via snapshots.
+
+    The market-data chain endpoint can fail independently of the contracts endpoint.
+    Keeping these paths separate lets the scanner continue when chain discovery has a
+    transient/provider-specific problem, while preserving the same indicative feed.
+    """
+    today=datetime.now(timezone.utc).date()
+    trading_base=os.getenv('ALPACA_TRADING_BASE_URL','https://paper-api.alpaca.markets/v2').rstrip('/')
+    params={
+        'underlying_symbols':underlying,
+        'status':'active',
+        'expiration_date_gte':today.isoformat(),
+        'expiration_date_lte':(today+timedelta(days=30)).isoformat(),
+        'limit':int(os.getenv('OPTIONS_CONTRACTS_PAGE_LIMIT','10000')),
+    }
+    if side: params['type']=side.lower()
+    if root_symbol: params['root_symbol']=root_symbol
+    contracts=[]; page_token=None; pages=0
+    while pages < int(os.getenv('OPTIONS_CONTRACTS_MAX_PAGES','3')):
+        q=dict(params)
+        if page_token: q['page_token']=page_token
+        data=req(f'{trading_base}/options/contracts',q)
+        rows=data.get('option_contracts') or data.get('contracts') or []
+        contracts.extend(rows)
+        pages += 1
+        page_token=data.get('page_token') or data.get('next_page_token')
+        if not page_token: break
+
+    symbols=[]; metadata={}
+    for c in contracts:
+        sym=str(c.get('symbol') or '').upper()
+        if not sym: continue
+        symbols.append(sym)
+        metadata[sym]={
+            'details':{
+                'expiration_date':c.get('expiration_date'),
+                'strike_price':c.get('strike_price'),
+                'type':c.get('type'),
+                'root_symbol':c.get('root_symbol'),
+                'underlying_symbol':c.get('underlying_symbol'),
+                'open_interest':c.get('open_interest'),
+                'openInterest':c.get('open_interest'),
+            }
+        }
+
+    merged={}; batch_size=100
+    for i in range(0,len(symbols),batch_size):
+        batch=symbols[i:i+batch_size]
+        data=req(f'{OPTIONS}/snapshots', {
+            'symbols':','.join(batch),
+            'feed':os.getenv('ALPACA_OPTIONS_FEED','indicative'),
+            'limit':len(batch),
+        })
+        snaps=data.get('snapshots') or {}
+        for sym in batch:
+            base=metadata.get(sym,{}); snap=snaps.get(sym) or {}
+            if snap:
+                snap.setdefault('details',{}).update(base.get('details') or {})
+                merged[sym]=snap
+    return {'snapshots':merged,'pages':pages,'fallback':True,'contracts_discovered':len(symbols)}
+
 def option_chain(underlying, side=None, root_symbol=None):
     # Restrict snapshots to the next 30 calendar days. This dramatically reduces
     # pagination and Alpaca rate-limit pressure while matching the scanner DTE rule.
     today=datetime.now(timezone.utc).date()
     params={
         'feed':os.getenv('ALPACA_OPTIONS_FEED','indicative'),
-        'limit':OPTIONS_PAGE_LIMIT,
+        'limit':min(1000, OPTIONS_PAGE_LIMIT),
         'expiration_date_gte':today.isoformat(),
         'expiration_date_lte':(today+timedelta(days=30)).isoformat(),
     }
     if side: params['type']=side.lower()
     if root_symbol: params['root_symbol']=root_symbol
     merged={}; page_token=None; pages=0
-    while pages < OPTIONS_MAX_PAGES:
-        p=dict(params)
-        if page_token: p['page_token']=page_token
-        data=req(f'{OPTIONS}/snapshots/{underlying}',p)
-        rows=data.get('snapshots') or {}
-        merged.update(rows)
-        pages += 1
-        page_token=data.get('next_page_token')
-        if not page_token: break
-    return {'snapshots':merged,'pages':pages}
+    try:
+        while pages < OPTIONS_MAX_PAGES:
+            q=dict(params)
+            if page_token: q['page_token']=page_token
+            data=req(f'{OPTIONS}/snapshots/{underlying}',q)
+            rows=data.get('snapshots') or {}
+            merged.update(rows)
+            pages += 1
+            page_token=data.get('next_page_token')
+            if not page_token: break
+        return {'snapshots':merged,'pages':pages,'fallback':False}
+    except Exception as primary_error:
+        if str(os.getenv('OPTIONS_CHAIN_FALLBACK','true')).lower() not in ('1','true','yes','on'):
+            raise
+        progress('options_chain_fallback', underlying=underlying, error=str(primary_error)[:300])
+        try:
+            result=_option_contracts_fallback(underlying,side=side,root_symbol=root_symbol)
+            result['primary_error']=str(primary_error)[:500]
+            return result
+        except Exception as fallback_error:
+            raise ProviderRequestError(
+                f'Option chain failed; fallback also failed. primary={primary_error}; fallback={fallback_error}',
+                endpoint=getattr(fallback_error,'endpoint',f'/options/snapshots/{underlying}'),
+                status_code=getattr(fallback_error,'status_code',None),
+                retry_count=getattr(fallback_error,'retry_count',None),
+                cause=fallback_error
+            )
 
 def parse_contract(sym, details):
     """Parse Alpaca option details, with OCC-symbol fallback.
@@ -346,6 +430,46 @@ def score_setup(m, direction, spread, delta, vol, oi):
     elif m['regime']=='TRENDING': score+=5; reasons.append('trend regime')
     return max(0,min(100,score)), reasons, aligned4, aligned1, aligned15, aligned5
 
+def explosive_setup_score(m, direction, spread, delta, vol, oi, dte):
+    """Score contracts for explosive momentum setups (0-100).
+
+    This is a detection score, not a prediction. It rewards simultaneous
+    price acceleration, breakout, volume expansion, multi-timeframe alignment,
+    option sensitivity/liquidity and near-term expiry while penalizing wide
+    spreads and choppy/sideways regimes.
+    """
+    f5,f15,f1,f4=m['5m'],m['15m'],m['1h'],m['4h']
+    score=0.0; flags=[]
+    bullish=direction=='CALL'
+    trend5=(f5['last']>m['vwap'] and f5['ema20']>f5['ema50'] and f5['macd_delta']>0) if bullish else (f5['last']<m['vwap'] and f5['ema20']<f5['ema50'] and f5['macd_delta']<0)
+    trend15=(f15['last']>f15['ema20'] and f15['macd_delta']>0) if bullish else (f15['last']<f15['ema20'] and f15['macd_delta']<0)
+    trend1=(f1['last']>f1['ema20']>f1['ema50']) if bullish else (f1['last']<f1['ema20']<f1['ema50'])
+    breakout=m['breakout']==('UP' if bullish else 'DOWN')
+    volume=m['volume_ratio']>=EXPLOSIVE_MIN_VOLUME_RATIO
+    strong_volume=m['volume_ratio']>=2.0
+    acceleration=abs(f5['slope']) >= max(f5['atr']*0.35, f5['last']*0.0008)
+    delta_ok=abs(delta)>=0.35
+    tight=spread<=12
+    liquid=vol>=20 and oi>=20
+    near_term=dte<=EXPLOSIVE_MAX_DTE
+    trending=m['regime']=='TRENDING'
+    if trend5: score+=22; flags.append('5M momentum')
+    if trend15: score+=14; flags.append('15M momentum')
+    if trend1: score+=10; flags.append('1H alignment')
+    if breakout: score+=18; flags.append('BREAKOUT')
+    if volume: score+=12; flags.append('VOLUME EXPANSION')
+    if strong_volume: score+=5; flags.append('VOLUME SPIKE')
+    if acceleration: score+=8; flags.append('PRICE ACCELERATION')
+    if delta_ok: score+=5; flags.append('GAMMA/DELTA SENSITIVITY')
+    if tight: score+=4; flags.append('LIQUID SPREAD')
+    if liquid: score+=4; flags.append('OPTION LIQUIDITY')
+    if near_term: score+=3; flags.append('NEAR-TERM EXPIRY')
+    if trending: score+=5; flags.append('TREND REGIME')
+    if m['regime']=='SIDEWAYS': score-=20
+    elif m['regime']=='CHOPPY': score-=10
+    return round(max(0,min(100,score)),1), flags
+
+
 def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_underlying=None):
     # `symbol` is the technical-data symbol; `option_underlying` can override the
     # Alpaca options root. This is used for SPXW: SPY supplies IEX technical bars
@@ -399,15 +523,20 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
         if not strict_liquidity and not relaxed_liquidity: rej['spread' if spread>RELAXED_MAX_SPREAD else 'liquidity']+=1; continue
         delta=num(greeks.get('delta'),0.25 if typ=='CALL' else -0.25); direction=typ
         score,reasons,a4,a1,a15,a5=score_setup(m,direction,spread,delta,vol,oi)
+        explosive_score, explosive_flags = explosive_setup_score(m,direction,spread,delta,vol,oi,dte)
+        explosive_ok = (explosive_score >= EXPLOSIVE_MIN_SCORE and relaxed_liquidity and m['regime'] not in ('SIDEWAYS','CHOPPY'))
         strict_ok = score>=MIN_SCORE and (a4 or not REQUIRE_4H_ALIGNMENT) and (m['regime'] not in ('SIDEWAYS','CHOPPY') or not BLOCK_SIDEWAYS_CHOPPY)
         relaxed_ok = score>=FALLBACK_MIN_SCORE and relaxed_liquidity and (a4 or not REQUIRE_4H_ALIGNMENT) and (m['regime'] not in ('SIDEWAYS','CHOPPY') or not BLOCK_SIDEWAYS_CHOPPY)
-        if not strict_ok and not relaxed_ok:
+        if not strict_ok and not relaxed_ok and not explosive_ok:
             if score<MIN_SCORE: rej['score']+=1
             if REQUIRE_4H_ALIGNMENT and not a4: rej['alignment']+=1
             if BLOCK_SIDEWAYS_CHOPPY and m['regime'] in ('SIDEWAYS','CHOPPY'): rej['regime']+=1
             continue
-        relaxed = not strict_ok
-        if relaxed:
+        relaxed = not strict_ok and not explosive_ok
+        if explosive_ok:
+            reasons.append('💥 EXPLOSIVE MOMENTUM SETUP')
+            reasons.extend(explosive_flags)
+        elif relaxed:
             rej['relaxed_candidates']+=1
             reasons.append('RELAXED LIQUIDITY/SCORE FALLBACK')
         risk=max(premium*.20,0.10); entry_low=round(premium*.97,2); entry_high=round(premium*1.03,2); stop=round(max(.05,entry_low-risk),2)
@@ -424,44 +553,8 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
         projected_premium=max(0.05, premium + abs(delta)*underlying_move); projected_upside_pct=round(max(0.0,(projected_premium/premium-1)*100),1) if premium>0 else 0.0
         extreme_upside=projected_upside_pct>=UPSIDE_ALERT_PCT and premium<=affordable_cap
         if extreme_upside: reasons.append(f'projected upside > {UPSIDE_ALERT_PCT:.0f}%')
-        out.append({'signal':direction,'market':'OPTIONS','symbol':symbol,'contract':contract,'dte':dte,'premium':round(premium,2),'bid':round(bid,2),'ask':round(ask,2),'entry_low':entry_low,'entry_high':entry_high,'stop_loss':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'affordable':contracts>0,'max_loss':max_loss,'expected_profit_tp1':reward1,'expected_profit_tp2':reward2,'expected_profit_tp3':reward3,'underlying_entry':u_entry,'underlying_stop_loss':u_stop,'underlying_tp1':u_tp1,'underlying_tp2':u_tp2,'underlying_tp3':u_tp3,'atr_5m_points':round(atr_points,2),'score':round(score,1),'confidence':confidence,'tp1_confidence':tp1_conf,'tp2_confidence':tp2_conf,'tp3_confidence':tp3_conf,'projected_underlying_target':projected_underlying,'projected_premium':round(projected_premium,2),'projected_upside_pct':projected_upside_pct,'extreme_upside':extreme_upside,'market_regime':m['regime'],'volume':vol,'open_interest':oi,'spread_pct':round(spread,1),'delta':round(delta,3),'underlying':u_entry,'indicator_symbol':symbol,'option_underlying':chain_root,'vwap_state':'BULLISH' if u_entry>m['vwap'] else 'BEARISH','ema_state':'BULLISH' if m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH','rsi':round(m['5m']['rsi'],1),'macd_state':'BULLISH' if m['5m']['macd_delta']>0 else 'BEARISH','volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout'],'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL','adx_4h':round(m['4h']['adx'],1),'rsi_4h':round(m['4h']['rsi'],1),'reasons':reasons,'session':session,'data_mode':options_data_mode()})
-    # Discovery rescue: when the normal quality gates produce zero candidates,
-    # keep a small set of liquid near-the-money opportunities visible. These are
-    # explicitly tagged as DISCOVERY so the alert layer can apply its own policy.
-    if not out and rows:
-        rescue=[]
-        for contract,snap in rows.items():
-            details=snap.get('details') or {}
-            exp,strike,typ=parse_contract(contract,details)
-            if not exp or not strike or typ not in ('CALL','PUT'): continue
-            try: dte=(datetime.fromisoformat(exp).date()-today).days
-            except Exception: continue
-            if dte<0 or dte>14: continue
-            quote=snap.get('latestQuote') or {}; trade=snap.get('latestTrade') or {}; greeks=snap.get('greeks') or {}
-            bid=num(quote.get('bp')); ask=num(quote.get('ap')); last=num(trade.get('p')); premium=(bid+ask)/2 if bid>0 and ask>0 else last
-            if premium<=0 or premium<MIN_PREMIUM or premium>MAX_AFFORDABLE_PREMIUM: continue
-            spread=((ask-bid)/premium*100) if premium and ask>=bid else 999
-            daily=snap.get('dailyBar') or snap.get('daily_bar') or {}; vol=int(num(daily.get('v')))
-            if vol<=0: vol=int(num(trade.get('s'))) if trade else 0
-            oi=int(num(details.get('open_interest') or details.get('openInterest')))
-            if spread>RELAXED_MAX_SPREAD or vol<RELAXED_MIN_VOL or oi<RELAXED_MIN_OI: continue
-            delta=num(greeks.get('delta'),0.25 if typ=='CALL' else -0.25)
-            score,reasons,a4,a1,a15,a5=score_setup(m,typ,spread,delta,vol,oi)
-            if score < DISCOVERY_FALLBACK_SCORE: continue
-            reasons=list(reasons)+['DISCOVERY FALLBACK — normal filters returned 0']
-            rescue.append((score,vol,oi,contract,snap,exp,strike,typ,premium,bid,ask,delta,reasons,spread))
-        rescue.sort(key=lambda z:(z[0],z[1],z[2]),reverse=True)
-        for z in rescue[:3]:
-            score,vol,oi,contract,snap,exp,strike,typ,premium,bid,ask,delta,reasons,spread=z
-            risk=max(premium*.20,0.10); entry_low=round(premium*.97,2); entry_high=round(premium*1.03,2); stop=round(max(.05,entry_low-risk),2)
-            tp1=round(entry_high+risk,2); tp2=round(entry_high+2*risk,2); tp3=round(entry_high+3*risk,2)
-            contracts=max(0,int(RISK//(risk*100))); max_loss=round(risk*100*contracts,2)
-            atr_points=max(m['5m']['atr'],m['5m']['last']*0.001); u_entry=round(m['5m']['last'],2)
-            if typ=='CALL': u_stop=round(u_entry-atr_points,2); u_tp1=round(u_entry+atr_points,2); u_tp2=round(u_entry+2*atr_points,2); u_tp3=round(u_entry+3*atr_points,2)
-            else: u_stop=round(u_entry+atr_points,2); u_tp1=round(u_entry-atr_points,2); u_tp2=round(u_entry-2*atr_points,2); u_tp3=round(u_entry-3*atr_points,2)
-            confidence=round(min(88,max(50,50+score*.35)),0)
-            out.append({'signal':typ,'market':'OPTIONS','symbol':symbol,'contract':contract,'dte':dte,'premium':round(premium,2),'bid':round(bid,2),'ask':round(ask,2),'entry_low':entry_low,'entry_high':entry_high,'stop_loss':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'affordable':contracts>0,'max_loss':max_loss,'expected_profit_tp1':round(max(0,tp1-entry_high)*100*contracts,2),'expected_profit_tp2':round(max(0,tp2-entry_high)*100*contracts,2),'expected_profit_tp3':round(max(0,tp3-entry_high)*100*contracts,2),'underlying_entry':u_entry,'underlying_stop_loss':u_stop,'underlying_tp1':u_tp1,'underlying_tp2':u_tp2,'underlying_tp3':u_tp3,'atr_5m_points':round(atr_points,2),'score':round(score,1),'confidence':confidence,'tp1_confidence':round(min(92,confidence+3)),'tp2_confidence':round(max(25,confidence-10)),'tp3_confidence':round(max(15,confidence-22)),'projected_underlying_target':u_tp3,'projected_premium':round(premium+abs(delta)*abs(u_tp3-u_entry),2),'projected_upside_pct':round(max(0,(premium+abs(delta)*abs(u_tp3-u_entry))/premium*100-100),1),'extreme_upside':False,'market_regime':m['regime'],'volume':vol,'open_interest':oi,'spread_pct':round(spread,1),'delta':round(delta,3),'underlying':u_entry,'indicator_symbol':symbol,'option_underlying':chain_root,'rsi':round(m['5m']['rsi'],1),'volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout'],'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL','adx_4h':round(m['4h']['adx'],1),'rsi_4h':round(m['4h']['rsi'],1),'reasons':reasons,'session':session,'data_mode':options_data_mode(),'discovery_fallback':True})
-    return out, {'chain_items':len(rows),'scored':len(out), 'parse_note':'OCC fallback enabled','underlying':chain_root,'indicator_source':'Alpaca IEX multi-timeframe 5m/15m/1h/4h','option_source':'Alpaca options '+os.getenv('ALPACA_OPTIONS_FEED','indicative'),'market_regime':m['regime'],'rejections':rej,'config':{'spxw_max_premium':float(os.getenv('SPXW_MAX_PREMIUM','75.00')),'spxw_max_spread':float(os.getenv('SPXW_MAX_SPREAD_PCT','35')),'spxw_min_oi':int(os.getenv('SPXW_MIN_OI','5')),'spxw_min_volume':int(os.getenv('SPXW_MIN_VOLUME','1')),'min_score':MIN_SCORE,'fallback_min_score':FALLBACK_MIN_SCORE,'require_4h_alignment':REQUIRE_4H_ALIGNMENT,'block_sideways_choppy':BLOCK_SIDEWAYS_CHOPPY,'max_spread':MAX_SPREAD,'relaxed_max_spread':RELAXED_MAX_SPREAD,'min_oi':MIN_OI,'relaxed_min_oi':RELAXED_MIN_OI,'min_volume':MIN_VOL,'relaxed_min_volume':RELAXED_MIN_VOL},'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL'}
+        out.append({'signal':direction,'market':'OPTIONS','symbol':symbol,'contract':contract,'dte':dte,'premium':round(premium,2),'bid':round(bid,2),'ask':round(ask,2),'entry_low':entry_low,'entry_high':entry_high,'stop_loss':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'affordable':contracts>0,'max_loss':max_loss,'expected_profit_tp1':reward1,'expected_profit_tp2':reward2,'expected_profit_tp3':reward3,'underlying_entry':u_entry,'underlying_stop_loss':u_stop,'underlying_tp1':u_tp1,'underlying_tp2':u_tp2,'underlying_tp3':u_tp3,'atr_5m_points':round(atr_points,2),'score':round(score,1),'explosive_score':explosive_score,'explosive_setup':bool(explosive_ok),'explosive_flags':explosive_flags,'confidence':confidence,'tp1_confidence':tp1_conf,'tp2_confidence':tp2_conf,'tp3_confidence':tp3_conf,'projected_underlying_target':projected_underlying,'projected_premium':round(projected_premium,2),'projected_upside_pct':projected_upside_pct,'extreme_upside':extreme_upside,'market_regime':m['regime'],'volume':vol,'open_interest':oi,'spread_pct':round(spread,1),'delta':round(delta,3),'underlying':u_entry,'indicator_symbol':symbol,'option_underlying':chain_root,'vwap_state':'BULLISH' if u_entry>m['vwap'] else 'BEARISH','ema_state':'BULLISH' if m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH','rsi':round(m['5m']['rsi'],1),'macd_state':'BULLISH' if m['5m']['macd_delta']>0 else 'BEARISH','volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout'],'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL','adx_4h':round(m['4h']['adx'],1),'rsi_4h':round(m['4h']['rsi'],1),'reasons':reasons,'session':session,'data_mode':options_data_mode()})
+    return out, {'chain_items':len(rows),'scored':len(out), 'parse_note':'OCC fallback enabled', 'chain_fallback':bool(chain.get('fallback')), 'chain_pages':chain.get('pages',0), 'contracts_discovered':chain.get('contracts_discovered',0), 'primary_chain_error':chain.get('primary_error'),'underlying':chain_root,'indicator_source':'Alpaca IEX multi-timeframe 5m/15m/1h/4h','option_source':'Alpaca options '+os.getenv('ALPACA_OPTIONS_FEED','indicative'),'market_regime':m['regime'],'rejections':rej,'config':{'explosive_min_score':EXPLOSIVE_MIN_SCORE,'explosive_min_volume_ratio':EXPLOSIVE_MIN_VOLUME_RATIO,'explosive_max_dte':EXPLOSIVE_MAX_DTE,'spxw_max_premium':float(os.getenv('SPXW_MAX_PREMIUM','75.00')),'spxw_max_spread':float(os.getenv('SPXW_MAX_SPREAD_PCT','35')),'spxw_min_oi':int(os.getenv('SPXW_MIN_OI','5')),'spxw_min_volume':int(os.getenv('SPXW_MIN_VOLUME','1')),'min_score':MIN_SCORE,'fallback_min_score':FALLBACK_MIN_SCORE,'require_4h_alignment':REQUIRE_4H_ALIGNMENT,'block_sideways_choppy':BLOCK_SIDEWAYS_CHOPPY,'max_spread':MAX_SPREAD,'relaxed_max_spread':RELAXED_MAX_SPREAD,'min_oi':MIN_OI,'relaxed_min_oi':RELAXED_MIN_OI,'min_volume':MIN_VOL,'relaxed_min_volume':RELAXED_MIN_VOL},'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL'}
 
 def scan_all(session):
     if not headers():raise RuntimeError('Missing ALPACA_API_KEY / ALPACA_API_SECRET')
@@ -516,7 +609,7 @@ def scan_all(session):
         except Exception as e:
             diagnostics['SPXW']={'error':f'{type(e).__name__}: {e}','provider':'Alpaca','endpoint':getattr(e,'endpoint',''),'status_code':getattr(e,'status_code',None),'retry_count':getattr(e,'retry_count',None),'detail':repr(e)}
     progress('sorting', candidates=len(results))
-    results.sort(key=lambda x:(x['extreme_upside'],x['projected_upside_pct'],x['score'],x['confidence'],x['volume'],x['open_interest']),reverse=True)
+    results.sort(key=lambda x:(x.get('explosive_setup',False),x.get('explosive_score',0),x['extreme_upside'],x['projected_upside_pct'],x['score'],x['confidence'],x['volume'],x['open_interest']),reverse=True)
     diagnostics['__meta__']={'symbols_scanned':symbols_scanned,'contracts_scanned':contracts_scanned,'candidates':len(results),'provider':provider_status()}
     return results,diagnostics
 
