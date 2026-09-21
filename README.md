@@ -74,3 +74,11 @@ The bot now distinguishes `CLOSED`, `OVERNIGHT`, and `scan already running`. `OV
 - Set `ALPACA_CONTRACTS_URL` to the appropriate Alpaca contracts endpoint for the account environment.
 - `/status` reports separate rejection counters for DTE, premium, spread, volume, open interest, score, trend alignment, and regime.
 - Provider diagnostics preserve HTTP status/timeout/connection information instead of collapsing it to `?`.
+
+
+## V10.0.1 data-sufficiency fix
+- Historical multi-symbol bars now follow `next_page_token`; Alpaca documents that the limit is total across symbols, not per symbol.
+- Symbols with fewer than 55 bars retry individually with a longer lookback before being rejected.
+- SPXW never fabricates SPX bars from SPY; if SPX history is unavailable from the configured feed, it is skipped safely and diagnosed.
+- `/status` reports score min/max/average and how many scored contracts reached the configured threshold.
+- No V9.9 score or filter threshold was changed.

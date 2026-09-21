@@ -166,14 +166,38 @@ def fetch_bars(symbol,timeframe,days=45,limit=1000):
     return data.get('bars') or []
 
 def fetch_bars_batch(symbols,timeframe,days=45,limit=10000):
+    # Alpaca's multi-symbol historical bars endpoint is paginated and the
+    # limit applies to the total number of bars across all symbols, not per
+    # symbol. Always follow next_page_token so one symbol cannot crowd out
+    # another. This fixes sparse per-symbol caches without changing strategy.
     end_dt=datetime.now(timezone.utc); start_dt=end_dt-timedelta(days=days)
-    data=req(f'{ALPACA}/stocks/bars', {'symbols':','.join(symbols),'timeframe':timeframe,'start':start_dt.isoformat().replace('+00:00','Z'),'end':end_dt.isoformat().replace('+00:00','Z'),'limit':limit,'feed':'iex','sort':'asc'})
-    return data.get('bars') or {}
+    merged={s:[] for s in symbols}; token=None
+    max_pages=max(1,int(os.getenv('BARS_MAX_PAGES','20'))); pages=0
+    while pages < max_pages:
+        params={'symbols':','.join(symbols),'timeframe':timeframe,
+                'start':start_dt.isoformat().replace('+00:00','Z'),
+                'end':end_dt.isoformat().replace('+00:00','Z'),
+                'limit':limit,'feed':os.getenv('ALPACA_UNDERLYING_FEED','iex'),'sort':'asc'}
+        if token: params['page_token']=token
+        data=req(f'{ALPACA}/stocks/bars', params)
+        page=data.get('bars') or {}
+        for sym, rows in page.items():
+            merged.setdefault(sym,[]).extend(rows or [])
+        pages += 1
+        token=data.get('next_page_token')
+        if not token: break
+    return merged
 
 def frame_indicators(symbol,timeframe,days=45,cache=None):
     bars=(cache or {}).get(symbol) if cache is not None else None
-    if bars is None: bars=fetch_bars(symbol,timeframe,days)
-    closes=[num(b.get('c')) for b in bars if num(b.get('c'))>0]
+    closes=[num(b.get('c')) for b in (bars or []) if num(b.get('c'))>0]
+    # IEX can be sparse for some symbols/timeframes. If the batched cache has
+    # fewer than the minimum indicator history, retry that symbol directly
+    # with a longer lookback. This does not change any scoring threshold.
+    if len(closes)<55:
+        fallback_days=max(days, 45 if timeframe=='15Min' else 30 if timeframe=='5Min' else days)
+        bars=fetch_bars(symbol,timeframe,fallback_days)
+        closes=[num(b.get('c')) for b in bars if num(b.get('c'))>0]
     if len(closes)<55: raise RuntimeError(f'not enough {timeframe} bars for {symbol}: {len(closes)}')
     e20=ema(closes[-100:],20); e50=ema(closes[-100:],50); rr=rsi(closes,14); a=atr_bars(bars,14); ax=adx(bars,14)
     mf=ema(closes[-80:],12); ms=ema(closes[-80:],26); macd=mf-ms
@@ -316,6 +340,7 @@ def score_setup(m, direction, spread, delta, vol, oi):
 def scan_underlying(symbol, session, contract_prefix=None, caches=None, contract_meta=None):
     m=multi_tf(symbol,caches); progress('fetching_options', symbol=symbol); chain=option_chain(symbol); rows=chain.get('snapshots') or {}; out=[]; today=datetime.now(timezone.utc).date()
     rejection_counts={'invalid_contract':0,'dte':0,'premium':0,'spread':0,'volume':0,'open_interest':0,'score':0,'trend_alignment':0,'regime':0,'score_evaluated':0,'passed_all_filters':0}
+    score_values=[]
     progress('scoring', symbol=symbol, contracts=len(rows))
     for contract,snap in rows.items():
         if contract_prefix and not contract.startswith(contract_prefix): continue
@@ -349,6 +374,7 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, contract
         delta=num(greeks.get('delta'),0.25 if typ=='CALL' else -0.25); direction=typ
         score,reasons,a4,a1,a15,a5=score_setup(m,direction,spread,delta,vol,oi)
         rejection_counts['score_evaluated'] += 1
+        score_values.append(score)
         if score<MIN_SCORE:
             rejection_counts['score'] += 1
             continue
@@ -374,7 +400,7 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, contract
         extreme_upside=projected_upside_pct>=UPSIDE_ALERT_PCT and premium<=MAX_AFFORDABLE_PREMIUM
         if extreme_upside: reasons.append(f'projected upside > {UPSIDE_ALERT_PCT:.0f}%')
         out.append({'signal':direction,'market':'OPTIONS','symbol':symbol,'contract':contract,'dte':dte,'premium':round(premium,2),'entry_low':entry_low,'entry_high':entry_high,'stop_loss':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'max_loss':max_loss,'expected_profit_tp1':reward1,'expected_profit_tp2':reward2,'expected_profit_tp3':reward3,'underlying_entry':u_entry,'underlying_stop_loss':u_stop,'underlying_tp1':u_tp1,'underlying_tp2':u_tp2,'underlying_tp3':u_tp3,'atr_5m_points':round(atr_points,2),'score':round(score,1),'confidence':confidence,'tp1_confidence':tp1_conf,'tp2_confidence':tp2_conf,'tp3_confidence':tp3_conf,'projected_underlying_target':projected_underlying,'projected_premium':round(projected_premium,2),'projected_upside_pct':projected_upside_pct,'extreme_upside':extreme_upside,'market_regime':m['regime'],'volume':vol,'open_interest':oi,'spread_pct':round(spread,1),'delta':round(delta,3),'underlying':u_entry,'vwap_state':'BULLISH' if u_entry>m['vwap'] else 'BEARISH','ema_state':'BULLISH' if m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH','rsi':round(m['5m']['rsi'],1),'macd_state':'BULLISH' if m['5m']['macd_delta']>0 else 'BEARISH','volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout'],'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL','adx_4h':round(m['4h']['adx'],1),'rsi_4h':round(m['4h']['rsi'],1),'reasons':reasons,'session':session,'data_mode':options_data_mode()})
-    return out, {'chain_items':len(rows),'chain_pages':int(chain.get('pages',0) or 0),'scored':rejection_counts.get('score_evaluated',0),'rejections':rejection_counts,'final_candidates':len(out),'underlying':symbol,'indicator_source':'Alpaca IEX multi-timeframe 5m/15m/1h/4h','option_source':'Alpaca options '+os.getenv('ALPACA_OPTIONS_FEED','indicative'),'market_regime':m['regime'],'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['vwap'] else 'NEUTRAL'}
+    return out, {'chain_items':len(rows),'chain_pages':int(chain.get('pages',0) or 0),'scored':rejection_counts.get('score_evaluated',0),'rejections':rejection_counts,'final_candidates':len(out),'score_min':min(score_values) if score_values else None,'score_max':max(score_values) if score_values else None,'score_avg':round(statistics.mean(score_values),2) if score_values else None,'score_at_or_above_threshold':sum(1 for v in score_values if v>=MIN_SCORE),'underlying':symbol,'indicator_source':'Alpaca historical multi-timeframe bars','option_source':'Alpaca options '+os.getenv('ALPACA_OPTIONS_FEED','indicative'),'market_regime':m['regime'],'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['vwap'] else 'NEUTRAL'}
 
 def scan_all(session):
     if not headers():raise RuntimeError('Missing ALPACA_API_KEY / ALPACA_API_SECRET')
@@ -407,7 +433,10 @@ def scan_all(session):
     if 'SPXW' in INDEX_ROOTS:
         try:
             progress('scoring', symbol='SPXW', symbols_scanned=symbols_scanned, contracts_scanned=contracts_scanned)
-            r,d=scan_underlying('SPX',session,contract_prefix='SPXW',caches=caches,contract_meta=contract_meta)
+            # SPX is an index, not an equity ticker. Keep SPXW support but do
+            # not fabricate SPX bars from SPY; if the configured stock-bars
+            # feed cannot provide SPX history, report it and skip safely.
+            r,d=scan_underlying('SPX',session,contract_prefix='SPXW',caches={},contract_meta=contract_meta)
             for x in r:x['symbol']='SPXW'
             results.extend(r); diagnostics['SPXW']=d; contracts_scanned += int(d.get('chain_items',0)); progress('scoring', symbol='SPXW', symbols_scanned=symbols_scanned+1, contracts_scanned=contracts_scanned, candidates=len(results))
         except Exception as e:

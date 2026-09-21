@@ -275,21 +275,27 @@ def _normalize_provider_status(value, error=''):
 def _diagnostic_summary(diagnostics):
     totals={}
     score_evaluated=0; final_candidates=0; chain_items=0
+    score_values=[]; score_at_threshold=0
     for d in (diagnostics or {}).values():
         if not isinstance(d,dict): continue
         chain_items += int(d.get('chain_items',0) or 0)
         score_evaluated += int(d.get('scored',0) or 0)
         final_candidates += int(d.get('final_candidates',0) or 0)
+        if d.get('score_min') is not None: score_values.append((d.get('score_min'),d.get('score_max'),d.get('score_avg')))
+        score_at_threshold += int(d.get('score_at_or_above_threshold',0) or 0)
         r=d.get('rejections')
         if isinstance(r,dict):
             for k,v in r.items(): totals[k]=totals.get(k,0)+int(v or 0)
-    return totals, score_evaluated, final_candidates, chain_items
+    mins=[x[0] for x in score_values if x[0] is not None]; maxs=[x[1] for x in score_values if x[1] is not None]
+    avgs=[x[2] for x in score_values if x[2] is not None]
+    score_diag={'min':min(mins) if mins else None,'max':max(maxs) if maxs else None,'avg':round(sum(avgs)/len(avgs),2) if avgs else None,'at_or_above_threshold':score_at_threshold}
+    return totals, score_evaluated, final_candidates, chain_items, score_diag
 
 
 def _status_text():
     with lock: s=dict(state)
     td=telegram_diagnostics(); ps=provider_status(); et_iso, et_text = session_clock()
-    rejection_totals, score_evaluated, final_candidates, chain_items = _diagnostic_summary(s.get('diagnostics') or {})
+    rejection_totals, score_evaluated, final_candidates, chain_items, score_diag = _diagnostic_summary(s.get('diagnostics') or {})
     rejection_order=['invalid_contract','dte','premium','spread','volume','open_interest','score','trend_alignment','regime']
     rejection_text=', '.join(f'{k}={rejection_totals.get(k,0)}' for k in rejection_order if rejection_totals.get(k,0)) or 'None'
     provider_details=s.get('provider_errors') or []
@@ -308,6 +314,7 @@ def _status_text():
             f"Scan duration: {s.get('scan_duration') if s.get('scan_duration') is not None else '—'} s\n"
             f"Last error: {s['last_error'] or 'None'}\n"
             f"Diagnostics: chain={chain_items} | score_evaluated={score_evaluated} | final_candidates={final_candidates}\n"
+            f"Score stats: min={score_diag.get('min','—')} max={score_diag.get('max','—')} avg={score_diag.get('avg','—')} >=threshold={score_diag.get('at_or_above_threshold',0)}\n"
             f"Rejections: {rejection_text}\nTelegram polling: {td.get('telegram_running')}\n"
             f"Telegram last update: {td.get('telegram_last_update') or '—'}\nTelegram last error: {td.get('telegram_last_error') or 'None'}\n"
             f"Provider: {ps.get('name')} | Options feed: {ps.get('options_feed')} | Underlying feed: {ps.get('underlying_feed')}\n"
