@@ -15,3 +15,9 @@ The scanner first uses Alpaca market-data option chains. If that request fails, 
 
 ## V13.4 Explosive Momentum Detector
 The scanner now separately scores high-momentum option setups using multi-timeframe alignment, breakouts, volume expansion, price acceleration, delta sensitivity, liquidity and near-term expiry. `explosive_score` is a setup-detection score, not a guarantee of profit. Alerts prioritize explosive setups first.
+
+
+## V13.5 fixes
+- OPRA -> indicative fallback when the configured options feed is rejected.
+- More detailed provider/HTTP diagnostics in `/status`.
+- One market-close HERO alert per trading day when a candidate exists.

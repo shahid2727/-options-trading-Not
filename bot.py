@@ -14,7 +14,7 @@ state = {
     'scan_running': False, 'scan_started': None, 'scan_finished': None,
     'scan_duration': None, 'scan_stage': 'idle', 'symbols_scanned': 0, 'contracts_scanned': 0,
     'last_top': [], 'diagnostics': {}, 'last_alert_keys': {}, 'market_warning_sent': None,
-    'provider_errors': [], 'scan_process_pid': None, 'fetching_timeframe': None, 'fetching_completed': 0, 'fetching_total': 4, 'fetching_state': None, 'alert_diagnostics': {'candidates': []}
+    'provider_errors': [], 'scan_process_pid': None, 'fetching_timeframe': None, 'fetching_completed': 0, 'fetching_total': 4, 'fetching_state': None, 'alert_diagnostics': {'candidates': []}, 'hero_sent_date': None
 }
 
 
@@ -210,6 +210,27 @@ def _finalize_scan(p, scan_id, results, diagnostics, started_at, error=None):
     provider_errors=[]
     for k,v in (diagnostics or {}).items():
         if isinstance(v,dict) and v.get('error'): provider_errors.append({'source':k,'error':v.get('error'),'endpoint':v.get('endpoint'),'status_code':v.get('status_code'),'retry_count':v.get('retry_count')})
+    # One end-of-market HERO message per trading day. This is deliberately
+    # separate from normal alert cooldowns so the best discovered setup is
+    # still delivered after the close.
+    hero_enabled = os.getenv('MARKET_CLOSE_HERO_ENABLED','true').lower() in ('1','true','yes','on')
+    if error is None and hero_enabled and p == 'AFTER_HOURS' and results:
+        today_key=now.date().isoformat()
+        with lock:
+            hero_already_sent = state.get('hero_sent_date') == today_key
+        if not hero_already_sent:
+            hero=sorted(results, key=lambda x:(x.get('explosive_setup',False),
+                                                x.get('explosive_score',0),
+                                                x.get('score',0),
+                                                x.get('confidence',0)), reverse=True)[0]
+            hero_text=("🌙 MARKET-CLOSE HERO\n\n"
+                       "⭐ Best setup detected from today's final scan\n\n" +
+                       format_alert(hero))
+            hero_ok=send_message(hero_text)
+            if hero_ok:
+                with lock:
+                    state['hero_sent_date']=today_key
+
     with lock:
         state.update(last_scan=now.isoformat(), last_candidates=len(results), last_alerts=alerts,
                      last_error=error, last_session=p, scan_id=scan_id, scan_running=False,
@@ -314,6 +335,18 @@ def _status_text():
             r=d.get('rejections') or {}
             lines.append(f"{key}: {'OK' if not d.get('error') else 'ERROR'} | Chain: {d.get('chain_items',0)} | Candidates: {d.get('scored',0)}")
             lines.append(f"{key} rejections: Prefix={r.get('prefix',0)} | BadContract={r.get('bad_contract',0)} | DTE={r.get('dte',0)} | Premium={r.get('premium',0)} | Spread/Liquidity={r.get('spread',0)+r.get('liquidity',0)} | Score={r.get('score',0)} | 4H={r.get('alignment',0)} | Regime={r.get('regime',0)} | Relaxed={r.get('relaxed_candidates',0)}")
+            if d.get('error'):
+                lines.append(f"{key} provider detail: {str(d.get('error'))[:350]}")
+                if d.get('endpoint'): lines.append(f"{key} endpoint: {d.get('endpoint')} | HTTP={d.get('status_code')}")
+    provider_errors=s.get('provider_errors') or []
+    if provider_errors:
+        lines.append("")
+        lines.append("⚠️ Provider error details (first 8)")
+        for pe in provider_errors[:8]:
+            if isinstance(pe,dict):
+                lines.append(f"• {pe.get('source','?')}: {pe.get('error','?')} | HTTP={pe.get('status_code','—')} | {pe.get('endpoint','')}")
+            else:
+                lines.append(f"• {str(pe)[:350]}")
     for c in (ad.get('candidates') or [])[:50]:
         lines.append(f"• {c.get('symbol','—')} | {c.get('contract','—')} | score={c.get('score','—')} | explosive={c.get('explosive_score','—')} | premium=${c.get('premium','—')} | bid={c.get('bid','—')} | ask={c.get('ask','—')} | {c.get('status','—')} | {c.get('reason','—')}")
     return "\n".join(lines)

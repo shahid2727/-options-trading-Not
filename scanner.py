@@ -268,6 +268,20 @@ def multi_tf(symbol,caches=None):
     reg=regime(f4,f1,f15,f5)
     return {'5m':f5,'15m':f15,'1h':f1,'4h':f4,'vwap':vwap,'volume_ratio':vr,'breakout':breakout,'regime':reg,'recent_high':recent_high,'recent_low':recent_low}
 
+def _options_feeds():
+    """Return configured feed first, then safe public fallback when available."""
+    configured = str(os.getenv('ALPACA_OPTIONS_FEED','indicative')).strip().lower()
+    feeds = [configured]
+    # OPRA can require a paid entitlement. If it fails, indicative is still
+    # useful for discovery/scoring and prevents the entire scan from becoming
+    # Chain=0. We keep OPRA first so entitled accounts still get live data.
+    if configured == 'opra' and str(os.getenv('OPTIONS_FEED_FALLBACK','true')).lower() in ('1','true','yes','on'):
+        feeds.append('indicative')
+    elif configured in ('live', 'delayed') and str(os.getenv('OPTIONS_FEED_FALLBACK','true')).lower() in ('1','true','yes','on'):
+        feeds.append('indicative')
+    return list(dict.fromkeys(feeds))
+
+
 def _option_contracts_fallback(underlying, side=None, root_symbol=None):
     """Fallback universe from Alpaca Trading API, then hydrate quotes/greeks via snapshots.
 
@@ -317,16 +331,31 @@ def _option_contracts_fallback(underlying, side=None, root_symbol=None):
     merged={}; batch_size=100
     for i in range(0,len(symbols),batch_size):
         batch=symbols[i:i+batch_size]
-        data=req(f'{OPTIONS}/snapshots', {
-            'symbols':','.join(batch),
-            'feed':os.getenv('ALPACA_OPTIONS_FEED','indicative'),
-            'limit':len(batch),
-        })
+        last_error=None
+        data=None
+        for feed in _options_feeds():
+            try:
+                data=req(f'{OPTIONS}/snapshots', {
+                    'symbols':','.join(batch),
+                    'feed':feed,
+                    'limit':len(batch),
+                })
+                break
+            except Exception as e:
+                last_error=e
+                progress('options_feed_retry', underlying=underlying, feed=feed,
+                         error=str(e)[:300])
+        if data is None:
+            raise last_error or ProviderRequestError('No options snapshot feed available',
+                                                     endpoint='/options/snapshots')
         snaps=data.get('snapshots') or {}
         for sym in batch:
             base=metadata.get(sym,{}); snap=snaps.get(sym) or {}
             if snap:
                 snap.setdefault('details',{}).update(base.get('details') or {})
+                # Record the effective feed without changing the configured
+                # provider status shown to the user.
+                snap.setdefault('_scanner_meta', {})['feed_used'] = feed
                 merged[sym]=snap
     return {'snapshots':merged,'pages':pages,'fallback':True,'contracts_discovered':len(symbols)}
 
@@ -334,26 +363,45 @@ def option_chain(underlying, side=None, root_symbol=None):
     # Restrict snapshots to the next 30 calendar days. This dramatically reduces
     # pagination and Alpaca rate-limit pressure while matching the scanner DTE rule.
     today=datetime.now(timezone.utc).date()
-    params={
-        'feed':os.getenv('ALPACA_OPTIONS_FEED','indicative'),
+    base_params={
         'limit':min(1000, OPTIONS_PAGE_LIMIT),
         'expiration_date_gte':today.isoformat(),
         'expiration_date_lte':(today+timedelta(days=30)).isoformat(),
     }
-    if side: params['type']=side.lower()
-    if root_symbol: params['root_symbol']=root_symbol
-    merged={}; page_token=None; pages=0
+    if side: base_params['type']=side.lower()
+    if root_symbol: base_params['root_symbol']=root_symbol
+    merged={}; page_token=None; pages=0; primary_error=None; feed_used=None
     try:
-        while pages < OPTIONS_MAX_PAGES:
-            q=dict(params)
-            if page_token: q['page_token']=page_token
-            data=req(f'{OPTIONS}/snapshots/{underlying}',q)
-            rows=data.get('snapshots') or {}
-            merged.update(rows)
-            pages += 1
-            page_token=data.get('next_page_token')
-            if not page_token: break
-        return {'snapshots':merged,'pages':pages,'fallback':False}
+        for feed in _options_feeds():
+            try:
+                merged={}; page_token=None; pages=0
+                while pages < OPTIONS_MAX_PAGES:
+                    q=dict(base_params); q['feed']=feed
+                    if page_token: q['page_token']=page_token
+                    data=req(f'{OPTIONS}/snapshots/{underlying}',q)
+                    rows=data.get('snapshots') or {}
+                    merged.update(rows)
+                    pages += 1
+                    page_token=data.get('next_page_token')
+                    if not page_token: break
+                feed_used=feed
+                if merged or feed == _options_feeds()[-1]:
+                    break
+            except Exception as e:
+                primary_error=e
+                progress('options_feed_retry', underlying=underlying, feed=feed,
+                         error=str(e)[:300])
+                continue
+        if merged:
+            for snap in merged.values():
+                if isinstance(snap,dict):
+                    snap.setdefault('_scanner_meta', {})['feed_used'] = feed_used
+            return {'snapshots':merged,'pages':pages,'fallback':False,
+                    'feed_used':feed_used,
+                    'primary_error':str(primary_error)[:500] if primary_error else None}
+        if primary_error:
+            raise primary_error
+        return {'snapshots':{},'pages':pages,'fallback':False,'feed_used':feed_used}
     except Exception as primary_error:
         if str(os.getenv('OPTIONS_CHAIN_FALLBACK','true')).lower() not in ('1','true','yes','on'):
             raise
@@ -594,7 +642,11 @@ def scan_all(session):
             r,d=scan_underlying(sym,session,caches=caches); results.extend(r); diagnostics[sym]=d
             symbols_scanned += 1; contracts_scanned += int(d.get('chain_items',0)); progress('scoring', symbol=sym, symbols_scanned=symbols_scanned, contracts_scanned=contracts_scanned, candidates=len(results))
         except Exception as e:
-            diagnostics[sym]={'error':f'{type(e).__name__}: {e}','provider':'Alpaca','endpoint':getattr(e,'endpoint',''),'status_code':getattr(e,'status_code',None),'retry_count':getattr(e,'retry_count',None)}
+            diagnostics[sym]={'error':f'{type(e).__name__}: {e}','provider':'Alpaca',
+                              'endpoint':getattr(e,'endpoint',''),
+                              'status_code':getattr(e,'status_code',None),
+                              'retry_count':getattr(e,'retry_count',None),
+                              'detail':repr(e)}
             symbols_scanned += 1
     if 'SPXW' in INDEX_ROOTS:
         try:
@@ -620,4 +672,9 @@ def options_data_mode():
 def provider_status():
     feed=os.getenv('ALPACA_OPTIONS_FEED','indicative')
     mode=str(feed).lower()
-    return {'name':'Alpaca','configured':bool(os.getenv('ALPACA_API_KEY') and os.getenv('ALPACA_API_SECRET')),'options_feed':feed,'underlying_feed':'iex','data_mode':options_data_mode(),'note':'Free Alpaca options data may be delayed/indicative; IEX equity feed is real-time.' if mode in ('indicative','delayed','snapshot') else 'Options feed mode is configured explicitly; verify entitlement before treating it as real-time.'}
+    return {'name':'Alpaca','configured':bool(os.getenv('ALPACA_API_KEY') and os.getenv('ALPACA_API_SECRET')),
+            'options_feed':feed,'effective_fallback':'indicative' if feed.lower()=='opra' else feed,
+            'underlying_feed':'iex','data_mode':options_data_mode(),
+            'note':'OPRA is attempted first; if the account/feed rejects it, the scanner can fall back to indicative discovery.' if feed.lower()=='opra' else
+                  ('Free Alpaca options data may be delayed/indicative; IEX equity feed is real-time.' if mode in ('indicative','delayed','snapshot')
+                   else 'Options feed mode is configured explicitly; verify entitlement before treating it as real-time.') }
