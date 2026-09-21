@@ -82,3 +82,7 @@ The bot now distinguishes `CLOSED`, `OVERNIGHT`, and `scan already running`. `OV
 - SPXW never fabricates SPX bars from SPY; if SPX history is unavailable from the configured feed, it is skipped safely and diagnosed.
 - `/status` reports score min/max/average and how many scored contracts reached the configured threshold.
 - No V9.9 score or filter threshold was changed.
+
+## SPXW data handling in V10.0
+
+SPXW remains configured and is not removed from the bot. However, Alpaca's documented `/v2/stocks/{symbol}/bars` historical endpoint is a stock-bars endpoint, and SPX is an index rather than an equity ticker. V10.0 therefore does **not** substitute SPY for SPX and does not fabricate SPX bars. When SPX history is unavailable, the scanner records `SPXW: skipped` instead of generating a provider error or false indicators. The rest of the scanner and all V9.9 scoring/thresholds are unchanged.

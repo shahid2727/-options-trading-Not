@@ -404,7 +404,7 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, contract
 
 def scan_all(session):
     if not headers():raise RuntimeError('Missing ALPACA_API_KEY / ALPACA_API_SECRET')
-    results=[]; diagnostics={}; symbols=list(dict.fromkeys(STOCKS+(['SPX'] if 'SPXW' in INDEX_ROOTS else [])))
+    results=[]; diagnostics={}; symbols=list(dict.fromkeys(STOCKS))
     periods={'5m':('5Min',7),'15m':('15Min',20),'1h':('1Hour',45),'4h':('4Hour',180)}; caches={}
     progress('fetching_bars', symbols_total=len(symbols))
     for key,(tf,days) in periods.items():
@@ -431,16 +431,21 @@ def scan_all(session):
             diagnostics[sym]={'error':f'{type(e).__name__}: {e}','provider':'Alpaca','endpoint':getattr(e,'endpoint',''),'status_code':getattr(e,'status_code',None),'retry_count':getattr(e,'retry_count',None)}
             symbols_scanned += 1
     if 'SPXW' in INDEX_ROOTS:
-        try:
-            progress('scoring', symbol='SPXW', symbols_scanned=symbols_scanned, contracts_scanned=contracts_scanned)
-            # SPX is an index, not an equity ticker. Keep SPXW support but do
-            # not fabricate SPX bars from SPY; if the configured stock-bars
-            # feed cannot provide SPX history, report it and skip safely.
-            r,d=scan_underlying('SPX',session,contract_prefix='SPXW',caches={},contract_meta=contract_meta)
-            for x in r:x['symbol']='SPXW'
-            results.extend(r); diagnostics['SPXW']=d; contracts_scanned += int(d.get('chain_items',0)); progress('scoring', symbol='SPXW', symbols_scanned=symbols_scanned+1, contracts_scanned=contracts_scanned, candidates=len(results))
-        except Exception as e:
-            diagnostics['SPXW']={'error':f'{type(e).__name__}: {e}','provider':'Alpaca','endpoint':getattr(e,'endpoint',''),'status_code':getattr(e,'status_code',None),'retry_count':getattr(e,'retry_count',None)}
+        # Alpaca's documented historical stock-bars API is for stock symbols;
+        # SPX is an index and does not return SPX 5-minute bars through this
+        # endpoint. Do not retry the unsupported request, and never substitute
+        # SPY data because that would change the V9.9 indicator inputs. Keep
+        # SPXW configured and visible in diagnostics, but skip scoring until a
+        # real SPX index history source is configured.
+        diagnostics['SPXW']={
+            'status':'skipped',
+            'reason':'SPX index historical 5Min bars are not available from the configured Alpaca stock-bars endpoint',
+            'provider':'Alpaca',
+            'endpoint':'/v2/stocks/{symbol}/bars',
+            'data_substitution':False,
+            'strategy_changed':False,
+        }
+        progress('scoring', symbol='SPXW', symbols_scanned=symbols_scanned, contracts_scanned=contracts_scanned, candidates=len(results), status='skipped_no_index_history')
     progress('sorting', candidates=len(results))
     results.sort(key=lambda x:(x['extreme_upside'],x['projected_upside_pct'],x['score'],x['confidence'],x['volume'],x['open_interest']),reverse=True)
     diagnostics['__meta__']={'symbols_scanned':symbols_scanned,'contracts_scanned':contracts_scanned,'candidates':len(results),'provider':provider_status(),'contract_metadata_count':len(contract_meta)}

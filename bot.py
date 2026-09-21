@@ -315,6 +315,7 @@ def _status_text():
     rejection_order=['invalid_contract','dte','premium','spread','volume','open_interest','score','trend_alignment','regime']
     rejection_text=', '.join(f'{k}={rejection_totals.get(k,0)}' for k in rejection_order if rejection_totals.get(k,0)) or 'None'
     provider_details=s.get('provider_errors') or []
+    spxw_diag=(s.get('diagnostics') or {}).get('SPXW') or {}
     provider_text=''
     if provider_details:
         lines=[]
@@ -337,7 +338,8 @@ def _status_text():
             f"Telegram polling: {td.get('telegram_running')}\n"
             f"Telegram last update: {td.get('telegram_last_update') or '—'}\nTelegram last error: {td.get('telegram_last_error') or 'None'}\n"
             f"Provider: {ps.get('name')} | Options feed: {ps.get('options_feed')} | Underlying feed: {ps.get('underlying_feed')}\n"
-            f"Data mode: {ps.get('data_mode')}\nProvider errors: {len(provider_details)}{provider_text}")
+            f"Data mode: {ps.get('data_mode')}\nProvider errors: {len(provider_details)}{provider_text}\n"
+            f"SPXW: {spxw_diag.get('status','—')}" + (f" | {spxw_diag.get('reason')}" if spxw_diag.get('reason') else ""))
 
 
 def telegram_command_loop():
