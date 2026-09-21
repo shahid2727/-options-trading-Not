@@ -1,4 +1,4 @@
-import os, math, statistics, time
+import os, math, statistics, time, threading, re
 from datetime import datetime, timezone, timedelta
 from typing import Callable, Optional
 import requests
@@ -22,6 +22,11 @@ RELAXED_MIN_VOL = int(os.getenv('RELAXED_MIN_VOLUME','5'))
 ALERT_COOLDOWN = int(os.getenv('ALERT_COOLDOWN_SECONDS','900'))
 HTTP_TIMEOUT = max(1, float(os.getenv('ALPACA_HTTP_TIMEOUT','8')))
 RETRIES = max(0, int(os.getenv('ALPACA_RETRIES','2')))
+OPTIONS_PAGE_LIMIT = max(100, min(1000, int(os.getenv('OPTIONS_PAGE_LIMIT','1000'))))
+OPTIONS_MAX_PAGES = max(1, int(os.getenv('OPTIONS_MAX_PAGES','12')))
+OPTIONS_MIN_INTERVAL = max(0.05, float(os.getenv('OPTIONS_MIN_INTERVAL_SECONDS','0.20')))
+_options_rate_lock = threading.Lock()
+_options_last_request = 0.0
 
 _session = requests.Session()
 _progress: Optional[Callable[..., None]] = None
@@ -55,12 +60,24 @@ def headers():
     return {'APCA-API-KEY-ID':k,'APCA-API-SECRET-KEY':s} if k and s else {}
 
 
+def _pace_options_request(url):
+    global _options_last_request
+    if not url.startswith(OPTIONS):
+        return
+    with _options_rate_lock:
+        now=time.monotonic()
+        wait=OPTIONS_MIN_INTERVAL-(now-_options_last_request)
+        if wait>0: time.sleep(wait)
+        _options_last_request=time.monotonic()
+
+
 def req(url, params=None, timeout=None):
     timeout = HTTP_TIMEOUT if timeout is None else timeout
     last=None
     endpoint=url.replace(ALPACA, '').replace(OPTIONS, '/options')
     for attempt in range(RETRIES + 1):
         try:
+            _pace_options_request(url)
             r=_session.get(url, headers=headers(), params=params or {}, timeout=timeout)
             if r.status_code in (401, 403):
                 raise ProviderRequestError(f'Alpaca HTTP {r.status_code}', endpoint=endpoint, status_code=r.status_code, retry_count=attempt)
@@ -207,14 +224,19 @@ def multi_tf(symbol,caches=None):
     return {'5m':f5,'15m':f15,'1h':f1,'4h':f4,'vwap':vwap,'volume_ratio':vr,'breakout':breakout,'regime':reg,'recent_high':recent_high,'recent_low':recent_low}
 
 def option_chain(underlying, side=None, root_symbol=None):
-    params={'feed':os.getenv('ALPACA_OPTIONS_FEED','indicative'),'limit':1000}
+    # Restrict snapshots to the next 30 calendar days. This dramatically reduces
+    # pagination and Alpaca rate-limit pressure while matching the scanner DTE rule.
+    today=datetime.now(timezone.utc).date()
+    params={
+        'feed':os.getenv('ALPACA_OPTIONS_FEED','indicative'),
+        'limit':OPTIONS_PAGE_LIMIT,
+        'expiration_date_gte':today.isoformat(),
+        'expiration_date_lte':(today+timedelta(days=30)).isoformat(),
+    }
     if side: params['type']=side.lower()
-    # Alpaca index option roots: SPXW weekly contracts are listed under
-    # the SPX underlier. Use the API's root_symbol filter instead of relying
-    # on the OSI contract-string prefix.
     if root_symbol: params['root_symbol']=root_symbol
-    merged={}; page_token=None; pages=0; max_pages=max(1,int(os.getenv('OPTIONS_MAX_PAGES','20')))
-    while pages < max_pages:
+    merged={}; page_token=None; pages=0
+    while pages < OPTIONS_MAX_PAGES:
         p=dict(params)
         if page_token: p['page_token']=page_token
         data=req(f'{OPTIONS}/snapshots/{underlying}',p)
