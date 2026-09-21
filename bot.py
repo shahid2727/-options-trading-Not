@@ -293,11 +293,15 @@ def _status_text():
            f"Data mode: {ps.get('data_mode')}",f"Provider errors: {len(s.get('provider_errors') or [])}","",
            "🔔 Alert diagnostics",
            f"Max alerts/scan: {ad.get('max_alerts',0)} | Cooldown: {ad.get('cooldown_seconds',0)}s",
-           f"SPXW: {('OK' if isinstance(s.get('diagnostics',{}).get('SPXW'),dict) and not s.get('diagnostics',{}).get('SPXW',{}).get('error') else 'ERROR / NO DATA')} | Chain: {s.get('diagnostics',{}).get('SPXW',{}).get('chain_items','—') if isinstance(s.get('diagnostics',{}).get('SPXW'),dict) else '—'} | Candidates: {s.get('diagnostics',{}).get('SPXW',{}).get('scored','—') if isinstance(s.get('diagnostics',{}).get('SPXW'),dict) else '—'}",
-           f"SPXW error: {s.get('diagnostics',{}).get('SPXW',{}).get('error','None') if isinstance(s.get('diagnostics',{}).get('SPXW'),dict) else 'None'}", 
-
            f"Candidates: {len(ad.get('candidates') or [])} | Eligible: {ad.get('eligible',0)} | Cooldown rejected: {ad.get('cooldown_rejected',0)} | Max-alerts rejected: {ad.get('max_alerts_rejected',0)}",
            f"Send attempted: {ad.get('send_attempted',0)} | Success: {ad.get('send_success',0)} | Failed: {ad.get('send_failed',0)}"]
+    di=s.get('diagnostics') or {}
+    for key in ('SPXW',):
+        d=di.get(key) if isinstance(di,dict) else None
+        if isinstance(d,dict):
+            r=d.get('rejections') or {}
+            lines.append(f"{key}: {'OK' if not d.get('error') else 'ERROR'} | Chain: {d.get('chain_items',0)} | Candidates: {d.get('scored',0)}")
+            lines.append(f"{key} rejections: DTE={r.get('dte',0)} | Premium={r.get('premium',0)} | Spread/Liquidity={r.get('spread',0)+r.get('liquidity',0)} | Score={r.get('score',0)} | 4H={r.get('alignment',0)} | Regime={r.get('regime',0)} | Relaxed={r.get('relaxed_candidates',0)}")
     for c in (ad.get('candidates') or [])[:50]:
         lines.append(f"• {c.get('symbol','—')} | {c.get('contract','—')} | score={c.get('score','—')} | premium=${c.get('premium','—')} | bid={c.get('bid','—')} | ask={c.get('ask','—')} | {c.get('status','—')} | {c.get('reason','—')}")
     return "\n".join(lines)
@@ -317,7 +321,7 @@ def telegram_command_loop():
                     if not text: continue
                     cmd=text.split()[0].split('@')[0].lower()
                     if cmd in ('/start','/help'):
-                        send_message('🤖 Options Opportunity Bot V10.0\n\nAlert-only options scanner.\n/start — start\n/help — help\n/status — diagnostics\n/scan — manual scan\n/top — latest candidates',chat_id); continue
+                        send_message('🤖 Options Opportunity Bot V10.3\n\nAlert-only options scanner.\n/start — start\n/help — help\n/status — diagnostics\n/scan — manual scan\n/top — latest candidates',chat_id); continue
                     if cmd=='/privacy':
                         send_message('🔐 البوت Alert-only ولا ينفذ صفقات عبر وسيط.',chat_id); continue
                     if not allowed_chat or chat_id != allowed_chat:

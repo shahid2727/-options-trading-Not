@@ -12,7 +12,13 @@ MIN_PREMIUM = float(os.getenv('MIN_PREMIUM','0.30')); MAX_PREMIUM = float(os.get
 UPSIDE_ALERT_PCT = float(os.getenv('UPSIDE_ALERT_PCT','1000'))
 MAX_AFFORDABLE_PREMIUM = float(os.getenv('MAX_AFFORDABLE_PREMIUM','10.00'))
 MAX_SPREAD = float(os.getenv('MAX_SPREAD_PCT','15')); MIN_OI = int(os.getenv('MIN_OI','50')); MIN_VOL = int(os.getenv('MIN_VOLUME','20'))
-MIN_SCORE = max(70.0, float(os.getenv('MIN_SCORE','70')))
+MIN_SCORE = max(50.0, float(os.getenv('MIN_SCORE','60')))
+REQUIRE_4H_ALIGNMENT = os.getenv('REQUIRE_4H_ALIGNMENT','false').strip().lower() in ('1','true','yes','on')
+BLOCK_SIDEWAYS_CHOPPY = os.getenv('BLOCK_SIDEWAYS_CHOPPY','false').strip().lower() in ('1','true','yes','on')
+FALLBACK_MIN_SCORE = max(50.0, float(os.getenv('FALLBACK_MIN_SCORE','55')))
+RELAXED_MAX_SPREAD = float(os.getenv('RELAXED_MAX_SPREAD_PCT','25'))
+RELAXED_MIN_OI = int(os.getenv('RELAXED_MIN_OI','20'))
+RELAXED_MIN_VOL = int(os.getenv('RELAXED_MIN_VOLUME','5'))
 ALERT_COOLDOWN = int(os.getenv('ALERT_COOLDOWN_SECONDS','900'))
 HTTP_TIMEOUT = max(1, float(os.getenv('ALPACA_HTTP_TIMEOUT','8')))
 RETRIES = max(0, int(os.getenv('ALPACA_RETRIES','2')))
@@ -245,32 +251,39 @@ def score_setup(m, direction, spread, delta, vol, oi):
     elif m['regime']=='TRENDING': score+=5; reasons.append('trend regime')
     return max(0,min(100,score)), reasons, aligned4, aligned1, aligned15, aligned5
 
-def scan_underlying(symbol, session, contract_prefix=None, caches=None, indicator_symbol=None, chain_symbol=None):
-    # For index options (e.g. SPXW), Alpaca exposes the option chain under SPX,
-    # but does not provide spot-index bars. Use a liquid ETF proxy (SPY) for
-    # technical indicators while keeping the real SPX option chain.
-    indicator_symbol = indicator_symbol or symbol
-    chain_symbol = chain_symbol or symbol
-    m=multi_tf(indicator_symbol,caches); progress('fetching_options', symbol=symbol, indicator_symbol=indicator_symbol, chain_symbol=chain_symbol)
-    chain=option_chain(chain_symbol); rows=chain.get('snapshots') or {}; out=[]; today=datetime.now(timezone.utc).date()
+def scan_underlying(symbol, session, contract_prefix=None, caches=None):
+    m=multi_tf(symbol,caches); progress('fetching_options', symbol=symbol); chain=option_chain(symbol); rows=chain.get('snapshots') or {}; out=[]; today=datetime.now(timezone.utc).date()
+    rej={'prefix':0,'bad_contract':0,'dte':0,'premium':0,'spread':0,'liquidity':0,'score':0,'alignment':0,'regime':0,'relaxed_candidates':0}
     progress('scoring', symbol=symbol, contracts=len(rows))
     for contract,snap in rows.items():
-        if contract_prefix and not contract.startswith(contract_prefix): continue
+        if contract_prefix and not contract.startswith(contract_prefix): rej['prefix']+=1; continue
         details=snap.get('details') or {}; exp,strike,typ=parse_contract(contract,details)
-        if not exp or not strike or typ not in ('CALL','PUT'): continue
+        if not exp or not strike or typ not in ('CALL','PUT'): rej['bad_contract']+=1; continue
         try:dte=(datetime.fromisoformat(exp).date()-today).days
-        except Exception:continue
-        if dte<0 or dte>30:continue
+        except Exception: rej['bad_contract']+=1; continue
+        if dte<0 or dte>30: rej['dte']+=1; continue
         quote=snap.get('latestQuote') or {}; trade=snap.get('latestTrade') or {}; greeks=snap.get('greeks') or {}
         bid=num(quote.get('bp')); ask=num(quote.get('ap')); last=num(trade.get('p')); premium=(bid+ask)/2 if bid>0 and ask>0 else last
-        if premium<MIN_PREMIUM or premium>MAX_PREMIUM or premium>MAX_AFFORDABLE_PREMIUM:continue
+        if premium<MIN_PREMIUM or premium>MAX_PREMIUM or premium>MAX_AFFORDABLE_PREMIUM: rej['premium']+=1; continue
         spread=((ask-bid)/premium*100) if premium and ask>=bid else 999
         daily=snap.get('dailyBar') or snap.get('daily_bar') or {}; vol=int(num(daily.get('v'))); oi=int(num(details.get('open_interest') or details.get('openInterest')))
         if vol<=0:vol=int(num(trade.get('s'))) if trade else 0
-        if spread>MAX_SPREAD or vol<MIN_VOL or oi<MIN_OI:continue
+        strict_liquidity = spread<=MAX_SPREAD and vol>=MIN_VOL and oi>=MIN_OI
+        relaxed_liquidity = spread<=RELAXED_MAX_SPREAD and vol>=RELAXED_MIN_VOL and oi>=RELAXED_MIN_OI
+        if not strict_liquidity and not relaxed_liquidity: rej['spread' if spread>RELAXED_MAX_SPREAD else 'liquidity']+=1; continue
         delta=num(greeks.get('delta'),0.25 if typ=='CALL' else -0.25); direction=typ
         score,reasons,a4,a1,a15,a5=score_setup(m,direction,spread,delta,vol,oi)
-        if score<MIN_SCORE or not a4 or m['regime'] in ('SIDEWAYS','CHOPPY'):continue
+        strict_ok = score>=MIN_SCORE and (a4 or not REQUIRE_4H_ALIGNMENT) and (m['regime'] not in ('SIDEWAYS','CHOPPY') or not BLOCK_SIDEWAYS_CHOPPY)
+        relaxed_ok = score>=FALLBACK_MIN_SCORE and relaxed_liquidity and (a4 or not REQUIRE_4H_ALIGNMENT) and (m['regime'] not in ('SIDEWAYS','CHOPPY') or not BLOCK_SIDEWAYS_CHOPPY)
+        if not strict_ok and not relaxed_ok:
+            if score<MIN_SCORE: rej['score']+=1
+            if REQUIRE_4H_ALIGNMENT and not a4: rej['alignment']+=1
+            if BLOCK_SIDEWAYS_CHOPPY and m['regime'] in ('SIDEWAYS','CHOPPY'): rej['regime']+=1
+            continue
+        relaxed = not strict_ok
+        if relaxed:
+            rej['relaxed_candidates']+=1
+            reasons.append('RELAXED LIQUIDITY/SCORE FALLBACK')
         risk=max(premium*.20,0.10); entry_low=round(premium*.97,2); entry_high=round(premium*1.03,2); stop=round(max(.05,entry_low-risk),2)
         tp1=round(entry_high+risk,2); tp2=round(entry_high+2*risk,2); tp3=round(entry_high+3*risk,2)
         contracts=max(0,int(RISK//(risk*100))); max_loss=round(risk*100*contracts,2)
@@ -286,11 +299,11 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, indicato
         extreme_upside=projected_upside_pct>=UPSIDE_ALERT_PCT and premium<=MAX_AFFORDABLE_PREMIUM
         if extreme_upside: reasons.append(f'projected upside > {UPSIDE_ALERT_PCT:.0f}%')
         out.append({'signal':direction,'market':'OPTIONS','symbol':symbol,'contract':contract,'dte':dte,'premium':round(premium,2),'bid':round(bid,2),'ask':round(ask,2),'entry_low':entry_low,'entry_high':entry_high,'stop_loss':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'max_loss':max_loss,'expected_profit_tp1':reward1,'expected_profit_tp2':reward2,'expected_profit_tp3':reward3,'underlying_entry':u_entry,'underlying_stop_loss':u_stop,'underlying_tp1':u_tp1,'underlying_tp2':u_tp2,'underlying_tp3':u_tp3,'atr_5m_points':round(atr_points,2),'score':round(score,1),'confidence':confidence,'tp1_confidence':tp1_conf,'tp2_confidence':tp2_conf,'tp3_confidence':tp3_conf,'projected_underlying_target':projected_underlying,'projected_premium':round(projected_premium,2),'projected_upside_pct':projected_upside_pct,'extreme_upside':extreme_upside,'market_regime':m['regime'],'volume':vol,'open_interest':oi,'spread_pct':round(spread,1),'delta':round(delta,3),'underlying':u_entry,'vwap_state':'BULLISH' if u_entry>m['vwap'] else 'BEARISH','ema_state':'BULLISH' if m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH','rsi':round(m['5m']['rsi'],1),'macd_state':'BULLISH' if m['5m']['macd_delta']>0 else 'BEARISH','volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout'],'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL','adx_4h':round(m['4h']['adx'],1),'rsi_4h':round(m['4h']['rsi'],1),'reasons':reasons,'session':session,'data_mode':options_data_mode()})
-    return out, {'chain_items':len(rows),'scored':len(out),'underlying':symbol,'indicator_symbol':indicator_symbol,'chain_symbol':chain_symbol,'indicator_source':f'Alpaca IEX multi-timeframe proxy={indicator_symbol} for {symbol}','option_source':'Alpaca options '+os.getenv('ALPACA_OPTIONS_FEED','indicative'),'market_regime':m['regime'],'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['vwap'] else 'NEUTRAL'}
+    return out, {'chain_items':len(rows),'scored':len(out),'underlying':symbol,'indicator_source':'Alpaca IEX multi-timeframe 5m/15m/1h/4h','option_source':'Alpaca options '+os.getenv('ALPACA_OPTIONS_FEED','indicative'),'market_regime':m['regime'],'rejections':rej,'config':{'min_score':MIN_SCORE,'fallback_min_score':FALLBACK_MIN_SCORE,'require_4h_alignment':REQUIRE_4H_ALIGNMENT,'block_sideways_choppy':BLOCK_SIDEWAYS_CHOPPY,'max_spread':MAX_SPREAD,'relaxed_max_spread':RELAXED_MAX_SPREAD,'min_oi':MIN_OI,'relaxed_min_oi':RELAXED_MIN_OI,'min_volume':MIN_VOL,'relaxed_min_volume':RELAXED_MIN_VOL},'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL'}
 
 def scan_all(session):
     if not headers():raise RuntimeError('Missing ALPACA_API_KEY / ALPACA_API_SECRET')
-    results=[]; diagnostics={}; symbols=list(dict.fromkeys(STOCKS))
+    results=[]; diagnostics={}; symbols=list(dict.fromkeys(STOCKS+(['SPX'] if 'SPXW' in INDEX_ROOTS else [])))
     periods={'5m':('5Min',7),'15m':('15Min',20),'1h':('1Hour',45),'4h':('4Hour',180)}; caches={}
     progress('fetching_bars', symbols_total=len(symbols))
     for key,(tf,days) in periods.items():
@@ -310,18 +323,17 @@ def scan_all(session):
     if 'SPXW' in INDEX_ROOTS:
         try:
             progress('scoring', symbol='SPXW', symbols_scanned=symbols_scanned, contracts_scanned=contracts_scanned)
-            # SPXW weekly contracts live under the SPX underlier in Alpaca.
-            # Alpaca's index-options docs state that spot SPX index bars are not
-            # provided, so use SPY as the technical/price proxy and SPX as the
-            # actual option-chain underlier. This keeps SPXW independent of the
-            # stock scanner and prevents an SPX index-bars failure from blocking it.
-            r,d=scan_underlying('SPXW',session,contract_prefix='SPXW',caches=caches,indicator_symbol='SPY',chain_symbol='SPX')
+            proxy_caches={k:dict(v or {}) for k,v in caches.items()}
+            # Alpaca equity IEX does not provide a normal SPX stock bar stream; use SPY bars only for technical context while the option chain remains SPXW.
+            for k in ('5m','15m','1h','4h'):
+                if 'SPY' in proxy_caches.get(k, {}): proxy_caches[k]['SPX']=proxy_caches[k]['SPY']
+            r,d=scan_underlying('SPX',session,contract_prefix='SPXW',caches=proxy_caches)
             for x in r:
-                x['symbol']='SPXW'
-                x['underlying_proxy']='SPY'
-            results.extend(r); diagnostics['SPXW']=d; contracts_scanned += int(d.get('chain_items',0)); progress('scoring', symbol='SPXW', symbols_scanned=symbols_scanned+1, contracts_scanned=contracts_scanned, candidates=len(results))
+                x['symbol']='SPXW'; x['indicator_proxy']='SPX'
+
+            results.extend(r); diagnostics['SPXW']=d; contracts_scanned += int(d.get('chain_items',0)); symbols_scanned += 1; progress('scoring', symbol='SPXW', symbols_scanned=symbols_scanned+1, contracts_scanned=contracts_scanned, candidates=len(results))
         except Exception as e:
-            diagnostics['SPXW']={'error':f'{type(e).__name__}: {e}','provider':'Alpaca','endpoint':getattr(e,'endpoint',''),'status_code':getattr(e,'status_code',None),'retry_count':getattr(e,'retry_count',None),'note':'SPXW scan is isolated; other symbols continue. If the error is 403/empty chain, verify Alpaca Index Options enablement and options data entitlement.'}
+            diagnostics['SPXW']={'error':f'{type(e).__name__}: {e}','provider':'Alpaca','endpoint':getattr(e,'endpoint',''),'status_code':getattr(e,'status_code',None),'retry_count':getattr(e,'retry_count',None)}
     progress('sorting', candidates=len(results))
     results.sort(key=lambda x:(x['extreme_upside'],x['projected_upside_pct'],x['score'],x['confidence'],x['volume'],x['open_interest']),reverse=True)
     diagnostics['__meta__']={'symbols_scanned':symbols_scanned,'contracts_scanned':contracts_scanned,'candidates':len(results),'provider':provider_status()}
@@ -334,4 +346,4 @@ def options_data_mode():
 def provider_status():
     feed=os.getenv('ALPACA_OPTIONS_FEED','indicative')
     mode=str(feed).lower()
-    return {'name':'Alpaca','configured':bool(os.getenv('ALPACA_API_KEY') and os.getenv('ALPACA_API_SECRET')),'options_feed':feed,'underlying_feed':'iex','data_mode':options_data_mode(),'note':'Free Alpaca options data may be delayed/indicative; IEX equity feed is real-time. SPXW uses SPX option-chain data plus SPY as the technical proxy because Alpaca does not provide spot SPX index bars.' if mode in ('indicative','delayed','snapshot') else 'Options feed mode is configured explicitly; verify entitlement before treating it as real-time. SPXW uses SPX option-chain data plus SPY as the technical proxy because Alpaca does not provide spot SPX index bars.'}
+    return {'name':'Alpaca','configured':bool(os.getenv('ALPACA_API_KEY') and os.getenv('ALPACA_API_SECRET')),'options_feed':feed,'underlying_feed':'iex','data_mode':options_data_mode(),'note':'Free Alpaca options data may be delayed/indicative; IEX equity feed is real-time.' if mode in ('indicative','delayed','snapshot') else 'Options feed mode is configured explicitly; verify entitlement before treating it as real-time.'}
