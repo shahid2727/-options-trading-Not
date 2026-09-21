@@ -16,8 +16,9 @@ MAX_SPREAD = float(os.getenv('MAX_SPREAD_PCT','25')); MIN_OI = int(os.getenv('MI
 MIN_SCORE = max(45.0, float(os.getenv('MIN_SCORE','50')))
 REQUIRE_4H_ALIGNMENT = os.getenv('REQUIRE_4H_ALIGNMENT','false').strip().lower() in ('1','true','yes','on')
 BLOCK_SIDEWAYS_CHOPPY = os.getenv('BLOCK_SIDEWAYS_CHOPPY','false').strip().lower() in ('1','true','yes','on')
-FALLBACK_MIN_SCORE = max(45.0, float(os.getenv('FALLBACK_MIN_SCORE','45')))
+FALLBACK_MIN_SCORE = max(35.0, float(os.getenv('FALLBACK_MIN_SCORE','40')))
 RELAXED_MAX_SPREAD = float(os.getenv('RELAXED_MAX_SPREAD_PCT','35'))
+DISCOVERY_FALLBACK_SCORE = max(30.0, float(os.getenv('DISCOVERY_FALLBACK_SCORE','35')))
 RELAXED_MIN_OI = int(os.getenv('RELAXED_MIN_OI','5'))
 RELAXED_MIN_VOL = int(os.getenv('RELAXED_MIN_VOLUME','1'))
 ALERT_COOLDOWN = int(os.getenv('ALERT_COOLDOWN_SECONDS','900'))
@@ -424,6 +425,42 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
         extreme_upside=projected_upside_pct>=UPSIDE_ALERT_PCT and premium<=affordable_cap
         if extreme_upside: reasons.append(f'projected upside > {UPSIDE_ALERT_PCT:.0f}%')
         out.append({'signal':direction,'market':'OPTIONS','symbol':symbol,'contract':contract,'dte':dte,'premium':round(premium,2),'bid':round(bid,2),'ask':round(ask,2),'entry_low':entry_low,'entry_high':entry_high,'stop_loss':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'affordable':contracts>0,'max_loss':max_loss,'expected_profit_tp1':reward1,'expected_profit_tp2':reward2,'expected_profit_tp3':reward3,'underlying_entry':u_entry,'underlying_stop_loss':u_stop,'underlying_tp1':u_tp1,'underlying_tp2':u_tp2,'underlying_tp3':u_tp3,'atr_5m_points':round(atr_points,2),'score':round(score,1),'confidence':confidence,'tp1_confidence':tp1_conf,'tp2_confidence':tp2_conf,'tp3_confidence':tp3_conf,'projected_underlying_target':projected_underlying,'projected_premium':round(projected_premium,2),'projected_upside_pct':projected_upside_pct,'extreme_upside':extreme_upside,'market_regime':m['regime'],'volume':vol,'open_interest':oi,'spread_pct':round(spread,1),'delta':round(delta,3),'underlying':u_entry,'indicator_symbol':symbol,'option_underlying':chain_root,'vwap_state':'BULLISH' if u_entry>m['vwap'] else 'BEARISH','ema_state':'BULLISH' if m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH','rsi':round(m['5m']['rsi'],1),'macd_state':'BULLISH' if m['5m']['macd_delta']>0 else 'BEARISH','volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout'],'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL','adx_4h':round(m['4h']['adx'],1),'rsi_4h':round(m['4h']['rsi'],1),'reasons':reasons,'session':session,'data_mode':options_data_mode()})
+    # Discovery rescue: when the normal quality gates produce zero candidates,
+    # keep a small set of liquid near-the-money opportunities visible. These are
+    # explicitly tagged as DISCOVERY so the alert layer can apply its own policy.
+    if not out and rows:
+        rescue=[]
+        for contract,snap in rows.items():
+            details=snap.get('details') or {}
+            exp,strike,typ=parse_contract(contract,details)
+            if not exp or not strike or typ not in ('CALL','PUT'): continue
+            try: dte=(datetime.fromisoformat(exp).date()-today).days
+            except Exception: continue
+            if dte<0 or dte>14: continue
+            quote=snap.get('latestQuote') or {}; trade=snap.get('latestTrade') or {}; greeks=snap.get('greeks') or {}
+            bid=num(quote.get('bp')); ask=num(quote.get('ap')); last=num(trade.get('p')); premium=(bid+ask)/2 if bid>0 and ask>0 else last
+            if premium<=0 or premium<MIN_PREMIUM or premium>MAX_AFFORDABLE_PREMIUM: continue
+            spread=((ask-bid)/premium*100) if premium and ask>=bid else 999
+            daily=snap.get('dailyBar') or snap.get('daily_bar') or {}; vol=int(num(daily.get('v')))
+            if vol<=0: vol=int(num(trade.get('s'))) if trade else 0
+            oi=int(num(details.get('open_interest') or details.get('openInterest')))
+            if spread>RELAXED_MAX_SPREAD or vol<RELAXED_MIN_VOL or oi<RELAXED_MIN_OI: continue
+            delta=num(greeks.get('delta'),0.25 if typ=='CALL' else -0.25)
+            score,reasons,a4,a1,a15,a5=score_setup(m,typ,spread,delta,vol,oi)
+            if score < DISCOVERY_FALLBACK_SCORE: continue
+            reasons=list(reasons)+['DISCOVERY FALLBACK — normal filters returned 0']
+            rescue.append((score,vol,oi,contract,snap,exp,strike,typ,premium,bid,ask,delta,reasons,spread))
+        rescue.sort(key=lambda z:(z[0],z[1],z[2]),reverse=True)
+        for z in rescue[:3]:
+            score,vol,oi,contract,snap,exp,strike,typ,premium,bid,ask,delta,reasons,spread=z
+            risk=max(premium*.20,0.10); entry_low=round(premium*.97,2); entry_high=round(premium*1.03,2); stop=round(max(.05,entry_low-risk),2)
+            tp1=round(entry_high+risk,2); tp2=round(entry_high+2*risk,2); tp3=round(entry_high+3*risk,2)
+            contracts=max(0,int(RISK//(risk*100))); max_loss=round(risk*100*contracts,2)
+            atr_points=max(m['5m']['atr'],m['5m']['last']*0.001); u_entry=round(m['5m']['last'],2)
+            if typ=='CALL': u_stop=round(u_entry-atr_points,2); u_tp1=round(u_entry+atr_points,2); u_tp2=round(u_entry+2*atr_points,2); u_tp3=round(u_entry+3*atr_points,2)
+            else: u_stop=round(u_entry+atr_points,2); u_tp1=round(u_entry-atr_points,2); u_tp2=round(u_entry-2*atr_points,2); u_tp3=round(u_entry-3*atr_points,2)
+            confidence=round(min(88,max(50,50+score*.35)),0)
+            out.append({'signal':typ,'market':'OPTIONS','symbol':symbol,'contract':contract,'dte':dte,'premium':round(premium,2),'bid':round(bid,2),'ask':round(ask,2),'entry_low':entry_low,'entry_high':entry_high,'stop_loss':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'affordable':contracts>0,'max_loss':max_loss,'expected_profit_tp1':round(max(0,tp1-entry_high)*100*contracts,2),'expected_profit_tp2':round(max(0,tp2-entry_high)*100*contracts,2),'expected_profit_tp3':round(max(0,tp3-entry_high)*100*contracts,2),'underlying_entry':u_entry,'underlying_stop_loss':u_stop,'underlying_tp1':u_tp1,'underlying_tp2':u_tp2,'underlying_tp3':u_tp3,'atr_5m_points':round(atr_points,2),'score':round(score,1),'confidence':confidence,'tp1_confidence':round(min(92,confidence+3)),'tp2_confidence':round(max(25,confidence-10)),'tp3_confidence':round(max(15,confidence-22)),'projected_underlying_target':u_tp3,'projected_premium':round(premium+abs(delta)*abs(u_tp3-u_entry),2),'projected_upside_pct':round(max(0,(premium+abs(delta)*abs(u_tp3-u_entry))/premium*100-100),1),'extreme_upside':False,'market_regime':m['regime'],'volume':vol,'open_interest':oi,'spread_pct':round(spread,1),'delta':round(delta,3),'underlying':u_entry,'indicator_symbol':symbol,'option_underlying':chain_root,'rsi':round(m['5m']['rsi'],1),'volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout'],'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL','adx_4h':round(m['4h']['adx'],1),'rsi_4h':round(m['4h']['rsi'],1),'reasons':reasons,'session':session,'data_mode':options_data_mode(),'discovery_fallback':True})
     return out, {'chain_items':len(rows),'scored':len(out), 'parse_note':'OCC fallback enabled','underlying':chain_root,'indicator_source':'Alpaca IEX multi-timeframe 5m/15m/1h/4h','option_source':'Alpaca options '+os.getenv('ALPACA_OPTIONS_FEED','indicative'),'market_regime':m['regime'],'rejections':rej,'config':{'spxw_max_premium':float(os.getenv('SPXW_MAX_PREMIUM','75.00')),'spxw_max_spread':float(os.getenv('SPXW_MAX_SPREAD_PCT','35')),'spxw_min_oi':int(os.getenv('SPXW_MIN_OI','5')),'spxw_min_volume':int(os.getenv('SPXW_MIN_VOLUME','1')),'min_score':MIN_SCORE,'fallback_min_score':FALLBACK_MIN_SCORE,'require_4h_alignment':REQUIRE_4H_ALIGNMENT,'block_sideways_choppy':BLOCK_SIDEWAYS_CHOPPY,'max_spread':MAX_SPREAD,'relaxed_max_spread':RELAXED_MAX_SPREAD,'min_oi':MIN_OI,'relaxed_min_oi':RELAXED_MIN_OI,'min_volume':MIN_VOL,'relaxed_min_volume':RELAXED_MIN_VOL},'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL'}
 
 def scan_all(session):

@@ -8,3 +8,10 @@ Run with the existing Docker/Render configuration and environment variables. Do 
 
 
 V10.5 fixes Alpaca SPXW discovery by using the option-chain root_symbol=SPXW filter under the SPX underlier, rather than relying on contract-string prefixes. /status now exposes Prefix and BadContract rejection counts.
+
+
+## V13.2 changes
+- Lowers the relaxed opportunity threshold to 40.
+- Adds a controlled discovery fallback when normal filters return zero candidates.
+- Discovery results are tagged `discovery_fallback` and limited to the top 3 per symbol.
+- Keeps the existing risk, spread, liquidity, Telegram and timeout protections.
