@@ -224,8 +224,29 @@ def option_chain(underlying, side=None):
     return {'snapshots':merged,'pages':pages}
 
 def parse_contract(sym, details):
-    exp=details.get('expiration_date') or details.get('expirationDate'); strike=num(details.get('strike_price') or details.get('strikePrice')); typ=(details.get('type') or '').upper()
-    return exp,strike,typ
+    # Alpaca option-chain snapshots are keyed by OCC contract symbols. The
+    # snapshot payload does not reliably include expiration/strike/type in
+    # `details`, so fall back to parsing the OCC symbol itself. This avoids
+    # treating every valid snapshot as an invalid contract.
+    details = details or {}
+    exp = details.get('expiration_date') or details.get('expirationDate')
+    strike = num(details.get('strike_price') or details.get('strikePrice'))
+    typ = (details.get('type') or details.get('contract_type') or '').upper()
+    if exp and strike and typ in ('CALL','PUT'):
+        return exp, strike, typ
+    import re
+    m = re.match(r'^(.+?)(\d{6})([CP])(\d{8})$', str(sym).strip().upper())
+    if not m:
+        return None, 0.0, ''
+    root, yymmdd, cp, strike_raw = m.groups()
+    try:
+        yy, mm, dd = int(yymmdd[:2]), int(yymmdd[2:4]), int(yymmdd[4:6])
+        exp = f"{2000 + yy:04d}-{mm:02d}-{dd:02d}"
+        strike = int(strike_raw) / 1000.0
+    except (ValueError, TypeError):
+        return None, 0.0, ''
+    typ = 'CALL' if cp == 'C' else 'PUT'
+    return exp, strike, typ
 
 def score_setup(m, direction, spread, delta, vol, oi):
     f5,f15,f1,f4=m['5m'],m['15m'],m['1h'],m['4h']; score=0; reasons=[]
