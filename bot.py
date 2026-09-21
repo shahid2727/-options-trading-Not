@@ -14,7 +14,8 @@ state = {
     'scan_running': False, 'scan_started': None, 'scan_finished': None,
     'scan_duration': None, 'scan_stage': 'idle', 'symbols_scanned': 0, 'contracts_scanned': 0,
     'last_top': [], 'diagnostics': {}, 'last_alert_keys': {}, 'market_warning_sent': None,
-    'provider_errors': [], 'scan_process_pid': None
+    'provider_errors': [], 'scan_process_pid': None,
+    'alert_diagnostics': {'candidates': 0, 'eligible': 0, 'cooldown_rejected': 0, 'max_alerts_rejected': 0, 'send_attempted': 0, 'send_success': 0, 'send_failed': 0, 'send_errors': []}
 }
 
 
@@ -161,18 +162,33 @@ def _scan_process_worker(session_name, scan_id, conn):
 def _finalize_scan(p, scan_id, results, diagnostics, started_at, error=None):
     now=datetime.now(TZ); duration=max(0.0,(now-datetime.fromisoformat(started_at)).total_seconds())
     alerts=0; max_alerts=max(1,int(os.getenv('MAX_ALERTS','5'))); cooldown=max(300,int(os.getenv('ALERT_COOLDOWN_SECONDS','900')))
+    alert_diag={'candidates':len(results),'eligible':0,'cooldown_rejected':0,'max_alerts_rejected':max(0,len(results)-max_alerts),
+                'send_attempted':0,'send_success':0,'send_failed':0,'send_errors':[]}
     if error is None:
-        for x in results[:max_alerts]:
+        for idx, x in enumerate(results):
+            if idx >= max_alerts:
+                break
             key=f"{x['contract']}:{x['signal']}"; last=state.get('last_alert_keys',{}).get(key)
             if last:
                 try:
-                    if (now-datetime.fromisoformat(last)).total_seconds()<cooldown: continue
+                    if (now-datetime.fromisoformat(last)).total_seconds()<cooldown:
+                        alert_diag['cooldown_rejected'] += 1
+                        continue
                 except Exception: pass
+            alert_diag['eligible'] += 1
+            alert_diag['send_attempted'] += 1
             try:
-                if send_message(format_alert(x)):
+                sent=send_message(format_alert(x))
+                if sent:
                     alerts+=1
+                    alert_diag['send_success'] += 1
                     with lock: state.setdefault('last_alert_keys',{})[key]=now.isoformat()
+                else:
+                    alert_diag['send_failed'] += 1
+                    alert_diag['send_errors'].append(f"send_message returned False for {x.get('contract','?')}")
             except Exception as e:
+                alert_diag['send_failed'] += 1
+                alert_diag['send_errors'].append(f"{type(e).__name__}: {e}")
                 with lock: state['last_error']=f'Telegram alert {type(e).__name__}: {e}'
         warning=market_warning(diagnostics)
         if warning and state.get('market_warning_sent') is None:
@@ -188,7 +204,7 @@ def _finalize_scan(p, scan_id, results, diagnostics, started_at, error=None):
         state.update(last_scan=now.isoformat(), last_candidates=len(results), last_alerts=alerts,
                      last_error=error, last_session=p, scan_id=scan_id, scan_running=False,
                      scan_finished=now.isoformat(), scan_duration=round(duration,2), scan_stage='complete' if error is None else 'failed',
-                     last_top=results[:max_alerts], diagnostics=diagnostics or {},
+                     last_top=results[:max_alerts], diagnostics=diagnostics or {}, alert_diagnostics=alert_diag,
                      symbols_scanned=meta.get('symbols_scanned',state.get('symbols_scanned',0)),
                      contracts_scanned=meta.get('contracts_scanned',state.get('contracts_scanned',0)), provider_errors=provider_errors,
                      scan_process_pid=None)
@@ -315,7 +331,10 @@ def _status_text():
             f"Last error: {s['last_error'] or 'None'}\n"
             f"Diagnostics: chain={chain_items} | score_evaluated={score_evaluated} | final_candidates={final_candidates}\n"
             f"Score stats: min={score_diag.get('min','—')} max={score_diag.get('max','—')} avg={score_diag.get('avg','—')} >=threshold={score_diag.get('at_or_above_threshold',0)}\n"
-            f"Rejections: {rejection_text}\nTelegram polling: {td.get('telegram_running')}\n"
+            f"Rejections: {rejection_text}\n"
+            f"Alert diagnostics: candidates={s.get('alert_diagnostics',{}).get('candidates',0)} | eligible={s.get('alert_diagnostics',{}).get('eligible',0)} | cooldown_rejected={s.get('alert_diagnostics',{}).get('cooldown_rejected',0)} | max_alerts_rejected={s.get('alert_diagnostics',{}).get('max_alerts_rejected',0)} | send_attempted={s.get('alert_diagnostics',{}).get('send_attempted',0)} | send_success={s.get('alert_diagnostics',{}).get('send_success',0)} | send_failed={s.get('alert_diagnostics',{}).get('send_failed',0)}\n"
+            f"Alert send errors: {' || '.join(s.get('alert_diagnostics',{}).get('send_errors',[])[:5]) or 'None'}\n"
+            f"Telegram polling: {td.get('telegram_running')}\n"
             f"Telegram last update: {td.get('telegram_last_update') or '—'}\nTelegram last error: {td.get('telegram_last_error') or 'None'}\n"
             f"Provider: {ps.get('name')} | Options feed: {ps.get('options_feed')} | Underlying feed: {ps.get('underlying_feed')}\n"
             f"Data mode: {ps.get('data_mode')}\nProvider errors: {len(provider_details)}{provider_text}")
