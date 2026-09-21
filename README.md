@@ -66,3 +66,11 @@ No API keys, Telegram tokens, or other secrets belong in GitHub.
 ## V10.0.1 session fix
 
 The bot now distinguishes `CLOSED`, `OVERNIGHT`, and `scan already running`. `OVERNIGHT_ENABLED=true` enables the 20:00–04:00 ET extended/overnight phase. This label does not imply live options pricing; `data_mode` remains based on the provider feed.
+
+
+## V10.0 diagnostics update
+- Option-chain snapshots remain the source for latest quote/trade/greeks.
+- Read-only option-contract metadata is used to supply daily `open_interest` when the snapshot payload does not include it; no brokerage order/execution is performed.
+- Set `ALPACA_CONTRACTS_URL` to the appropriate Alpaca contracts endpoint for the account environment.
+- `/status` reports separate rejection counters for DTE, premium, spread, volume, open interest, score, trend alignment, and regime.
+- Provider diagnostics preserve HTTP status/timeout/connection information instead of collapsing it to `?`.

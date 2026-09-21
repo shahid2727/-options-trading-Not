@@ -5,6 +5,7 @@ import requests
 
 ALPACA = 'https://data.alpaca.markets/v2'
 OPTIONS = 'https://data.alpaca.markets/v1beta1/options'
+CONTRACTS = os.getenv('ALPACA_CONTRACTS_URL', 'https://paper-api.alpaca.markets/v2/options/contracts')
 STOCKS = [s.strip().upper() for s in os.getenv('STOCK_SYMBOLS','QQQ,NVDA,AMD,TSLA,AAPL,AMZN,META,MSFT,GOOGL,MU,AVGO,PLTR,SMCI,SPY,IWM').split(',') if s.strip()]
 INDEX_ROOTS = [s.strip().upper() for s in os.getenv('INDEX_ROOTS','SPXW').split(',') if s.strip()]
 RISK = float(os.getenv('RISK_BUDGET','100'))
@@ -98,9 +99,14 @@ def req(url, params=None, timeout=None):
             response = getattr(e, 'response', None)
             status = getattr(response, 'status_code', None)
             if attempt >= RETRIES:
+                label = f'Alpaca HTTP {status}' if status else (
+                    'Alpaca timeout' if isinstance(e, requests.Timeout) else
+                    'Alpaca connection error' if isinstance(e, requests.ConnectionError) else
+                    f'Alpaca {type(e).__name__}'
+                )
                 raise ProviderRequestError(
-                    f'Alpaca HTTP {status}' if status else type(e).__name__,
-                    endpoint=endpoint, status_code=status, retry_count=attempt, cause=e
+                    label, endpoint=endpoint, status_code=status or label,
+                    retry_count=attempt, cause=e
                 )
         except Exception as e:
             last=e
@@ -208,6 +214,39 @@ def multi_tf(symbol,caches=None):
     reg=regime(f4,f1,f15,f5)
     return {'5m':f5,'15m':f15,'1h':f1,'4h':f4,'vwap':vwap,'volume_ratio':vr,'breakout':breakout,'regime':reg,'recent_high':recent_high,'recent_low':recent_low}
 
+def fetch_contract_metadata(underlyings, min_date, max_date):
+    """Fetch option contract metadata once per scan to obtain daily open interest.
+
+    Alpaca option snapshots expose latest trade/quote/greeks, while contract
+    metadata exposes open_interest and its date. This lookup is read-only and
+    does not submit or execute brokerage orders.
+    """
+    underlyings=[u for u in dict.fromkeys(underlyings) if u]
+    if not underlyings:
+        return {}, {'pages':0,'contracts':0}
+    params={
+        'underlying_symbols': ','.join(underlyings),
+        'status':'active',
+        'expiration_date_gte':min_date.isoformat(),
+        'expiration_date_lte':max_date.isoformat(),
+        'limit':10000,
+    }
+    merged={}; token=None; pages=0
+    max_pages=max(1,int(os.getenv('CONTRACTS_MAX_PAGES','20')))
+    while pages < max_pages:
+        q=dict(params)
+        if token: q['page_token']=token
+        data=req(CONTRACTS,q)
+        rows=data.get('option_contracts') or data.get('contracts') or []
+        for c in rows:
+            sym=str(c.get('symbol') or '').upper()
+            if sym:
+                merged[sym]=c
+        pages += 1
+        token=data.get('next_page_token') or data.get('page_token')
+        if not token: break
+    return merged, {'pages':pages,'contracts':len(merged)}
+
 def option_chain(underlying, side=None):
     params={'feed':os.getenv('ALPACA_OPTIONS_FEED','indicative'),'limit':1000}
     if side: params['type']=side.lower()
@@ -274,9 +313,9 @@ def score_setup(m, direction, spread, delta, vol, oi):
     elif m['regime']=='TRENDING': score+=5; reasons.append('trend regime')
     return max(0,min(100,score)), reasons, aligned4, aligned1, aligned15, aligned5
 
-def scan_underlying(symbol, session, contract_prefix=None, caches=None):
+def scan_underlying(symbol, session, contract_prefix=None, caches=None, contract_meta=None):
     m=multi_tf(symbol,caches); progress('fetching_options', symbol=symbol); chain=option_chain(symbol); rows=chain.get('snapshots') or {}; out=[]; today=datetime.now(timezone.utc).date()
-    rejection_counts={'invalid_contract':0,'dte':0,'premium':0,'spread':0,'liquidity':0,'score':0,'trend_alignment':0,'regime':0}
+    rejection_counts={'invalid_contract':0,'dte':0,'premium':0,'spread':0,'volume':0,'open_interest':0,'score':0,'trend_alignment':0,'regime':0}
     progress('scoring', symbol=symbol, contracts=len(rows))
     for contract,snap in rows.items():
         if contract_prefix and not contract.startswith(contract_prefix): continue
@@ -295,10 +334,17 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None):
             rejection_counts['premium'] += 1
             continue
         spread=((ask-bid)/premium*100) if premium and ask>=bid else 999
-        daily=snap.get('dailyBar') or snap.get('daily_bar') or {}; vol=int(num(daily.get('v'))); oi=int(num(details.get('open_interest') or details.get('openInterest')))
+        daily=snap.get('dailyBar') or snap.get('daily_bar') or {}; vol=int(num(daily.get('v'))); meta=(contract_meta or {}).get(contract,{})
+        oi=int(num(details.get('open_interest') or details.get('openInterest') or snap.get('open_interest') or snap.get('openInterest') or meta.get('open_interest')))
         if vol<=0:vol=int(num(trade.get('s'))) if trade else 0
-        if spread>MAX_SPREAD or vol<MIN_VOL or oi<MIN_OI:
-            rejection_counts['spread' if spread>MAX_SPREAD else 'liquidity'] += 1
+        if spread>MAX_SPREAD:
+            rejection_counts['spread'] += 1
+            continue
+        if vol<MIN_VOL:
+            rejection_counts['volume'] += 1
+            continue
+        if oi<MIN_OI:
+            rejection_counts['open_interest'] += 1
             continue
         delta=num(greeks.get('delta'),0.25 if typ=='CALL' else -0.25); direction=typ
         score,reasons,a4,a1,a15,a5=score_setup(m,direction,spread,delta,vol,oi)
@@ -339,10 +385,19 @@ def scan_all(session):
         except Exception as e:
             caches[key]={}; diagnostics[f'__{key}']={'error':f'{type(e).__name__}: {e}','provider':'Alpaca','endpoint':getattr(e,'endpoint',''),'status_code':getattr(e,'status_code',None),'retry_count':getattr(e,'retry_count',None)}
     symbols_scanned=0; contracts_scanned=0
+    contract_meta={}
+    try:
+        min_date=datetime.now(timezone.utc).date(); max_date=min_date+timedelta(days=30)
+        progress('fetching_contract_metadata', symbols=len(STOCKS)+ (1 if 'SPXW' in INDEX_ROOTS else 0))
+        meta_underlyings=list(STOCKS)+(['SPX'] if 'SPXW' in INDEX_ROOTS else [])
+        contract_meta, meta_diag=fetch_contract_metadata(meta_underlyings,min_date,max_date)
+        diagnostics['__contract_metadata__']={'contracts':meta_diag['contracts'],'pages':meta_diag['pages'],'provider':'Alpaca','endpoint':CONTRACTS}
+    except Exception as e:
+        diagnostics['__contract_metadata__']={'error':f'{type(e).__name__}: {e}','provider':'Alpaca','endpoint':getattr(e,'endpoint',CONTRACTS),'status_code':getattr(e,'status_code',None),'retry_count':getattr(e,'retry_count',None)}
     for sym in STOCKS:
         try:
             progress('scoring', symbol=sym, symbols_scanned=symbols_scanned, contracts_scanned=contracts_scanned)
-            r,d=scan_underlying(sym,session,caches=caches); results.extend(r); diagnostics[sym]=d
+            r,d=scan_underlying(sym,session,caches=caches,contract_meta=contract_meta); results.extend(r); diagnostics[sym]=d
             symbols_scanned += 1; contracts_scanned += int(d.get('chain_items',0)); progress('scoring', symbol=sym, symbols_scanned=symbols_scanned, contracts_scanned=contracts_scanned, candidates=len(results))
         except Exception as e:
             diagnostics[sym]={'error':f'{type(e).__name__}: {e}','provider':'Alpaca','endpoint':getattr(e,'endpoint',''),'status_code':getattr(e,'status_code',None),'retry_count':getattr(e,'retry_count',None)}
@@ -350,14 +405,14 @@ def scan_all(session):
     if 'SPXW' in INDEX_ROOTS:
         try:
             progress('scoring', symbol='SPXW', symbols_scanned=symbols_scanned, contracts_scanned=contracts_scanned)
-            r,d=scan_underlying('SPX',session,contract_prefix='SPXW',caches=caches)
+            r,d=scan_underlying('SPX',session,contract_prefix='SPXW',caches=caches,contract_meta=contract_meta)
             for x in r:x['symbol']='SPXW'
             results.extend(r); diagnostics['SPXW']=d; contracts_scanned += int(d.get('chain_items',0)); progress('scoring', symbol='SPXW', symbols_scanned=symbols_scanned+1, contracts_scanned=contracts_scanned, candidates=len(results))
         except Exception as e:
             diagnostics['SPXW']={'error':f'{type(e).__name__}: {e}','provider':'Alpaca','endpoint':getattr(e,'endpoint',''),'status_code':getattr(e,'status_code',None),'retry_count':getattr(e,'retry_count',None)}
     progress('sorting', candidates=len(results))
     results.sort(key=lambda x:(x['extreme_upside'],x['projected_upside_pct'],x['score'],x['confidence'],x['volume'],x['open_interest']),reverse=True)
-    diagnostics['__meta__']={'symbols_scanned':symbols_scanned,'contracts_scanned':contracts_scanned,'candidates':len(results),'provider':provider_status()}
+    diagnostics['__meta__']={'symbols_scanned':symbols_scanned,'contracts_scanned':contracts_scanned,'candidates':len(results),'provider':provider_status(),'contract_metadata_count':len(contract_meta)}
     return results,diagnostics
 
 def options_data_mode():
