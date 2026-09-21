@@ -264,12 +264,31 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
     progress('scoring', symbol=symbol, contracts=len(rows))
     for contract,snap in rows.items():
         details=snap.get('details') or {}
-        if contract_prefix:
-            root=(details.get('root_symbol') or details.get('rootSymbol') or '').upper()
-            is_spxw = option_underlying=='SPX' and (root=='SPXW' or contract.startswith('SPXW'))
-            if not (contract.startswith(contract_prefix) or is_spxw):
-                rej['prefix']+=1; continue
         exp,strike,typ=parse_contract(contract,details)
+        # SPXW is often returned by Alpaca inside the SPX option chain.
+        # Depending on the endpoint/snapshot payload, root_symbol may be SPX,
+        # SPXW, or omitted. For SPXW scans, do not require a literal SPXW
+        # prefix (that was causing every contract to be rejected).
+        if contract_prefix:
+            root=(details.get('root_symbol') or details.get('rootSymbol') or details.get('underlying_symbol') or details.get('underlyingSymbol') or '').upper()
+            if option_underlying=='SPX':
+                is_spxw = root == 'SPXW' or contract.upper().startswith('SPXW')
+                if not is_spxw and root in ('', 'SPX') and exp:
+                    try:
+                        d=datetime.fromisoformat(exp).date()
+                        # Standard SPX monthly expiry is the 3rd Friday;
+                        # other expiries in the SPX chain are SPXW weeklies/dailies.
+                        third_friday = next(
+                            day for day in range(15,22)
+                            if datetime(d.year,d.month,day).weekday()==4
+                        )
+                        is_spxw = d.day != third_friday
+                    except Exception:
+                        is_spxw = True
+                if not is_spxw:
+                    rej['prefix']+=1; continue
+            elif not contract.upper().startswith(contract_prefix):
+                rej['prefix']+=1; continue
         if not exp or not strike or typ not in ('CALL','PUT'): rej['bad_contract']+=1; continue
         try:dte=(datetime.fromisoformat(exp).date()-today).days
         except Exception: rej['bad_contract']+=1; continue
