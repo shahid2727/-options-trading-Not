@@ -14,7 +14,7 @@ state = {
     'scan_running': False, 'scan_started': None, 'scan_finished': None,
     'scan_duration': None, 'scan_stage': 'idle', 'symbols_scanned': 0, 'contracts_scanned': 0,
     'last_top': [], 'diagnostics': {}, 'last_alert_keys': {}, 'market_warning_sent': None,
-    'provider_errors': [], 'scan_process_pid': None, 'alert_diagnostics': {'candidates': []}
+    'provider_errors': [], 'scan_process_pid': None, 'fetching_timeframe': None, 'fetching_completed': 0, 'fetching_total': 4, 'fetching_state': None, 'alert_diagnostics': {'candidates': []}
 }
 
 
@@ -129,6 +129,11 @@ def _apply_progress(msg):
         state['scan_stage'] = msg.get('stage', state['scan_stage'])
         for key in ('symbols_scanned','contracts_scanned','last_candidates'):
             if key in msg: state[key] = msg[key]
+        if msg.get('stage') in ('fetching_bars','fetching_bars_page','fetching_bars_complete'):
+            if 'timeframe' in msg: state['fetching_timeframe'] = msg.get('timeframe')
+            if 'completed' in msg: state['fetching_completed'] = msg.get('completed', state.get('fetching_completed',0))
+            if 'timeframes' in msg: state['fetching_total'] = msg.get('timeframes', state.get('fetching_total',4))
+            if 'state' in msg: state['fetching_state'] = msg.get('state')
         if msg.get('stage') == 'provider_retry':
             err = f"Alpaca {msg.get('status_code')} {msg.get('endpoint')} retry {msg.get('retry')}"
             state['provider_errors'] = (state.get('provider_errors') or [])[-9:] + [err]
@@ -215,7 +220,7 @@ def _finalize_scan(p, scan_id, results, diagnostics, started_at, error=None):
 
 
 def _watch_scan(proc, conn, p, scan_id, started_at):
-    timeout=max(1,int(os.getenv('SCAN_TIMEOUT_SECONDS','120')))
+    timeout=max(30,int(os.getenv('SCAN_TIMEOUT_SECONDS','180')))
     result=None; fatal_error=None
     try:
         while True:
@@ -262,7 +267,8 @@ def start_scan(p):
         scan_id=uuid.uuid4().hex[:10]; started=datetime.now(TZ).isoformat()
         state.update(scan_running=True, scan_id=scan_id, scan_started=started, scan_finished=None,
                      scan_duration=None, scan_stage='starting', last_error=None, last_session=p,
-                     symbols_scanned=0, contracts_scanned=0, provider_errors=[])
+                     symbols_scanned=0, contracts_scanned=0, provider_errors=[], fetching_timeframe=None,
+                     fetching_completed=0, fetching_total=4, fetching_state=None)
     ctx=multiprocessing.get_context('fork' if 'fork' in multiprocessing.get_all_start_methods() else 'spawn')
     parent_conn, child_conn=ctx.Pipe(duplex=False)
     proc=ctx.Process(target=_scan_process_worker,args=(p,scan_id,child_conn),daemon=True)
@@ -286,7 +292,7 @@ def _status_text():
     with lock: s=dict(state); ad=dict(s.get('alert_diagnostics') or {})
     td=telegram_diagnostics(); ps=provider_status()
     lines=[f"🟢 Bot status",f"Phase: {phase_label(phase())}",f"Running: {s['running']}",
-           f"Scan running: {s['scan_running']}",f"Scan stage: {s.get('scan_stage')}",f"Scan ID: {s.get('scan_id') or '—'}",
+           f"Scan running: {s['scan_running']}",f"Scan stage: {s.get('scan_stage')}",f"Bars: {s.get('fetching_completed',0)}/{s.get('fetching_total',4)} {s.get('fetching_timeframe') or ''} {s.get('fetching_state') or ''}",f"Scan ID: {s.get('scan_id') or '—'}",
            f"Symbols scanned: {s.get('symbols_scanned',0)}",f"Contracts scanned: {s.get('contracts_scanned',0)}",
            f"Last candidates: {s['last_candidates']}",f"Last alerts: {s['last_alerts']}",f"Last scan: {s['last_scan'] or '—'}",
            f"Scan duration: {s.get('scan_duration') if s.get('scan_duration') is not None else '—'} s",
@@ -360,13 +366,13 @@ def loop():
         time.sleep(interval)
 
 @app.get('/')
-def root(): return jsonify({'service':'options-opportunity-bot','version':'10.1.0','status':'ok','docs':'/health','scan':'/scan','scan_status':'/scan/status'})
+def root(): return jsonify({'service':'options-opportunity-bot','version':'13.1.0','status':'ok','docs':'/health','scan':'/scan','scan_status':'/scan/status'})
 
 @app.get('/health')
 def health():
     with lock: s=dict(state)
     s['telegram_configured']=bool(os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID')); s['scan_secret_configured']=bool(os.getenv('SCAN_SECRET')); s['provider']=provider_status(); s['telegram']=telegram_diagnostics()
-    return jsonify({'service':'options-opportunity-bot','version':'10.1.0','status':'ok','phase':phase(),'scanner':s})
+    return jsonify({'service':'options-opportunity-bot','version':'13.1.0','status':'ok','phase':phase(),'scanner':s})
 
 @app.get('/status')
 def status(): return health()

@@ -1,4 +1,5 @@
 import os, math, statistics, time, threading, re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from typing import Callable, Optional
 import requests
@@ -8,23 +9,25 @@ OPTIONS = 'https://data.alpaca.markets/v1beta1/options'
 STOCKS = [s.strip().upper() for s in os.getenv('STOCK_SYMBOLS','QQQ,NVDA,AMD,TSLA,AAPL,AMZN,META,MSFT,GOOGL,MU,AVGO,PLTR,SMCI,SPY,IWM').split(',') if s.strip()]
 INDEX_ROOTS = [s.strip().upper() for s in os.getenv('INDEX_ROOTS','SPXW').split(',') if s.strip()]
 RISK = float(os.getenv('RISK_BUDGET','100'))
-MIN_PREMIUM = float(os.getenv('MIN_PREMIUM','0.30')); MAX_PREMIUM = float(os.getenv('MAX_PREMIUM','10.00'))
+MIN_PREMIUM = float(os.getenv('MIN_PREMIUM','0.20')); MAX_PREMIUM = float(os.getenv('MAX_PREMIUM','25.00'))
 UPSIDE_ALERT_PCT = float(os.getenv('UPSIDE_ALERT_PCT','1000'))
-MAX_AFFORDABLE_PREMIUM = float(os.getenv('MAX_AFFORDABLE_PREMIUM','10.00'))
-MAX_SPREAD = float(os.getenv('MAX_SPREAD_PCT','15')); MIN_OI = int(os.getenv('MIN_OI','50')); MIN_VOL = int(os.getenv('MIN_VOLUME','20'))
-MIN_SCORE = max(50.0, float(os.getenv('MIN_SCORE','60')))
+MAX_AFFORDABLE_PREMIUM = float(os.getenv('MAX_AFFORDABLE_PREMIUM','25.00'))
+MAX_SPREAD = float(os.getenv('MAX_SPREAD_PCT','25')); MIN_OI = int(os.getenv('MIN_OI','10')); MIN_VOL = int(os.getenv('MIN_VOLUME','5'))
+MIN_SCORE = max(45.0, float(os.getenv('MIN_SCORE','50')))
 REQUIRE_4H_ALIGNMENT = os.getenv('REQUIRE_4H_ALIGNMENT','false').strip().lower() in ('1','true','yes','on')
 BLOCK_SIDEWAYS_CHOPPY = os.getenv('BLOCK_SIDEWAYS_CHOPPY','false').strip().lower() in ('1','true','yes','on')
-FALLBACK_MIN_SCORE = max(50.0, float(os.getenv('FALLBACK_MIN_SCORE','55')))
-RELAXED_MAX_SPREAD = float(os.getenv('RELAXED_MAX_SPREAD_PCT','25'))
-RELAXED_MIN_OI = int(os.getenv('RELAXED_MIN_OI','20'))
-RELAXED_MIN_VOL = int(os.getenv('RELAXED_MIN_VOLUME','5'))
+FALLBACK_MIN_SCORE = max(45.0, float(os.getenv('FALLBACK_MIN_SCORE','45')))
+RELAXED_MAX_SPREAD = float(os.getenv('RELAXED_MAX_SPREAD_PCT','35'))
+RELAXED_MIN_OI = int(os.getenv('RELAXED_MIN_OI','5'))
+RELAXED_MIN_VOL = int(os.getenv('RELAXED_MIN_VOLUME','1'))
 ALERT_COOLDOWN = int(os.getenv('ALERT_COOLDOWN_SECONDS','900'))
 HTTP_TIMEOUT = max(1, float(os.getenv('ALPACA_HTTP_TIMEOUT','8')))
 RETRIES = max(0, int(os.getenv('ALPACA_RETRIES','2')))
 OPTIONS_PAGE_LIMIT = max(100, min(1000, int(os.getenv('OPTIONS_PAGE_LIMIT','1000'))))
 OPTIONS_MAX_PAGES = max(1, int(os.getenv('OPTIONS_MAX_PAGES','12')))
 OPTIONS_MIN_INTERVAL = max(0.05, float(os.getenv('OPTIONS_MIN_INTERVAL_SECONDS','0.20')))
+STOCKS_PAGE_LIMIT = max(100, min(10000, int(os.getenv('STOCKS_PAGE_LIMIT','10000'))))
+STOCKS_MAX_PAGES = max(1, int(os.getenv('STOCKS_MAX_PAGES','5')))
 _options_rate_lock = threading.Lock()
 _options_last_request = 0.0
 
@@ -174,14 +177,50 @@ def fetch_bars(symbol,timeframe,days=45,limit=1000):
     data=req(f'{ALPACA}/stocks/{symbol}/bars', {'timeframe':timeframe,'start':start_dt.isoformat().replace('+00:00','Z'),'end':end_dt.isoformat().replace('+00:00','Z'),'limit':limit,'feed':'iex','sort':'asc'})
     return data.get('bars') or []
 
-def fetch_bars_batch(symbols,timeframe,days=45,limit=10000):
+def fetch_bars_batch(symbols,timeframe,days=45,limit=None):
+    """Fetch multi-symbol stock bars with pagination and explicit progress.
+
+    Alpaca's stock-bars endpoint can paginate even when multiple symbols are
+    requested. The previous implementation only consumed the first page, which
+    could leave some symbols with incomplete/missing bars and trigger expensive
+    per-symbol refetches later in the scan.
+    """
     end_dt=datetime.now(timezone.utc); start_dt=end_dt-timedelta(days=days)
-    data=req(f'{ALPACA}/stocks/bars', {'symbols':','.join(symbols),'timeframe':timeframe,'start':start_dt.isoformat().replace('+00:00','Z'),'end':end_dt.isoformat().replace('+00:00','Z'),'limit':limit,'feed':'iex','sort':'asc'})
-    return data.get('bars') or {}
+    page_limit=min(STOCKS_PAGE_LIMIT, int(limit or STOCKS_PAGE_LIMIT))
+    merged={}; page_token=None; pages=0
+    while pages < STOCKS_MAX_PAGES:
+        params={
+            'symbols':','.join(symbols),
+            'timeframe':timeframe,
+            'start':start_dt.isoformat().replace('+00:00','Z'),
+            'end':end_dt.isoformat().replace('+00:00','Z'),
+            'limit':page_limit,
+            'feed':'iex',
+            'sort':'asc'
+        }
+        if page_token:
+            params['page_token']=page_token
+        progress('fetching_bars_page', timeframe=timeframe, page=pages+1, symbols_total=len(symbols))
+        data=req(f'{ALPACA}/stocks/bars', params)
+        rows=data.get('bars') or {}
+        for sym, bars in rows.items():
+            merged.setdefault(sym, []).extend(bars or [])
+        pages += 1
+        page_token=data.get('next_page_token')
+        if not page_token:
+            break
+    progress('fetching_bars_page', timeframe=timeframe, page=pages, symbols=len(merged), complete=True)
+    return merged
 
 def frame_indicators(symbol,timeframe,days=45,cache=None):
-    bars=(cache or {}).get(symbol) if cache is not None else None
-    if bars is None: bars=fetch_bars(symbol,timeframe,days)
+    if cache is not None:
+        # Do not silently refetch one symbol after a failed batch request. That
+        # behavior multiplied provider calls and was a major source of slow scans.
+        if symbol not in cache:
+            raise RuntimeError(f'cached {timeframe} bars unavailable for {symbol}')
+        bars=cache.get(symbol) or []
+    else:
+        bars=fetch_bars(symbol,timeframe,days)
     closes=[num(b.get('c')) for b in bars if num(b.get('c'))>0]
     if len(closes)<55: raise RuntimeError(f'not enough {timeframe} bars for {symbol}: {len(closes)}')
     e20=ema(closes[-100:],20); e50=ema(closes[-100:],50); rr=rsi(closes,14); a=atr_bars(bars,14); ax=adx(bars,14)
@@ -341,12 +380,21 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
         if dte<0 or dte>30: rej['dte']+=1; continue
         quote=snap.get('latestQuote') or {}; trade=snap.get('latestTrade') or {}; greeks=snap.get('greeks') or {}
         bid=num(quote.get('bp')); ask=num(quote.get('ap')); last=num(trade.get('p')); premium=(bid+ask)/2 if bid>0 and ask>0 else last
-        if premium<MIN_PREMIUM or premium>MAX_PREMIUM or premium>MAX_AFFORDABLE_PREMIUM: rej['premium']+=1; continue
+        is_spxw = bool(contract_prefix and option_underlying=='SPX')
+        # SPXW contracts are structurally more expensive than single-stock
+        # options, so use a separate envelope. User env vars still override.
+        premium_floor = float(os.getenv('SPXW_MIN_PREMIUM','0.50')) if is_spxw else MIN_PREMIUM
+        premium_cap = float(os.getenv('SPXW_MAX_PREMIUM','75.00')) if is_spxw else MAX_PREMIUM
+        affordable_cap = float(os.getenv('SPXW_MAX_AFFORDABLE_PREMIUM','75.00')) if is_spxw else MAX_AFFORDABLE_PREMIUM
+        spread_cap = float(os.getenv('SPXW_MAX_SPREAD_PCT','35')) if is_spxw else MAX_SPREAD
+        oi_floor = int(os.getenv('SPXW_MIN_OI','5')) if is_spxw else MIN_OI
+        vol_floor = int(os.getenv('SPXW_MIN_VOLUME','1')) if is_spxw else MIN_VOL
+        if premium<premium_floor or premium>premium_cap or premium>affordable_cap: rej['premium']+=1; continue
         spread=((ask-bid)/premium*100) if premium and ask>=bid else 999
         daily=snap.get('dailyBar') or snap.get('daily_bar') or {}; vol=int(num(daily.get('v'))); oi=int(num(details.get('open_interest') or details.get('openInterest')))
         if vol<=0:vol=int(num(trade.get('s'))) if trade else 0
-        strict_liquidity = spread<=MAX_SPREAD and vol>=MIN_VOL and oi>=MIN_OI
-        relaxed_liquidity = spread<=RELAXED_MAX_SPREAD and vol>=RELAXED_MIN_VOL and oi>=RELAXED_MIN_OI
+        strict_liquidity = spread<=spread_cap and vol>=vol_floor and oi>=oi_floor
+        relaxed_liquidity = spread<=max(spread_cap, RELAXED_MAX_SPREAD) and vol>=min(vol_floor, RELAXED_MIN_VOL) and oi>=min(oi_floor, RELAXED_MIN_OI)
         if not strict_liquidity and not relaxed_liquidity: rej['spread' if spread>RELAXED_MAX_SPREAD else 'liquidity']+=1; continue
         delta=num(greeks.get('delta'),0.25 if typ=='CALL' else -0.25); direction=typ
         score,reasons,a4,a1,a15,a5=score_setup(m,direction,spread,delta,vol,oi)
@@ -373,21 +421,42 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
         if direction=='CALL': projected_underlying=round(max(u_tp3, m['recent_high'] + 2*atr_points),2); underlying_move=max(0.0, projected_underlying-u_entry)
         else: projected_underlying=round(min(u_tp3, m['recent_low'] - 2*atr_points),2); underlying_move=max(0.0, u_entry-projected_underlying)
         projected_premium=max(0.05, premium + abs(delta)*underlying_move); projected_upside_pct=round(max(0.0,(projected_premium/premium-1)*100),1) if premium>0 else 0.0
-        extreme_upside=projected_upside_pct>=UPSIDE_ALERT_PCT and premium<=MAX_AFFORDABLE_PREMIUM
+        extreme_upside=projected_upside_pct>=UPSIDE_ALERT_PCT and premium<=affordable_cap
         if extreme_upside: reasons.append(f'projected upside > {UPSIDE_ALERT_PCT:.0f}%')
-        out.append({'signal':direction,'market':'OPTIONS','symbol':symbol,'contract':contract,'dte':dte,'premium':round(premium,2),'bid':round(bid,2),'ask':round(ask,2),'entry_low':entry_low,'entry_high':entry_high,'stop_loss':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'max_loss':max_loss,'expected_profit_tp1':reward1,'expected_profit_tp2':reward2,'expected_profit_tp3':reward3,'underlying_entry':u_entry,'underlying_stop_loss':u_stop,'underlying_tp1':u_tp1,'underlying_tp2':u_tp2,'underlying_tp3':u_tp3,'atr_5m_points':round(atr_points,2),'score':round(score,1),'confidence':confidence,'tp1_confidence':tp1_conf,'tp2_confidence':tp2_conf,'tp3_confidence':tp3_conf,'projected_underlying_target':projected_underlying,'projected_premium':round(projected_premium,2),'projected_upside_pct':projected_upside_pct,'extreme_upside':extreme_upside,'market_regime':m['regime'],'volume':vol,'open_interest':oi,'spread_pct':round(spread,1),'delta':round(delta,3),'underlying':u_entry,'indicator_symbol':symbol,'option_underlying':chain_root,'vwap_state':'BULLISH' if u_entry>m['vwap'] else 'BEARISH','ema_state':'BULLISH' if m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH','rsi':round(m['5m']['rsi'],1),'macd_state':'BULLISH' if m['5m']['macd_delta']>0 else 'BEARISH','volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout'],'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL','adx_4h':round(m['4h']['adx'],1),'rsi_4h':round(m['4h']['rsi'],1),'reasons':reasons,'session':session,'data_mode':options_data_mode()})
-    return out, {'chain_items':len(rows),'scored':len(out), 'parse_note':'OCC fallback enabled','underlying':chain_root,'indicator_source':'Alpaca IEX multi-timeframe 5m/15m/1h/4h','option_source':'Alpaca options '+os.getenv('ALPACA_OPTIONS_FEED','indicative'),'market_regime':m['regime'],'rejections':rej,'config':{'min_score':MIN_SCORE,'fallback_min_score':FALLBACK_MIN_SCORE,'require_4h_alignment':REQUIRE_4H_ALIGNMENT,'block_sideways_choppy':BLOCK_SIDEWAYS_CHOPPY,'max_spread':MAX_SPREAD,'relaxed_max_spread':RELAXED_MAX_SPREAD,'min_oi':MIN_OI,'relaxed_min_oi':RELAXED_MIN_OI,'min_volume':MIN_VOL,'relaxed_min_volume':RELAXED_MIN_VOL},'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL'}
+        out.append({'signal':direction,'market':'OPTIONS','symbol':symbol,'contract':contract,'dte':dte,'premium':round(premium,2),'bid':round(bid,2),'ask':round(ask,2),'entry_low':entry_low,'entry_high':entry_high,'stop_loss':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'affordable':contracts>0,'max_loss':max_loss,'expected_profit_tp1':reward1,'expected_profit_tp2':reward2,'expected_profit_tp3':reward3,'underlying_entry':u_entry,'underlying_stop_loss':u_stop,'underlying_tp1':u_tp1,'underlying_tp2':u_tp2,'underlying_tp3':u_tp3,'atr_5m_points':round(atr_points,2),'score':round(score,1),'confidence':confidence,'tp1_confidence':tp1_conf,'tp2_confidence':tp2_conf,'tp3_confidence':tp3_conf,'projected_underlying_target':projected_underlying,'projected_premium':round(projected_premium,2),'projected_upside_pct':projected_upside_pct,'extreme_upside':extreme_upside,'market_regime':m['regime'],'volume':vol,'open_interest':oi,'spread_pct':round(spread,1),'delta':round(delta,3),'underlying':u_entry,'indicator_symbol':symbol,'option_underlying':chain_root,'vwap_state':'BULLISH' if u_entry>m['vwap'] else 'BEARISH','ema_state':'BULLISH' if m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH','rsi':round(m['5m']['rsi'],1),'macd_state':'BULLISH' if m['5m']['macd_delta']>0 else 'BEARISH','volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout'],'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL','adx_4h':round(m['4h']['adx'],1),'rsi_4h':round(m['4h']['rsi'],1),'reasons':reasons,'session':session,'data_mode':options_data_mode()})
+    return out, {'chain_items':len(rows),'scored':len(out), 'parse_note':'OCC fallback enabled','underlying':chain_root,'indicator_source':'Alpaca IEX multi-timeframe 5m/15m/1h/4h','option_source':'Alpaca options '+os.getenv('ALPACA_OPTIONS_FEED','indicative'),'market_regime':m['regime'],'rejections':rej,'config':{'spxw_max_premium':float(os.getenv('SPXW_MAX_PREMIUM','75.00')),'spxw_max_spread':float(os.getenv('SPXW_MAX_SPREAD_PCT','35')),'spxw_min_oi':int(os.getenv('SPXW_MIN_OI','5')),'spxw_min_volume':int(os.getenv('SPXW_MIN_VOLUME','1')),'min_score':MIN_SCORE,'fallback_min_score':FALLBACK_MIN_SCORE,'require_4h_alignment':REQUIRE_4H_ALIGNMENT,'block_sideways_choppy':BLOCK_SIDEWAYS_CHOPPY,'max_spread':MAX_SPREAD,'relaxed_max_spread':RELAXED_MAX_SPREAD,'min_oi':MIN_OI,'relaxed_min_oi':RELAXED_MIN_OI,'min_volume':MIN_VOL,'relaxed_min_volume':RELAXED_MIN_VOL},'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL'}
 
 def scan_all(session):
     if not headers():raise RuntimeError('Missing ALPACA_API_KEY / ALPACA_API_SECRET')
     results=[]; diagnostics={}; symbols=list(dict.fromkeys(STOCKS+(['SPX'] if 'SPXW' in INDEX_ROOTS else [])))
     periods={'5m':('5Min',7),'15m':('15Min',20),'1h':('1Hour',45),'4h':('4Hour',180)}; caches={}
-    progress('fetching_bars', symbols_total=len(symbols))
-    for key,(tf,days) in periods.items():
+    progress('fetching_bars', symbols_total=len(symbols), timeframes=len(periods), completed=0)
+    # Fetch the four timeframes concurrently. Each request still has its own
+    # HTTP timeout/retry policy, but a slow timeframe no longer blocks the
+    # other three before they can start.
+    def _fetch_period(item):
+        key,(tf,days)=item
+        progress('fetching_bars', timeframe=key, state='started', symbols_total=len(symbols))
         try:
-            caches[key]=fetch_bars_batch(symbols,tf,days); progress('fetching_bars', timeframe=key, symbols=len(caches[key]))
+            data=fetch_bars_batch(symbols,tf,days)
+            return key,data,None
         except Exception as e:
-            caches[key]={}; diagnostics[f'__{key}']={'error':f'{type(e).__name__}: {e}','provider':'Alpaca','endpoint':getattr(e,'endpoint',''),'status_code':getattr(e,'status_code',None),'retry_count':getattr(e,'retry_count',None)}
+            return key,{},e
+
+    completed=0
+    with ThreadPoolExecutor(max_workers=min(4,len(periods))) as ex:
+        futures=[ex.submit(_fetch_period,item) for item in periods.items()]
+        for fut in as_completed(futures):
+            key,data,err=fut.result()
+            caches[key]=data
+            completed += 1
+            if err is not None:
+                diagnostics[f'__{key}']={'error':f'{type(err).__name__}: {err}','provider':'Alpaca','endpoint':getattr(err,'endpoint',''),'status_code':getattr(err,'status_code',None),'retry_count':getattr(err,'retry_count',None)}
+                progress('fetching_bars', timeframe=key, state='failed', symbols=len(data), completed=completed, error=str(err))
+            else:
+                progress('fetching_bars', timeframe=key, state='complete', symbols=len(data), completed=completed)
+
+    progress('fetching_bars_complete', symbols=len(symbols), completed=completed)
     symbols_scanned=0; contracts_scanned=0
     for sym in STOCKS:
         try:
