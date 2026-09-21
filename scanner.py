@@ -23,6 +23,10 @@ EXPLOSIVE_MAX_DTE = max(0, int(os.getenv('EXPLOSIVE_MAX_DTE','14')))
 RELAXED_MAX_SPREAD = float(os.getenv('RELAXED_MAX_SPREAD_PCT','35'))
 RELAXED_MIN_OI = int(os.getenv('RELAXED_MIN_OI','5'))
 RELAXED_MIN_VOL = int(os.getenv('RELAXED_MIN_VOLUME','1'))
+AFTER_HOURS_MAX_PREMIUM = float(os.getenv('AFTER_HOURS_MAX_PREMIUM','300.00'))
+AFTER_HOURS_MAX_SPREAD = float(os.getenv('AFTER_HOURS_MAX_SPREAD_PCT','150'))
+AFTER_HOURS_MIN_OI = int(os.getenv('AFTER_HOURS_MIN_OI','0'))
+AFTER_HOURS_MIN_VOL = int(os.getenv('AFTER_HOURS_MIN_VOLUME','0'))
 ALERT_COOLDOWN = int(os.getenv('ALERT_COOLDOWN_SECONDS','900'))
 HTTP_TIMEOUT = max(1, float(os.getenv('ALPACA_HTTP_TIMEOUT','8')))
 RETRIES = max(0, int(os.getenv('ALPACA_RETRIES','2')))
@@ -597,7 +601,7 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
     # Alpaca options root. This is used for SPXW: SPY supplies IEX technical bars
     # while SPX supplies the actual SPXW option chain.
     m=multi_tf(symbol,caches); chain_root=option_underlying or symbol; progress('fetching_options', symbol=chain_root); chain=option_chain(chain_root, root_symbol=None); rows=chain.get('snapshots') or {}; out=[]; today=datetime.now(timezone.utc).date()
-    rej={'prefix':0,'bad_contract':0,'dte':0,'premium':0,'spread':0,'liquidity':0,'score':0,'alignment':0,'regime':0,'relaxed_candidates':0}
+    rej={'prefix':0,'bad_contract':0,'dte':0,'premium':0,'spread':0,'liquidity':0,'score':0,'alignment':0,'regime':0,'relaxed_candidates':0,'after_hours_candidates':0}
     progress('scoring', symbol=symbol, contracts=len(rows))
     for contract,snap in rows.items():
         details=snap.get('details') or {}
@@ -636,28 +640,46 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
         spread_cap = float(os.getenv('SPXW_MAX_SPREAD_PCT','35')) if is_spxw else MAX_SPREAD
         oi_floor = int(os.getenv('SPXW_MIN_OI','5')) if is_spxw else MIN_OI
         vol_floor = int(os.getenv('SPXW_MIN_VOLUME','1')) if is_spxw else MIN_VOL
-        if premium<premium_floor or premium>premium_cap or premium>affordable_cap: rej['premium']+=1; continue
+        after_hours = str(session).upper() in ('AFTER_HOURS','CLOSED')
+        ah_cap = AFTER_HOURS_MAX_PREMIUM if after_hours else premium_cap
+        ah_affordable = AFTER_HOURS_MAX_PREMIUM if after_hours else affordable_cap
+        if premium<premium_floor or premium>ah_cap or premium>ah_affordable: rej['premium']+=1; continue
         spread=((ask-bid)/premium*100) if premium and ask>=bid else 999
         daily=snap.get('dailyBar') or snap.get('daily_bar') or {}; vol=int(num(daily.get('v'))); oi=int(num(details.get('open_interest') or details.get('openInterest')))
         if vol<=0:vol=int(num(trade.get('s'))) if trade else 0
         strict_liquidity = spread<=spread_cap and vol>=vol_floor and oi>=oi_floor
         relaxed_liquidity = spread<=max(spread_cap, RELAXED_MAX_SPREAD) and vol>=min(vol_floor, RELAXED_MIN_VOL) and oi>=min(oi_floor, RELAXED_MIN_OI)
-        if not strict_liquidity and not relaxed_liquidity: rej['spread' if spread>RELAXED_MAX_SPREAD else 'liquidity']+=1; continue
+        # After-hours option quotes can be stale and spreads/OI/volume can be
+        # incomplete. Do not throw away every technically valid contract just
+        # because the market is closed; score liquidity as a risk factor instead.
+        after_hours_liquidity = after_hours and spread<=AFTER_HOURS_MAX_SPREAD and vol>=AFTER_HOURS_MIN_VOL and oi>=AFTER_HOURS_MIN_OI
+        # Momentum lane: do not discard a potentially explosive setup solely because
+        # displayed OI/volume are stale or incomplete.  We still require a bounded
+        # spread and a strong underlying/contract score before allowing an alert.
+        momentum_liquidity = (spread <= float(os.getenv('MOMENTUM_MAX_SPREAD_PCT','150'))
+                              and (after_hours or vol >= int(os.getenv('MOMENTUM_MIN_VOLUME','0')))
+                              and (after_hours or oi >= int(os.getenv('MOMENTUM_MIN_OI','0'))))
+        if not strict_liquidity and not relaxed_liquidity and not after_hours_liquidity and not momentum_liquidity:
+            rej['spread' if spread>RELAXED_MAX_SPREAD else 'liquidity']+=1; continue
         delta=num(greeks.get('delta'),0.25 if typ=='CALL' else -0.25); direction=typ
         score,reasons,a4,a1,a15,a5=score_setup(m,direction,spread,delta,vol,oi)
         explosive_score, explosive_flags = explosive_setup_score(m,direction,spread,delta,vol,oi,dte)
-        explosive_ok = (explosive_score >= EXPLOSIVE_MIN_SCORE and relaxed_liquidity and m['regime'] not in ('SIDEWAYS','CHOPPY'))
+        explosive_ok = (explosive_score >= EXPLOSIVE_MIN_SCORE and (relaxed_liquidity or after_hours_liquidity or momentum_liquidity) and m['regime'] not in ('SIDEWAYS','CHOPPY'))
         strict_ok = score>=MIN_SCORE and (a4 or not REQUIRE_4H_ALIGNMENT) and (m['regime'] not in ('SIDEWAYS','CHOPPY') or not BLOCK_SIDEWAYS_CHOPPY)
-        relaxed_ok = score>=FALLBACK_MIN_SCORE and relaxed_liquidity and (a4 or not REQUIRE_4H_ALIGNMENT) and (m['regime'] not in ('SIDEWAYS','CHOPPY') or not BLOCK_SIDEWAYS_CHOPPY)
-        if not strict_ok and not relaxed_ok and not explosive_ok:
+        relaxed_ok = score>=FALLBACK_MIN_SCORE and (relaxed_liquidity or after_hours_liquidity or momentum_liquidity) and (a4 or not REQUIRE_4H_ALIGNMENT) and (m['regime'] not in ('SIDEWAYS','CHOPPY') or not BLOCK_SIDEWAYS_CHOPPY)
+        after_hours_ok = after_hours and score>=FALLBACK_MIN_SCORE and (after_hours_liquidity or momentum_liquidity) and (a4 or not REQUIRE_4H_ALIGNMENT) and (m['regime'] not in ('SIDEWAYS','CHOPPY') or not BLOCK_SIDEWAYS_CHOPPY)
+        if not strict_ok and not relaxed_ok and not explosive_ok and not after_hours_ok:
             if score<MIN_SCORE: rej['score']+=1
             if REQUIRE_4H_ALIGNMENT and not a4: rej['alignment']+=1
             if BLOCK_SIDEWAYS_CHOPPY and m['regime'] in ('SIDEWAYS','CHOPPY'): rej['regime']+=1
             continue
-        relaxed = not strict_ok and not explosive_ok
+        relaxed = not strict_ok and not explosive_ok and not after_hours_ok
         if explosive_ok:
             reasons.append('💥 EXPLOSIVE MOMENTUM SETUP')
             reasons.extend(explosive_flags)
+        elif after_hours_ok:
+            rej['after_hours_candidates']+=1
+            reasons.append('🌙 AFTER-HOURS HERO FALLBACK — verify live spread at open')
         elif relaxed:
             rej['relaxed_candidates']+=1
             reasons.append('RELAXED LIQUIDITY/SCORE FALLBACK')
@@ -676,7 +698,7 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
         extreme_upside=projected_upside_pct>=UPSIDE_ALERT_PCT and premium<=affordable_cap
         if extreme_upside: reasons.append(f'projected upside > {UPSIDE_ALERT_PCT:.0f}%')
         out.append({'signal':direction,'market':'OPTIONS','symbol':symbol,'contract':contract,'dte':dte,'premium':round(premium,2),'bid':round(bid,2),'ask':round(ask,2),'entry_low':entry_low,'entry_high':entry_high,'stop_loss':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'affordable':contracts>0,'max_loss':max_loss,'expected_profit_tp1':reward1,'expected_profit_tp2':reward2,'expected_profit_tp3':reward3,'underlying_entry':u_entry,'underlying_stop_loss':u_stop,'underlying_tp1':u_tp1,'underlying_tp2':u_tp2,'underlying_tp3':u_tp3,'atr_5m_points':round(atr_points,2),'score':round(score,1),'explosive_score':explosive_score,'explosive_setup':bool(explosive_ok),'explosive_flags':explosive_flags,'confidence':confidence,'tp1_confidence':tp1_conf,'tp2_confidence':tp2_conf,'tp3_confidence':tp3_conf,'projected_underlying_target':projected_underlying,'projected_premium':round(projected_premium,2),'projected_upside_pct':projected_upside_pct,'extreme_upside':extreme_upside,'market_regime':m['regime'],'volume':vol,'open_interest':oi,'spread_pct':round(spread,1),'delta':round(delta,3),'underlying':u_entry,'indicator_symbol':symbol,'option_underlying':chain_root,'vwap_state':'BULLISH' if u_entry>m['vwap'] else 'BEARISH','ema_state':'BULLISH' if m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH','rsi':round(m['5m']['rsi'],1),'macd_state':'BULLISH' if m['5m']['macd_delta']>0 else 'BEARISH','volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout'],'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL','adx_4h':round(m['4h']['adx'],1),'rsi_4h':round(m['4h']['rsi'],1),'reasons':reasons,'session':session,'data_mode':options_data_mode()})
-    return out, {'chain_items':len(rows),'scored':len(out), 'parse_note':'OCC fallback enabled', 'chain_fallback':bool(chain.get('fallback')), 'chain_pages':chain.get('pages',0), 'contracts_discovered':chain.get('contracts_discovered',0), 'primary_chain_error':chain.get('primary_error'),'underlying':chain_root,'indicator_source':'Alpaca IEX multi-timeframe 5m/15m/1h/4h','option_source':'Alpaca options '+os.getenv('ALPACA_OPTIONS_FEED','indicative'),'market_regime':m['regime'],'rejections':rej,'config':{'explosive_min_score':EXPLOSIVE_MIN_SCORE,'explosive_min_volume_ratio':EXPLOSIVE_MIN_VOLUME_RATIO,'explosive_max_dte':EXPLOSIVE_MAX_DTE,'spxw_max_premium':float(os.getenv('SPXW_MAX_PREMIUM','75.00')),'spxw_max_spread':float(os.getenv('SPXW_MAX_SPREAD_PCT','35')),'spxw_min_oi':int(os.getenv('SPXW_MIN_OI','5')),'spxw_min_volume':int(os.getenv('SPXW_MIN_VOLUME','1')),'min_score':MIN_SCORE,'fallback_min_score':FALLBACK_MIN_SCORE,'require_4h_alignment':REQUIRE_4H_ALIGNMENT,'block_sideways_choppy':BLOCK_SIDEWAYS_CHOPPY,'max_spread':MAX_SPREAD,'relaxed_max_spread':RELAXED_MAX_SPREAD,'min_oi':MIN_OI,'relaxed_min_oi':RELAXED_MIN_OI,'min_volume':MIN_VOL,'relaxed_min_volume':RELAXED_MIN_VOL},'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL'}
+    return out, {'chain_items':len(rows),'scored':len(out), 'parse_note':'OCC fallback enabled', 'chain_fallback':bool(chain.get('fallback')), 'chain_pages':chain.get('pages',0), 'contracts_discovered':chain.get('contracts_discovered',0), 'primary_chain_error':chain.get('primary_error'),'underlying':chain_root,'indicator_source':'Alpaca IEX multi-timeframe 5m/15m/1h/4h','option_source':'Alpaca options '+os.getenv('ALPACA_OPTIONS_FEED','indicative'),'market_regime':m['regime'],'rejections':rej,'config':{'after_hours_max_premium':AFTER_HOURS_MAX_PREMIUM,'after_hours_max_spread':AFTER_HOURS_MAX_SPREAD,'momentum_max_spread':float(os.getenv('MOMENTUM_MAX_SPREAD_PCT','150')),'explosive_min_score':EXPLOSIVE_MIN_SCORE,'explosive_min_volume_ratio':EXPLOSIVE_MIN_VOLUME_RATIO,'explosive_max_dte':EXPLOSIVE_MAX_DTE,'spxw_max_premium':float(os.getenv('SPXW_MAX_PREMIUM','75.00')),'spxw_max_spread':float(os.getenv('SPXW_MAX_SPREAD_PCT','35')),'spxw_min_oi':int(os.getenv('SPXW_MIN_OI','5')),'spxw_min_volume':int(os.getenv('SPXW_MIN_VOLUME','1')),'min_score':MIN_SCORE,'fallback_min_score':FALLBACK_MIN_SCORE,'require_4h_alignment':REQUIRE_4H_ALIGNMENT,'block_sideways_choppy':BLOCK_SIDEWAYS_CHOPPY,'max_spread':MAX_SPREAD,'relaxed_max_spread':RELAXED_MAX_SPREAD,'min_oi':MIN_OI,'relaxed_min_oi':RELAXED_MIN_OI,'min_volume':MIN_VOL,'relaxed_min_volume':RELAXED_MIN_VOL},'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL'}
 
 def scan_all(session):
     if not headers():raise RuntimeError('Missing ALPACA_API_KEY / ALPACA_API_SECRET')
