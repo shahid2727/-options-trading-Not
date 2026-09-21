@@ -192,34 +192,6 @@ def _finalize_scan(p, scan_id, results, diagnostics, started_at, error=None):
                      scan_process_pid=None)
 
 
-def _force_timeout(proc, p, scan_id, started_at, timeout):
-    """Independent hard watchdog. It does not depend on the scanner watcher loop."""
-    time.sleep(timeout)
-    with lock:
-        if not state.get('scan_running') or state.get('scan_id') != scan_id:
-            return
-        stage = state.get('scan_stage') or 'unknown'
-        state['last_error'] = f'Scanner timeout after {timeout}s at stage {stage}'
-    try:
-        if proc.is_alive():
-            proc.terminate()
-            proc.join(timeout=3)
-            if proc.is_alive() and hasattr(proc, 'kill'):
-                proc.kill()
-                proc.join(timeout=2)
-    except Exception as e:
-        with lock:
-            if state.get('scan_id') == scan_id:
-                state['last_error'] += f' | terminate error: {type(e).__name__}: {e}'
-    now=datetime.now(TZ)
-    duration=max(0.0,(now-datetime.fromisoformat(started_at)).total_seconds())
-    with lock:
-        if state.get('scan_id') == scan_id and state.get('scan_running'):
-            state.update(scan_running=False, scan_finished=now.isoformat(),
-                         scan_duration=round(duration,2), scan_stage='failed',
-                         scan_process_pid=None, last_session=p)
-
-
 def _watch_scan(proc, conn, p, scan_id, started_at):
     timeout=max(1,int(os.getenv('SCAN_TIMEOUT_SECONDS','120')))
     result=None; fatal_error=None
@@ -281,24 +253,34 @@ def start_scan(p):
         with lock: state.update(scan_running=False,scan_stage='failed',last_error=f'Scanner start {type(e).__name__}: {e}')
         return None, 'start_failed'
     with lock: state['scan_process_pid']=proc.pid
-    # Two independent safety paths: the normal watcher and a hard watchdog.
-    threading.Thread(target=_watch_scan,args=(proc,parent_conn,p,scan_id,started),daemon=True,name=f'scan-watch-{scan_id}').start()
-    threading.Thread(target=_force_timeout,args=(proc,p,scan_id,started,max(1,int(os.getenv('SCAN_TIMEOUT_SECONDS','120')))),daemon=True,name=f'scan-timeout-{scan_id}').start()
+    threading.Thread(target=_watch_scan,args=(proc,parent_conn,p,scan_id,started),daemon=True).start()
     return scan_id, True
 
 
 def _status_text():
     with lock: s=dict(state)
     td=telegram_diagnostics(); ps=provider_status(); et_iso, et_text = session_clock()
+    rejection_totals={}
+    for d in (s.get('diagnostics') or {}).values():
+        if isinstance(d,dict) and isinstance(d.get('rejections'),dict):
+            for k,v in d['rejections'].items(): rejection_totals[k]=rejection_totals.get(k,0)+int(v or 0)
+    rejection_text=', '.join(f'{k}={v}' for k,v in rejection_totals.items() if v) or 'None'
+    provider_details=s.get('provider_errors') or []
+    provider_text=''
+    if provider_details:
+        lines=[]
+        for e in provider_details[-5:]:
+            lines.append(f"{e.get('source','?')} HTTP {e.get('status_code') or '?'} {e.get('endpoint') or ''} retry {e.get('retry_count') or 0}")
+        provider_text='\nProvider error details: '+ ' | '.join(lines)
     return (f"🟢 Bot status\nPhase: {phase_label(phase())}\nET clock: {et_text}\nRunning: {s['running']}\n"
             f"Scan running: {s['scan_running']}\nScan stage: {s.get('scan_stage')}\nScan ID: {s.get('scan_id') or '—'}\n"
             f"Symbols scanned: {s.get('symbols_scanned',0)}\nContracts scanned: {s.get('contracts_scanned',0)}\n"
             f"Last candidates: {s['last_candidates']}\nLast alerts: {s['last_alerts']}\nLast scan: {s['last_scan'] or '—'}\n"
             f"Scan duration: {s.get('scan_duration') if s.get('scan_duration') is not None else '—'} s\n"
-            f"Last error: {s['last_error'] or 'None'}\nTelegram polling: {td.get('telegram_running')}\n"
+            f"Last error: {s['last_error'] or 'None'}\nRejections: {rejection_text}\nTelegram polling: {td.get('telegram_running')}\n"
             f"Telegram last update: {td.get('telegram_last_update') or '—'}\nTelegram last error: {td.get('telegram_last_error') or 'None'}\n"
             f"Provider: {ps.get('name')} | Options feed: {ps.get('options_feed')} | Underlying feed: {ps.get('underlying_feed')}\n"
-            f"Data mode: {ps.get('data_mode')}\nProvider errors: {len(s.get('provider_errors') or [])}")
+            f"Data mode: {ps.get('data_mode')}\nProvider errors: {len(provider_details)}{provider_text}")
 
 
 def telegram_command_loop():
