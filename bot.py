@@ -301,7 +301,7 @@ def _status_text():
         if isinstance(d,dict):
             r=d.get('rejections') or {}
             lines.append(f"{key}: {'OK' if not d.get('error') else 'ERROR'} | Chain: {d.get('chain_items',0)} | Candidates: {d.get('scored',0)}")
-            lines.append(f"{key} rejections: DTE={r.get('dte',0)} | Premium={r.get('premium',0)} | Spread/Liquidity={r.get('spread',0)+r.get('liquidity',0)} | Score={r.get('score',0)} | 4H={r.get('alignment',0)} | Regime={r.get('regime',0)} | Relaxed={r.get('relaxed_candidates',0)}")
+            lines.append(f"{key} rejections: Prefix={r.get('prefix',0)} | BadContract={r.get('bad_contract',0)} | DTE={r.get('dte',0)} | Premium={r.get('premium',0)} | Spread/Liquidity={r.get('spread',0)+r.get('liquidity',0)} | Score={r.get('score',0)} | 4H={r.get('alignment',0)} | Regime={r.get('regime',0)} | Relaxed={r.get('relaxed_candidates',0)}")
     for c in (ad.get('candidates') or [])[:50]:
         lines.append(f"• {c.get('symbol','—')} | {c.get('contract','—')} | score={c.get('score','—')} | premium=${c.get('premium','—')} | bid={c.get('bid','—')} | ask={c.get('ask','—')} | {c.get('status','—')} | {c.get('reason','—')}")
     return "\n".join(lines)

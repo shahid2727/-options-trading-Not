@@ -206,9 +206,13 @@ def multi_tf(symbol,caches=None):
     reg=regime(f4,f1,f15,f5)
     return {'5m':f5,'15m':f15,'1h':f1,'4h':f4,'vwap':vwap,'volume_ratio':vr,'breakout':breakout,'regime':reg,'recent_high':recent_high,'recent_low':recent_low}
 
-def option_chain(underlying, side=None):
+def option_chain(underlying, side=None, root_symbol=None):
     params={'feed':os.getenv('ALPACA_OPTIONS_FEED','indicative'),'limit':1000}
     if side: params['type']=side.lower()
+    # Alpaca index option roots: SPXW weekly contracts are listed under
+    # the SPX underlier. Use the API's root_symbol filter instead of relying
+    # on the OSI contract-string prefix.
+    if root_symbol: params['root_symbol']=root_symbol
     merged={}; page_token=None; pages=0; max_pages=max(1,int(os.getenv('OPTIONS_MAX_PAGES','20')))
     while pages < max_pages:
         p=dict(params)
@@ -255,11 +259,12 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
     # `symbol` is the technical-data symbol; `option_underlying` can override the
     # Alpaca options root. This is used for SPXW: SPY supplies IEX technical bars
     # while SPX supplies the actual SPXW option chain.
-    m=multi_tf(symbol,caches); chain_root=option_underlying or symbol; progress('fetching_options', symbol=chain_root); chain=option_chain(chain_root); rows=chain.get('snapshots') or {}; out=[]; today=datetime.now(timezone.utc).date()
+    m=multi_tf(symbol,caches); chain_root=option_underlying or symbol; progress('fetching_options', symbol=chain_root); chain=option_chain(chain_root, root_symbol=('SPXW' if option_underlying=='SPX' else None)); rows=chain.get('snapshots') or {}; out=[]; today=datetime.now(timezone.utc).date()
     rej={'prefix':0,'bad_contract':0,'dte':0,'premium':0,'spread':0,'liquidity':0,'score':0,'alignment':0,'regime':0,'relaxed_candidates':0}
     progress('scoring', symbol=symbol, contracts=len(rows))
     for contract,snap in rows.items():
-        if contract_prefix and not contract.startswith(contract_prefix): rej['prefix']+=1; continue
+        if contract_prefix and not (contract.startswith(contract_prefix) or (option_underlying=='SPX' and (contract.startswith('SPX') or contract.startswith('SPXW')))):
+            rej['prefix']+=1; continue
         details=snap.get('details') or {}; exp,strike,typ=parse_contract(contract,details)
         if not exp or not strike or typ not in ('CALL','PUT'): rej['bad_contract']+=1; continue
         try:dte=(datetime.fromisoformat(exp).date()-today).days
