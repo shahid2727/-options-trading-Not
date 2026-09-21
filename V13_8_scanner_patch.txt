@@ -1,0 +1,61 @@
+V13.8 PATCH — scanner.py
+
+Apply to the current scanner.py from GitHub.
+
+1. Contract max premium = $5
+
+MIN_PREMIUM = float(os.getenv('MIN_PREMIUM','0.20')); MAX_PREMIUM = float(os.getenv('MAX_PREMIUM','25.00'))
+->
+MIN_PREMIUM = float(os.getenv('MIN_PREMIUM','0.20')); MAX_PREMIUM = float(os.getenv('MAX_PREMIUM','5.00'))
+
+MAX_AFFORDABLE_PREMIUM = float(os.getenv('MAX_AFFORDABLE_PREMIUM','25.00'))
+->
+MAX_AFFORDABLE_PREMIUM = float(os.getenv('MAX_AFFORDABLE_PREMIUM','5.00'))
+
+AFTER_HOURS_MAX_PREMIUM = float(os.getenv('AFTER_HOURS_MAX_PREMIUM','300.00'))
+->
+AFTER_HOURS_MAX_PREMIUM = float(os.getenv('AFTER_HOURS_MAX_PREMIUM','5.00'))
+
+2. SPXW max premium = $5
+
+premium_cap = float(os.getenv('SPXW_MAX_PREMIUM','75.00')) if is_spxw else MAX_PREMIUM
+->
+premium_cap = float(os.getenv('SPXW_MAX_PREMIUM','5.00')) if is_spxw else MAX_PREMIUM
+
+affordable_cap = float(os.getenv('SPXW_MAX_AFFORDABLE_PREMIUM','75.00')) if is_spxw else MAX_AFFORDABLE_PREMIUM
+->
+affordable_cap = float(os.getenv('SPXW_MAX_AFFORDABLE_PREMIUM','5.00')) if is_spxw else MAX_AFFORDABLE_PREMIUM
+
+'spxw_max_premium':float(os.getenv('SPXW_MAX_PREMIUM','75.00'))
+->
+'spxw_max_premium':float(os.getenv('SPXW_MAX_PREMIUM','5.00'))
+
+3. Prevent SPX index from being sent to IEX stock bars
+
+symbols=list(dict.fromkeys(STOCKS+(['SPX'] if 'SPXW' in INDEX_ROOTS else [])))
+->
+symbols=list(dict.fromkeys(STOCKS))
+
+SPXW continues to be scanned separately using SPY as the technical proxy and SPX as the option underlying.
+
+4. Reduce false zero-candidate scans while preserving quality filtering
+
+MIN_SCORE = max(45.0, float(os.getenv('MIN_SCORE','50')))
+->
+MIN_SCORE = max(40.0, float(os.getenv('MIN_SCORE','45')))
+
+FALLBACK_MIN_SCORE = max(45.0, float(os.getenv('FALLBACK_MIN_SCORE','45')))
+->
+FALLBACK_MIN_SCORE = max(40.0, float(os.getenv('FALLBACK_MIN_SCORE','42')))
+
+EXPLOSIVE_MIN_SCORE = max(65.0, float(os.getenv('EXPLOSIVE_MIN_SCORE','72')))
+->
+EXPLOSIVE_MIN_SCORE = max(58.0, float(os.getenv('EXPLOSIVE_MIN_SCORE','65')))
+
+5. Alert cooldown default
+
+ALERT_COOLDOWN = int(os.getenv('ALERT_COOLDOWN_SECONDS','900'))
+->
+ALERT_COOLDOWN = int(os.getenv('ALERT_COOLDOWN_SECONDS','300'))
+
+The rest of the current scanner.py should remain unchanged, including the existing SPXW scan, momentum lane, explosive setup scoring, entry/SL/TP fields, and Hero-compatible output.
