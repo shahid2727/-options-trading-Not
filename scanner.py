@@ -315,7 +315,7 @@ def score_setup(m, direction, spread, delta, vol, oi):
 
 def scan_underlying(symbol, session, contract_prefix=None, caches=None, contract_meta=None):
     m=multi_tf(symbol,caches); progress('fetching_options', symbol=symbol); chain=option_chain(symbol); rows=chain.get('snapshots') or {}; out=[]; today=datetime.now(timezone.utc).date()
-    rejection_counts={'invalid_contract':0,'dte':0,'premium':0,'spread':0,'volume':0,'open_interest':0,'score':0,'trend_alignment':0,'regime':0}
+    rejection_counts={'invalid_contract':0,'dte':0,'premium':0,'spread':0,'volume':0,'open_interest':0,'score':0,'trend_alignment':0,'regime':0,'score_evaluated':0,'passed_all_filters':0}
     progress('scoring', symbol=symbol, contracts=len(rows))
     for contract,snap in rows.items():
         if contract_prefix and not contract.startswith(contract_prefix): continue
@@ -348,6 +348,7 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, contract
             continue
         delta=num(greeks.get('delta'),0.25 if typ=='CALL' else -0.25); direction=typ
         score,reasons,a4,a1,a15,a5=score_setup(m,direction,spread,delta,vol,oi)
+        rejection_counts['score_evaluated'] += 1
         if score<MIN_SCORE:
             rejection_counts['score'] += 1
             continue
@@ -357,6 +358,7 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, contract
         if m['regime'] in ('SIDEWAYS','CHOPPY'):
             rejection_counts['regime'] += 1
             continue
+        rejection_counts['passed_all_filters'] += 1
         risk=max(premium*.20,0.10); entry_low=round(premium*.97,2); entry_high=round(premium*1.03,2); stop=round(max(.05,entry_low-risk),2)
         tp1=round(entry_high+risk,2); tp2=round(entry_high+2*risk,2); tp3=round(entry_high+3*risk,2)
         contracts=max(0,int(RISK//(risk*100))); max_loss=round(risk*100*contracts,2)
@@ -372,7 +374,7 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, contract
         extreme_upside=projected_upside_pct>=UPSIDE_ALERT_PCT and premium<=MAX_AFFORDABLE_PREMIUM
         if extreme_upside: reasons.append(f'projected upside > {UPSIDE_ALERT_PCT:.0f}%')
         out.append({'signal':direction,'market':'OPTIONS','symbol':symbol,'contract':contract,'dte':dte,'premium':round(premium,2),'entry_low':entry_low,'entry_high':entry_high,'stop_loss':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'max_loss':max_loss,'expected_profit_tp1':reward1,'expected_profit_tp2':reward2,'expected_profit_tp3':reward3,'underlying_entry':u_entry,'underlying_stop_loss':u_stop,'underlying_tp1':u_tp1,'underlying_tp2':u_tp2,'underlying_tp3':u_tp3,'atr_5m_points':round(atr_points,2),'score':round(score,1),'confidence':confidence,'tp1_confidence':tp1_conf,'tp2_confidence':tp2_conf,'tp3_confidence':tp3_conf,'projected_underlying_target':projected_underlying,'projected_premium':round(projected_premium,2),'projected_upside_pct':projected_upside_pct,'extreme_upside':extreme_upside,'market_regime':m['regime'],'volume':vol,'open_interest':oi,'spread_pct':round(spread,1),'delta':round(delta,3),'underlying':u_entry,'vwap_state':'BULLISH' if u_entry>m['vwap'] else 'BEARISH','ema_state':'BULLISH' if m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH','rsi':round(m['5m']['rsi'],1),'macd_state':'BULLISH' if m['5m']['macd_delta']>0 else 'BEARISH','volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout'],'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL','adx_4h':round(m['4h']['adx'],1),'rsi_4h':round(m['4h']['rsi'],1),'reasons':reasons,'session':session,'data_mode':options_data_mode()})
-    return out, {'chain_items':len(rows),'chain_pages':int(chain.get('pages',0) or 0),'scored':len(out),'rejections':rejection_counts,'underlying':symbol,'indicator_source':'Alpaca IEX multi-timeframe 5m/15m/1h/4h','option_source':'Alpaca options '+os.getenv('ALPACA_OPTIONS_FEED','indicative'),'market_regime':m['regime'],'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['vwap'] else 'NEUTRAL'}
+    return out, {'chain_items':len(rows),'chain_pages':int(chain.get('pages',0) or 0),'scored':rejection_counts.get('score_evaluated',0),'rejections':rejection_counts,'final_candidates':len(out),'underlying':symbol,'indicator_source':'Alpaca IEX multi-timeframe 5m/15m/1h/4h','option_source':'Alpaca options '+os.getenv('ALPACA_OPTIONS_FEED','indicative'),'market_regime':m['regime'],'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['vwap'] else 'NEUTRAL'}
 
 def scan_all(session):
     if not headers():raise RuntimeError('Missing ALPACA_API_KEY / ALPACA_API_SECRET')

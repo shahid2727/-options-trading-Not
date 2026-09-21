@@ -181,7 +181,9 @@ def _finalize_scan(p, scan_id, results, diagnostics, started_at, error=None):
     meta=diagnostics.get('__meta__',{}) if isinstance(diagnostics,dict) else {}
     provider_errors=[]
     for k,v in (diagnostics or {}).items():
-        if isinstance(v,dict) and v.get('error'): provider_errors.append({'source':k,'error':v.get('error'),'endpoint':v.get('endpoint'),'status_code':v.get('status_code'),'retry_count':v.get('retry_count')})
+        if isinstance(v,dict) and v.get('error'):
+            err=str(v.get('error'))
+            provider_errors.append({'source':k,'error':err,'endpoint':v.get('endpoint'),'status_code':_normalize_provider_status(v.get('status_code'),err),'retry_count':v.get('retry_count')})
     with lock:
         state.update(last_scan=now.isoformat(), last_candidates=len(results), last_alerts=alerts,
                      last_error=error, last_session=p, scan_id=scan_id, scan_running=False,
@@ -257,27 +259,56 @@ def start_scan(p):
     return scan_id, True
 
 
+def _normalize_provider_status(value, error=''):
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        import re
+        m=re.search(r'\bHTTP\s+(\d{3})\b', value)
+        if m: return int(m.group(1))
+        if value.isdigit(): return int(value)
+    import re
+    m=re.search(r'\bHTTP\s+(\d{3})\b', str(error or ''))
+    return int(m.group(1)) if m else None
+
+
+def _diagnostic_summary(diagnostics):
+    totals={}
+    score_evaluated=0; final_candidates=0; chain_items=0
+    for d in (diagnostics or {}).values():
+        if not isinstance(d,dict): continue
+        chain_items += int(d.get('chain_items',0) or 0)
+        score_evaluated += int(d.get('scored',0) or 0)
+        final_candidates += int(d.get('final_candidates',0) or 0)
+        r=d.get('rejections')
+        if isinstance(r,dict):
+            for k,v in r.items(): totals[k]=totals.get(k,0)+int(v or 0)
+    return totals, score_evaluated, final_candidates, chain_items
+
+
 def _status_text():
     with lock: s=dict(state)
     td=telegram_diagnostics(); ps=provider_status(); et_iso, et_text = session_clock()
-    rejection_totals={}
-    for d in (s.get('diagnostics') or {}).values():
-        if isinstance(d,dict) and isinstance(d.get('rejections'),dict):
-            for k,v in d['rejections'].items(): rejection_totals[k]=rejection_totals.get(k,0)+int(v or 0)
-    rejection_text=', '.join(f'{k}={v}' for k,v in rejection_totals.items() if v) or 'None'
+    rejection_totals, score_evaluated, final_candidates, chain_items = _diagnostic_summary(s.get('diagnostics') or {})
+    rejection_order=['invalid_contract','dte','premium','spread','volume','open_interest','score','trend_alignment','regime']
+    rejection_text=', '.join(f'{k}={rejection_totals.get(k,0)}' for k in rejection_order if rejection_totals.get(k,0)) or 'None'
     provider_details=s.get('provider_errors') or []
     provider_text=''
     if provider_details:
         lines=[]
-        for e in provider_details[-5:]:
-            lines.append(f"{e.get('source','?')} HTTP {e.get('status_code') or '?'} {e.get('endpoint') or ''} retry {e.get('retry_count') or 0}")
-        provider_text='\nProvider error details: '+ ' | '.join(lines)
+        for e in provider_details[-8:]:
+            status=_normalize_provider_status(e.get('status_code'),e.get('error'))
+            err=e.get('error') or 'unknown error'
+            lines.append(f"{e.get('source','?')} HTTP {status if status is not None else 'UNKNOWN'} retry {e.get('retry_count') or 0} | {e.get('endpoint') or 'endpoint unknown'} | {err}")
+        provider_text='\nProvider error details: '+ ' || '.join(lines)
     return (f"🟢 Bot status\nPhase: {phase_label(phase())}\nET clock: {et_text}\nRunning: {s['running']}\n"
             f"Scan running: {s['scan_running']}\nScan stage: {s.get('scan_stage')}\nScan ID: {s.get('scan_id') or '—'}\n"
             f"Symbols scanned: {s.get('symbols_scanned',0)}\nContracts scanned: {s.get('contracts_scanned',0)}\n"
             f"Last candidates: {s['last_candidates']}\nLast alerts: {s['last_alerts']}\nLast scan: {s['last_scan'] or '—'}\n"
             f"Scan duration: {s.get('scan_duration') if s.get('scan_duration') is not None else '—'} s\n"
-            f"Last error: {s['last_error'] or 'None'}\nRejections: {rejection_text}\nTelegram polling: {td.get('telegram_running')}\n"
+            f"Last error: {s['last_error'] or 'None'}\n"
+            f"Diagnostics: chain={chain_items} | score_evaluated={score_evaluated} | final_candidates={final_candidates}\n"
+            f"Rejections: {rejection_text}\nTelegram polling: {td.get('telegram_running')}\n"
             f"Telegram last update: {td.get('telegram_last_update') or '—'}\nTelegram last error: {td.get('telegram_last_error') or 'None'}\n"
             f"Provider: {ps.get('name')} | Options feed: {ps.get('options_feed')} | Underlying feed: {ps.get('underlying_feed')}\n"
             f"Data mode: {ps.get('data_mode')}\nProvider errors: {len(provider_details)}{provider_text}")
