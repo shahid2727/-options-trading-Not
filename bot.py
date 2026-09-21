@@ -192,6 +192,34 @@ def _finalize_scan(p, scan_id, results, diagnostics, started_at, error=None):
                      scan_process_pid=None)
 
 
+def _force_timeout(proc, p, scan_id, started_at, timeout):
+    """Independent hard watchdog. It does not depend on the scanner watcher loop."""
+    time.sleep(timeout)
+    with lock:
+        if not state.get('scan_running') or state.get('scan_id') != scan_id:
+            return
+        stage = state.get('scan_stage') or 'unknown'
+        state['last_error'] = f'Scanner timeout after {timeout}s at stage {stage}'
+    try:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=3)
+            if proc.is_alive() and hasattr(proc, 'kill'):
+                proc.kill()
+                proc.join(timeout=2)
+    except Exception as e:
+        with lock:
+            if state.get('scan_id') == scan_id:
+                state['last_error'] += f' | terminate error: {type(e).__name__}: {e}'
+    now=datetime.now(TZ)
+    duration=max(0.0,(now-datetime.fromisoformat(started_at)).total_seconds())
+    with lock:
+        if state.get('scan_id') == scan_id and state.get('scan_running'):
+            state.update(scan_running=False, scan_finished=now.isoformat(),
+                         scan_duration=round(duration,2), scan_stage='failed',
+                         scan_process_pid=None, last_session=p)
+
+
 def _watch_scan(proc, conn, p, scan_id, started_at):
     timeout=max(1,int(os.getenv('SCAN_TIMEOUT_SECONDS','120')))
     result=None; fatal_error=None
@@ -253,7 +281,9 @@ def start_scan(p):
         with lock: state.update(scan_running=False,scan_stage='failed',last_error=f'Scanner start {type(e).__name__}: {e}')
         return None, 'start_failed'
     with lock: state['scan_process_pid']=proc.pid
-    threading.Thread(target=_watch_scan,args=(proc,parent_conn,p,scan_id,started),daemon=True).start()
+    # Two independent safety paths: the normal watcher and a hard watchdog.
+    threading.Thread(target=_watch_scan,args=(proc,parent_conn,p,scan_id,started),daemon=True,name=f'scan-watch-{scan_id}').start()
+    threading.Thread(target=_force_timeout,args=(proc,p,scan_id,started,max(1,int(os.getenv('SCAN_TIMEOUT_SECONDS','120')))),daemon=True,name=f'scan-timeout-{scan_id}').start()
     return scan_id, True
 
 
