@@ -62,3 +62,7 @@ The bot does not equate an extended-hours underlying quote with a live options q
 Use a Render Web Service with the included Dockerfile. Render provides `PORT`; the application reads it automatically. No paid libraries or brokerage services are required.
 
 No API keys, Telegram tokens, or other secrets belong in GitHub.
+
+## V10.0.1 session fix
+
+The bot now distinguishes `CLOSED`, `OVERNIGHT`, and `scan already running`. `OVERNIGHT_ENABLED=true` enables the 20:00–04:00 ET extended/overnight phase. This label does not imply live options pricing; `data_mode` remains based on the provider feed.

@@ -19,20 +19,50 @@ state = {
 
 
 def phase():
-    n = datetime.now(TZ); t = n.time()
-    if n.weekday() >= 5: return 'CLOSED'
-    if dtime(4,0) <= t < dtime(9,30): return 'PRE_MARKET'
-    if dtime(9,30) <= t < dtime(16,0): return 'REGULAR'
-    if dtime(16,0) <= t < dtime(20,0): return 'AFTER_HOURS'
-    return 'CLOSED'
+    """Return the configured bot session using America/New_York.
+
+    Session windows:
+      00:00-04:00 ET -> OVERNIGHT (Mon-Fri session continuation; Sunday is closed)
+      04:00-09:30 ET -> PRE_MARKET (Mon-Fri)
+      09:30-16:00 ET -> REGULAR (Mon-Fri)
+      16:00-20:00 ET -> AFTER_HOURS (Mon-Fri)
+      20:00-24:00 ET -> OVERNIGHT (Sun-Thu)
+
+    This is a scheduling/data-mode label only. It does not claim that every
+    US option contract has live quotes or executable trading overnight.
+    """
+    n = datetime.now(TZ)
+    t = n.time()
+    wd = n.weekday()  # Mon=0 ... Sun=6
+
+    # 00:00-04:00 ET belongs to the overnight session that started the prior
+    # evening. Monday 00:00-04:00 is the Sunday-night continuation.
+    if dtime(0, 0) <= t < dtime(4, 0):
+        return 'OVERNIGHT' if wd in (0, 1, 2, 3, 4) else 'CLOSED'
+
+    if dtime(4, 0) <= t < dtime(9, 30):
+        return 'PRE_MARKET' if wd < 5 else 'CLOSED'
+    if dtime(9, 30) <= t < dtime(16, 0):
+        return 'REGULAR' if wd < 5 else 'CLOSED'
+    if dtime(16, 0) <= t < dtime(20, 0):
+        return 'AFTER_HOURS' if wd < 5 else 'CLOSED'
+
+    # 20:00-24:00 ET: Sunday through Thursday nights.
+    return 'OVERNIGHT' if wd in (0, 1, 2, 3, 6) else 'CLOSED'
+
+
+def session_clock():
+    """Return ET/UTC clocks for diagnostics without exposing secrets."""
+    n = datetime.now(TZ)
+    return n.isoformat(), n.strftime('%A %Y-%m-%d %H:%M:%S %Z')
 
 
 def phase_label(p):
-    return {'PRE_MARKET':'🌅 PRE-MARKET','REGULAR':'🟢 REGULAR','AFTER_HOURS':'🌙 AFTER-HOURS','CLOSED':'⚪ CLOSED'}.get(p,p)
+    return {'PRE_MARKET':'🌅 PRE-MARKET','REGULAR':'🟢 REGULAR','AFTER_HOURS':'🌙 AFTER-HOURS','OVERNIGHT':'🌙 OVERNIGHT','CLOSED':'⚪ CLOSED'}.get(p,p)
 
 
 def allowed(p):
-    env = {'PRE_MARKET':'PREMARKET_ENABLED','REGULAR':'REGULAR_ENABLED','AFTER_HOURS':'AFTERHOURS_ENABLED'}.get(p)
+    env = {'PRE_MARKET':'PREMARKET_ENABLED','REGULAR':'REGULAR_ENABLED','AFTER_HOURS':'AFTERHOURS_ENABLED','OVERNIGHT':'OVERNIGHT_ENABLED'}.get(p)
     return bool(env and os.getenv(env, 'false').lower() == 'true')
 
 
@@ -204,9 +234,10 @@ def _watch_scan(proc, conn, p, scan_id, started_at):
 
 
 def start_scan(p):
-    if p == 'CLOSED': return None, False
+    if p == 'CLOSED': return None, 'closed'
+    if not allowed(p): return None, 'disabled'
     with lock:
-        if state['scan_running']: return None, False
+        if state['scan_running']: return None, 'running'
         scan_id=uuid.uuid4().hex[:10]; started=datetime.now(TZ).isoformat()
         state.update(scan_running=True, scan_id=scan_id, scan_started=started, scan_finished=None,
                      scan_duration=None, scan_stage='starting', last_error=None, last_session=p,
@@ -220,7 +251,7 @@ def start_scan(p):
         try: parent_conn.close()
         except Exception: pass
         with lock: state.update(scan_running=False,scan_stage='failed',last_error=f'Scanner start {type(e).__name__}: {e}')
-        return None, False
+        return None, 'start_failed'
     with lock: state['scan_process_pid']=proc.pid
     threading.Thread(target=_watch_scan,args=(proc,parent_conn,p,scan_id,started),daemon=True).start()
     return scan_id, True
@@ -228,8 +259,8 @@ def start_scan(p):
 
 def _status_text():
     with lock: s=dict(state)
-    td=telegram_diagnostics(); ps=provider_status()
-    return (f"🟢 Bot status\nPhase: {phase_label(phase())}\nRunning: {s['running']}\n"
+    td=telegram_diagnostics(); ps=provider_status(); et_iso, et_text = session_clock()
+    return (f"🟢 Bot status\nPhase: {phase_label(phase())}\nET clock: {et_text}\nRunning: {s['running']}\n"
             f"Scan running: {s['scan_running']}\nScan stage: {s.get('scan_stage')}\nScan ID: {s.get('scan_id') or '—'}\n"
             f"Symbols scanned: {s.get('symbols_scanned',0)}\nContracts scanned: {s.get('contracts_scanned',0)}\n"
             f"Last candidates: {s['last_candidates']}\nLast alerts: {s['last_alerts']}\nLast scan: {s['last_scan'] or '—'}\n"
@@ -262,7 +293,14 @@ def telegram_command_loop():
                     if cmd=='/status': send_message(_status_text(),chat_id)
                     elif cmd=='/scan':
                         p=phase(); sid,started=start_scan(p)
-                        send_message(f'🔎 Scan started\nPhase: {phase_label(p)}\nScan ID: {sid}' if started else f'⚠️ Scan already running\nScan ID: {state.get("scan_id")}',chat_id)
+                        if started is True:
+                            send_message(f'🔎 Scan started\nPhase: {phase_label(p)}\nScan ID: {sid}', chat_id)
+                        elif started == 'closed':
+                            send_message('⚪ Market is CLOSED\n\nNo scan started.\nScanning is available during the configured market/extended sessions.', chat_id)
+                        elif started == 'disabled':
+                            send_message(f'⏸️ {phase_label(p)} is disabled\n\nEnable the corresponding session environment variable to allow scanning.', chat_id)
+                        else:
+                            send_message(f'⚠️ Scan already running\nScan ID: {state.get("scan_id") or "—"}', chat_id)
                     elif cmd=='/top':
                         with lock: top=list(state.get('last_top') or [])
                         if not top: send_message('ℹ️ لا توجد candidates من آخر scan.',chat_id)
@@ -304,7 +342,11 @@ def status(): return health()
 def scan():
     if not secret_ok(): return jsonify({'ok':False,'error':'unauthorized'}),401
     p=phase(); sid,started=start_scan(p)
-    if not started:
+    if started == 'closed':
+        return jsonify({'ok':True,'accepted':False,'message':'market closed','scan_id':None,'phase':p}),202
+    if started == 'disabled':
+        return jsonify({'ok':True,'accepted':False,'message':'session disabled','scan_id':None,'phase':p}),202
+    if started != True:
         with lock: current=state.get('scan_id')
         return jsonify({'ok':True,'accepted':False,'message':'scan already running','scan_id':current,'phase':p}),202
     return jsonify({'ok':True,'accepted':True,'message':'scan started in background','scan_id':sid,'phase':p,'status_url':'/scan/status'}),202
