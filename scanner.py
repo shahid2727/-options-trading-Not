@@ -218,17 +218,87 @@ def fetch_bars_batch(symbols,timeframe,days=45,limit=None):
     progress('fetching_bars_page', timeframe=timeframe, page=pages, symbols=len(merged), complete=True)
     return merged
 
+def _bar_dt(value):
+    try:
+        return datetime.fromisoformat(str(value).replace('Z','+00:00')).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def _aggregate_bars(bars, minutes):
+    # Build higher-timeframe OHLCV bars from a lower timeframe without pandas.
+    # Grouping is UTC based and preserves chronological order.
+    if not bars or minutes <= 0:
+        return []
+    step=minutes*60
+    groups={}
+    for b in bars:
+        dt=_bar_dt(b.get('t'))
+        if dt is None:
+            continue
+        epoch=int(dt.timestamp())
+        bucket=(epoch//step)*step
+        groups.setdefault(bucket,[]).append(b)
+    out=[]
+    for bucket, rows in sorted(groups.items()):
+        rows=sorted(rows,key=lambda x:str(x.get('t','')))
+        valid=[r for r in rows if num(r.get('c'))>0]
+        if not valid:
+            continue
+        o=num(valid[0].get('o')); h=max(num(r.get('h')) for r in valid); l=min(num(r.get('l')) for r in valid); c=num(valid[-1].get('c'))
+        v=sum(max(0,num(r.get('v'))) for r in valid)
+        item={'t':datetime.fromtimestamp(bucket,tz=timezone.utc).isoformat().replace('+00:00','Z'),
+              'o':o,'h':h,'l':l,'c':c,'v':v}
+        # Carry common optional fields when present.
+        for key in ('n','vw'):
+            vals=[num(r.get(key),0) for r in valid if r.get(key) is not None]
+            if vals:
+                item[key]=sum(vals)/len(vals) if key=='vw' else int(sum(vals))
+        out.append(item)
+    return out
+
+def _bars_for_symbol(symbol,timeframe,days,cache):
+    # Prefer the requested cache. If it is missing/incomplete, fetch the symbol
+    # directly rather than turning a partial multi-symbol response into a hard
+    # provider error.
+    bars=(cache or {}).get(symbol) if cache is not None else None
+    bars=bars or []
+    if len([b for b in bars if num(b.get('c'))>0]) >= 55:
+        return bars, 'cache'
+    try:
+        fetched=fetch_bars(symbol,timeframe,days,limit=2000)
+        if len(fetched) >= len(bars):
+            bars=fetched
+        if len([b for b in bars if num(b.get('c'))>0]) >= 55:
+            if cache is not None: cache[symbol]=bars
+            return bars, 'live_fetch'
+    except Exception as e:
+        progress('bars_symbol_fallback_failed',symbol=symbol,timeframe=timeframe,error=str(e)[:300])
+    return bars, 'cache_partial'
+
 def frame_indicators(symbol,timeframe,days=45,cache=None):
-    if cache is not None:
-        # Do not silently refetch one symbol after a failed batch request. That
-        # behavior multiplied provider calls and was a major source of slow scans.
-        if symbol not in cache:
-            raise RuntimeError(f'cached {timeframe} bars unavailable for {symbol}')
-        bars=cache.get(symbol) or []
-    else:
-        bars=fetch_bars(symbol,timeframe,days)
+    bars,source=_bars_for_symbol(symbol,timeframe,days,cache)
     closes=[num(b.get('c')) for b in bars if num(b.get('c'))>0]
-    if len(closes)<55: raise RuntimeError(f'not enough {timeframe} bars for {symbol}: {len(closes)}')
+    if len(closes)<55:
+        # Higher timeframes are rebuilt from lower ones when the provider's
+        # native timeframe is missing or too short.
+        lower={'15Min':('5Min',7,15),'1Hour':('15Min',20,60),'4Hour':('1Hour',45,240)}.get(timeframe)
+        if lower:
+            ltf,ldays,minutes=lower
+            lcache=None
+            # The caller normally provides a multi-timeframe cache. Access it
+            # through the temporary attribute installed by multi_tf.
+            allc=getattr(frame_indicators,'_all_caches',{}) or {}
+            lcache=allc.get({'5Min':'5m','15Min':'15m','1Hour':'1h'}.get(ltf,''))
+            lower_bars,lower_source=_bars_for_symbol(symbol,ltf,ldays,lcache)
+            if len([b for b in lower_bars if num(b.get('c'))>0])>=55:
+                bars=_aggregate_bars(lower_bars,minutes)
+                source=f'aggregated_{ltf}'
+                closes=[num(b.get('c')) for b in bars if num(b.get('c'))>0]
+                if cache is not None and len(closes)>=55:
+                    cache[symbol]=bars
+        
+    if len(closes)<55:
+        raise RuntimeError(f'not enough {timeframe} bars for {symbol}: {len(closes)}')
     e20=ema(closes[-100:],20); e50=ema(closes[-100:],50); rr=rsi(closes,14); a=atr_bars(bars,14); ax=adx(bars,14)
     mf=ema(closes[-80:],12); ms=ema(closes[-80:],26); macd=mf-ms
     pmf=ema(closes[-81:-1],12); pms=ema(closes[-81:-1],26); pmacd=pmf-pms
@@ -258,7 +328,11 @@ def regime(f4,f1,f15,f5):
 
 def multi_tf(symbol,caches=None):
     caches=caches or {}
-    f5=frame_indicators(symbol,'5Min',7,caches.get('5m')); f15=frame_indicators(symbol,'15Min',20,caches.get('15m')); f1=frame_indicators(symbol,'1Hour',45,caches.get('1h')); f4=frame_indicators(symbol,'4Hour',180,caches.get('4h'))
+    frame_indicators._all_caches=caches
+    try:
+        f5=frame_indicators(symbol,'5Min',7,caches.get('5m')); f15=frame_indicators(symbol,'15Min',20,caches.get('15m')); f1=frame_indicators(symbol,'1Hour',45,caches.get('1h')); f4=frame_indicators(symbol,'4Hour',180,caches.get('4h'))
+    finally:
+        frame_indicators._all_caches={}
     vwap=session_vwap(f5['bars']) or f5['last']
     closes=[num(b.get('c')) for b in f5['bars']]; vols=[num(b.get('v')) for b in f5['bars']]
     avgvol=statistics.mean(vols[-21:-1]) if len(vols)>21 else max(statistics.mean(vols[:-1]),1)
@@ -633,6 +707,30 @@ def scan_all(session):
                 progress('fetching_bars', timeframe=key, state='failed', symbols=len(data), completed=completed, error=str(err))
             else:
                 progress('fetching_bars', timeframe=key, state='complete', symbols=len(data), completed=completed)
+
+    # Repair partial/missing timeframe caches before scoring. Native 4H data can
+    # be sparse; lower timeframe aggregation is more reliable than dropping the
+    # symbol from the scan.
+    repair_plan=[('15m','5m',15,7),('1h','15m',60,20),('4h','1h',240,45)]
+    for target,source_tf,minutes,src_days in repair_plan:
+        target_cache=caches.setdefault(target,{})
+        source_cache=caches.setdefault(source_tf,{})
+        for sym in symbols:
+            good=len([b for b in (target_cache.get(sym) or []) if num(b.get('c'))>0])
+            if good>=55:
+                continue
+            src=source_cache.get(sym) or []
+            if len([b for b in src if num(b.get('c'))>0])<55:
+                try:
+                    fetched=fetch_bars(sym, {'5m':'5Min','15m':'15Min','1h':'1Hour'}[source_tf], src_days, limit=2000)
+                    if fetched:
+                        source_cache[sym]=fetched; src=fetched
+                except Exception as e:
+                    progress('bars_repair_fetch_failed',symbol=sym,target=target,source=source_tf,error=str(e)[:300])
+            agg=_aggregate_bars(src,minutes)
+            if len([b for b in agg if num(b.get('c'))>0])>=55:
+                target_cache[sym]=agg
+                progress('bars_repaired',symbol=sym,target=target,source=source_tf,bars=len(agg))
 
     progress('fetching_bars_complete', symbols=len(symbols), completed=completed)
     symbols_scanned=0; contracts_scanned=0
