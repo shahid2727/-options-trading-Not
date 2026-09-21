@@ -154,8 +154,8 @@ def _scan_process_worker(session_name, scan_id, conn):
 
 def _finalize_scan(p, scan_id, results, diagnostics, started_at, error=None):
     now=datetime.now(TZ); duration=max(0.0,(now-datetime.fromisoformat(started_at)).total_seconds())
-    max_alerts=max(1,int(os.getenv('MAX_ALERTS_PER_SCAN', os.getenv('MAX_ALERTS','5'))))
-    cooldown=max(0,int(os.getenv('ALERT_COOLDOWN_SECONDS','900')))
+    max_alerts=max(1,int(os.getenv('MAX_ALERTS_PER_SCAN', os.getenv('MAX_ALERTS','5')) or 5))
+    cooldown=max(300,int(os.getenv('ALERT_COOLDOWN_SECONDS','900') or 900))
     alert_diag={'max_alerts':max_alerts,'cooldown_seconds':cooldown,'candidates':[],
                 'eligible':0,'cooldown_rejected':0,'max_alerts_rejected':0,
                 'other_rejected':0,'send_attempted':0,'send_success':0,'send_failed':0}
@@ -279,6 +279,10 @@ def start_scan(p):
 
 
 def _status_text():
+    # Effective alert settings are clamped so accidental 0 values cannot disable alerts.
+    _max_alerts = max(1, int(os.getenv('MAX_ALERTS_PER_SCAN', os.getenv('MAX_ALERTS','5')) or 5))
+    _cooldown = max(300, int(os.getenv('ALERT_COOLDOWN_SECONDS','900') or 900))
+
     with lock: s=dict(state); ad=dict(s.get('alert_diagnostics') or {})
     td=telegram_diagnostics(); ps=provider_status()
     lines=[f"🟢 Bot status",f"Phase: {phase_label(phase())}",f"Running: {s['running']}",
@@ -292,7 +296,7 @@ def _status_text():
            f"Provider: {ps.get('name')} | Options feed: {ps.get('options_feed')} | Underlying feed: {ps.get('underlying_feed')}",
            f"Data mode: {ps.get('data_mode')}",f"Provider errors: {len(s.get('provider_errors') or [])}","",
            "🔔 Alert diagnostics",
-           f"Max alerts/scan: {ad.get('max_alerts',0)} | Cooldown: {ad.get('cooldown_seconds',0)}s",
+           f"Max alerts/scan: {ad.get('max_alerts',_max_alerts)} | Cooldown: {ad.get('cooldown_seconds',_cooldown)}s",
            f"Candidates: {len(ad.get('candidates') or [])} | Eligible: {ad.get('eligible',0)} | Cooldown rejected: {ad.get('cooldown_rejected',0)} | Max-alerts rejected: {ad.get('max_alerts_rejected',0)}",
            f"Send attempted: {ad.get('send_attempted',0)} | Success: {ad.get('send_success',0)} | Failed: {ad.get('send_failed',0)}"]
     di=s.get('diagnostics') or {}
