@@ -1,4 +1,4 @@
-# Options Opportunity Bot V10.4
+# Options Opportunity Bot V13.8
 
 SPXW final fix: technical indicators use SPY IEX bars while the real SPXW option chain is fetched from Alpaca under the SPX options root. SPXW failures are isolated from other symbols.
 
@@ -21,3 +21,18 @@ The scanner now separately scores high-momentum option setups using multi-timefr
 - OPRA -> indicative fallback when the configured options feed is rejected.
 - More detailed provider/HTTP diagnostics in `/status`.
 - One market-close HERO alert per trading day when a candidate exists.
+
+
+## V13.8 setup engine
+- Preserves the existing Alpaca/OPRA/IEX scanner, Telegram polling, worker timeout, SPXW proxy-chain architecture, caching, and alert-only risk controls.
+- Separates hard contract/quote safety filters from soft setup factors.
+- Premium, 4H alignment, regime, RSI, VWAP, volume, momentum and score are soft factors unless an explicit safety setting is enabled.
+- Adds explainable `HERO`, `STRONG`, and `WATCH` tiers with configurable thresholds.
+- Scores underlying direction once per symbol and reuses the indicators across its option chain.
+- CALLs and PUTs are directionally evaluated independently; SPXW uses separate weighting while using SPY IEX bars as its technical proxy and the real SPX option chain.
+- Adds per-symbol rejection/tier diagnostics and scan-wide no-setup reasons.
+- Alert cooldown is `symbol + direction + contract`; `MAX_ALERTS_PER_SCAN=5` prioritizes HERO, then STRONG, then WATCH.
+- End-of-day can send up to three HERO setups, including SPXW.
+- Quote validation rejects zero/invalid bid/ask and explicit stale quotes; missing timestamps are not treated as stale unless `REQUIRE_QUOTE_TIMESTAMP=true`.
+- Entry/stop/target levels are model-derived from current bid/ask and available ATR. When the required volatility data is unavailable, the alert reports the target as unavailable instead of inventing a number.
+- The bot never places brokerage orders.

@@ -27,7 +27,7 @@ AFTER_HOURS_MAX_PREMIUM = float(os.getenv('AFTER_HOURS_MAX_PREMIUM','300.00'))
 AFTER_HOURS_MAX_SPREAD = float(os.getenv('AFTER_HOURS_MAX_SPREAD_PCT','150'))
 AFTER_HOURS_MIN_OI = int(os.getenv('AFTER_HOURS_MIN_OI','0'))
 AFTER_HOURS_MIN_VOL = int(os.getenv('AFTER_HOURS_MIN_VOLUME','0'))
-ALERT_COOLDOWN = int(os.getenv('ALERT_COOLDOWN_SECONDS','900'))
+ALERT_COOLDOWN = int(os.getenv('ALERT_COOLDOWN_SECONDS','300'))
 HTTP_TIMEOUT = max(1, float(os.getenv('ALPACA_HTTP_TIMEOUT','8')))
 RETRIES = max(0, int(os.getenv('ALPACA_RETRIES','2')))
 OPTIONS_PAGE_LIMIT = max(100, min(1000, int(os.getenv('OPTIONS_PAGE_LIMIT','1000'))))
@@ -35,6 +35,19 @@ OPTIONS_MAX_PAGES = max(1, int(os.getenv('OPTIONS_MAX_PAGES','12')))
 OPTIONS_MIN_INTERVAL = max(0.05, float(os.getenv('OPTIONS_MIN_INTERVAL_SECONDS','0.20')))
 STOCKS_PAGE_LIMIT = max(100, min(10000, int(os.getenv('STOCKS_PAGE_LIMIT','10000'))))
 STOCKS_MAX_PAGES = max(1, int(os.getenv('STOCKS_MAX_PAGES','5')))
+# V13.8 setup classification / risk controls. These are soft-scoring thresholds
+# except the explicit hard limits below.
+HERO_SCORE = float(os.getenv('HERO_SCORE','88'))
+STRONG_SCORE = float(os.getenv('STRONG_SCORE','78'))
+WATCH_SCORE = float(os.getenv('WATCH_SCORE','65'))
+WATCH_MIN_DIRECTION = int(os.getenv('WATCH_MIN_DIRECTION_EVIDENCE','2'))
+HARD_MAX_SPREAD = float(os.getenv('HARD_MAX_SPREAD_PCT','150'))
+HARD_MAX_PREMIUM_MULTIPLIER = float(os.getenv('HARD_MAX_PREMIUM_MULTIPLIER','10'))
+QUOTE_STALE_SECONDS = int(os.getenv('QUOTE_STALE_SECONDS','300'))
+AFTER_HOURS_STALE_SECONDS = int(os.getenv('AFTER_HOURS_STALE_SECONDS','3600'))
+REQUIRE_QUOTE_TIMESTAMP = os.getenv('REQUIRE_QUOTE_TIMESTAMP','false').strip().lower() in ('1','true','yes','on')
+MAX_DTE = max(1, int(os.getenv('MAX_DTE','30')))
+MIN_DTE = max(0, int(os.getenv('MIN_DTE','0')))
 _options_rate_lock = threading.Lock()
 _options_last_request = 0.0
 
@@ -530,31 +543,140 @@ def parse_contract(sym, details):
 
     return exp, strike, typ
 
-def score_setup(m, direction, spread, delta, vol, oi):
-    f5,f15,f1,f4=m['5m'],m['15m'],m['1h'],m['4h']; score=0; reasons=[]
-    up4=f4['last']>f4['ema20']>f4['ema50'] and f4['macd_delta']>=0 and f4['rsi']>=52
-    dn4=f4['last']<f4['ema20']<f4['ema50'] and f4['macd_delta']<=0 and f4['rsi']<=48
-    up1=f1['last']>f1['ema20']>f1['ema50']; dn1=f1['last']<f1['ema20']<f1['ema50']
-    up15=f15['last']>f15['ema20']; dn15=f15['last']<f15['ema20']
-    up5=f5['last']>m['vwap'] and f5['ema20']>f5['ema50'] and f5['macd_delta']>0 and f5['rsi']>=52
-    dn5=f5['last']<m['vwap'] and f5['ema20']<f5['ema50'] and f5['macd_delta']<0 and f5['rsi']<=48
-    aligned4=up4 if direction=='CALL' else dn4; aligned1=up1 if direction=='CALL' else dn1; aligned15=up15 if direction=='CALL' else dn15; aligned5=up5 if direction=='CALL' else dn5
-    if aligned4: score+=20; reasons.append('4H trend aligned')
-    if aligned1: score+=12; reasons.append('1H aligned')
-    if aligned15: score+=8; reasons.append('15M aligned')
-    if aligned5: score+=15; reasons.append('5M confirmation')
-    if m['breakout']==('UP' if direction=='CALL' else 'DOWN'): score+=10; reasons.append('breakout')
-    if m['volume_ratio']>=1.5: score+=10; reasons.append('volume surge')
-    elif m['volume_ratio']>=1.15: score+=5
-    if spread<8: score+=6; reasons.append('tight spread')
-    elif spread<12: score+=3
-    if vol>=100 and oi>=500: score+=5; reasons.append('strong option liquidity')
-    elif vol>=MIN_VOL and oi>=MIN_OI: score+=2
-    if abs(delta)>=0.30: score+=4
-    if m['regime']=='SIDEWAYS': score-=25; reasons.append('sideways market risk')
-    elif m['regime']=='CHOPPY': score-=15; reasons.append('choppy market risk')
-    elif m['regime']=='TRENDING': score+=5; reasons.append('trend regime')
-    return max(0,min(100,score)), reasons, aligned4, aligned1, aligned15, aligned5
+def _direction_state(m, direction):
+    """Return directional evidence without making 4H/regime a hard gate."""
+    bullish = direction == 'CALL'
+    f5, f15, f1, f4 = m['5m'], m['15m'], m['1h'], m['4h']
+    checks = {
+        '5M': (f5['last'] > m['vwap'] and f5['ema20'] > f5['ema50'] and f5['macd_delta'] >= 0) if bullish
+              else (f5['last'] < m['vwap'] and f5['ema20'] < f5['ema50'] and f5['macd_delta'] <= 0),
+        '15M': (f15['last'] > f15['ema20'] and f15['macd_delta'] >= 0) if bullish
+               else (f15['last'] < f15['ema20'] and f15['macd_delta'] <= 0),
+        '1H': (f1['last'] > f1['ema20'] > f1['ema50']) if bullish
+              else (f1['last'] < f1['ema20'] < f1['ema50']),
+        '4H': (f4['last'] > f4['ema20'] > f4['ema50'] and f4['macd_delta'] >= 0) if bullish
+              else (f4['last'] < f4['ema20'] < f4['ema50'] and f4['macd_delta'] <= 0),
+        'VWAP': m['5m']['last'] > m['vwap'] if bullish else m['5m']['last'] < m['vwap'],
+        'BREAKOUT': m['breakout'] == ('UP' if bullish else 'DOWN'),
+    }
+    positive=sum(bool(v) for v in checks.values())
+    opposite_checks = {
+        '5M': (f5['last'] < m['vwap'] and f5['ema20'] < f5['ema50'] and f5['macd_delta'] < 0) if bullish
+              else (f5['last'] > m['vwap'] and f5['ema20'] > f5['ema50'] and f5['macd_delta'] > 0),
+        '15M': (f15['last'] < f15['ema20'] and f15['macd_delta'] < 0) if bullish
+               else (f15['last'] > f15['ema20'] and f15['macd_delta'] > 0),
+        '1H': (f1['last'] < f1['ema20'] < f1['ema50']) if bullish
+              else (f1['last'] > f1['ema20'] > f1['ema50']),
+        '4H': (f4['last'] < f4['ema20'] < f4['ema50']) if bullish
+              else (f4['last'] > f4['ema20'] > f4['ema50']),
+        'VWAP': m['5m']['last'] < m['vwap'] if bullish else m['5m']['last'] > m['vwap'],
+    }
+    opposite=sum(bool(v) for v in opposite_checks.values())
+    return checks, positive, opposite
+
+
+def score_setup(m, direction, spread, delta, vol, oi, dte=0, strike=None, is_spxw=False):
+    """Explainable 0-100 score. Premium, 4H and regime are soft factors."""
+    f5, f15, f1, f4 = m['5m'], m['15m'], m['1h'], m['4h']
+    checks, positive, opposite = _direction_state(m, direction)
+    reasons=[]
+    components={}
+
+    # Stock/underlying setup: 71 points for stocks, with a slightly more
+    # volatility/breakout-heavy mix for SPXW.
+    components['momentum'] = 15 if checks['5M'] else 0
+    components['volume'] = 8 if m['volume_ratio'] >= 2.0 else (5 if m['volume_ratio'] >= 1.5 else (2 if m['volume_ratio'] >= 1.15 else 0))
+    components['relative_volume'] = min(7.0, max(0.0, (m['volume_ratio']-1.0)*7.0))
+    components['vwap'] = 7 if checks['VWAP'] else 0
+    components['trend_15m'] = 8 if checks['15M'] else 0
+    components['trend_4h'] = (7 if checks['4H'] else 0) if is_spxw else (10 if checks['4H'] else 0)
+    components['breakout'] = (12 if checks['BREAKOUT'] else 0) if is_spxw else (10 if checks['BREAKOUT'] else 0)
+    atr_pct=(f5['atr']/max(f5['last'],1e-9))*100
+    vol_score=min(6.0, max(0.0, atr_pct*1.8))
+    components['volatility']=vol_score
+    if checks['5M']: reasons.append('5M momentum aligned')
+    if checks['15M']: reasons.append('15M trend aligned')
+    if checks['4H']: reasons.append('4H trend aligned')
+    if checks['VWAP']: reasons.append('Above/Below VWAP aligned')
+    if checks['BREAKOUT']: reasons.append('Breakout/Breakdown')
+    if m['volume_ratio']>=1.5: reasons.append('Volume surge')
+
+    # Option quality: 29 points. These factors can reduce the score but do not
+    # reject a contract unless the quote itself is unusable.
+    components['option_liquidity'] = 6 if vol >= max(20, MIN_VOL*4) else (3 if vol >= MIN_VOL else 0)
+    components['open_interest'] = 4 if oi >= max(100, MIN_OI*5) else (2 if oi >= MIN_OI else 0)
+    components['spread'] = 5 if spread <= 8 else (4 if spread <= 12 else (2 if spread <= 25 else (1 if spread <= 50 else 0)))
+    ideal_dte = 7 if is_spxw else 14
+    dte_distance=abs(dte-ideal_dte)
+    components['dte'] = max(0.0, 4.0 - min(4.0, dte_distance/5.0))
+    underlying=f5['last']
+    distance=abs(strike-underlying)/max(underlying,1e-9) if strike else None
+    if distance is None: strike_score=1.5
+    elif distance <= 0.02: strike_score=5
+    elif distance <= 0.05: strike_score=4
+    elif distance <= 0.08: strike_score=2.5
+    elif distance <= 0.12: strike_score=1
+    else: strike_score=0
+    components['strike_positioning']=strike_score
+    ad=abs(delta)
+    components['delta'] = 3 if 0.35 <= ad <= 0.70 else (2 if 0.20 <= ad < 0.35 or 0.70 < ad <= 0.80 else 0)
+    if vol >= max(20, MIN_VOL*4) and oi >= max(100, MIN_OI*5): reasons.append('Strong option liquidity')
+    if spread <= 12: reasons.append('Manageable spread')
+    if 0.30 <= ad <= 0.70: reasons.append('Useful delta')
+    if dte <= EXPLOSIVE_MAX_DTE: reasons.append('Near-term catalyst window')
+
+    # Soft regime penalty: it should make a setup weaker, not erase it.
+    regime_adj = {'TRENDING':5, 'MIXED':1, 'CHOPPY':-6, 'SIDEWAYS':-10}.get(m['regime'],0)
+    components['regime'] = regime_adj
+    if m['regime']=='TRENDING': reasons.append('Trend regime')
+    elif m['regime'] in ('SIDEWAYS','CHOPPY'): reasons.append(f'{m["regime"]} risk')
+
+    raw=sum(components.values())
+    # Directional evidence is a quality gate only for truly non-directional
+    # contracts; it is not a 4H gate.
+    if positive < WATCH_MIN_DIRECTION or opposite >= max(3, positive+1):
+        raw -= 18
+    score=max(0,min(100,raw))
+    return round(score,1), reasons, checks['4H'], checks['1H'], checks['15M'], checks['5M'], components, positive, opposite
+
+
+def premium_quality(premium, is_spxw=False):
+    """Soft premium quality score. Security caps are handled separately."""
+    if premium <= 0: return 0.0, 'invalid premium'
+    budget_per_contract=max(RISK,1.0)
+    # Reward usable premiums without claiming cheap = better. Very cheap options
+    # get a small penalty for fragility; expensive options get a budget penalty.
+    if premium < 0.50: score=2.0; label='very low premium / high sensitivity'
+    elif premium < 1.00: score=5.0; label='low premium'
+    elif premium <= max(5.0, budget_per_contract/100*0.75): score=8.0; label='balanced premium'
+    elif premium <= max(10.0, budget_per_contract/100*1.5): score=6.0; label='higher premium'
+    else: score=3.0; label='high premium / capital intensive'
+    return score, label
+
+
+def _quote_timestamp(snap, quote, trade):
+    for source in (quote, trade, snap):
+        for key in ('t','timestamp','time','updated_at','updatedAt'):
+            value=source.get(key) if isinstance(source,dict) else None
+            if value:
+                try:
+                    return datetime.fromisoformat(str(value).replace('Z','+00:00')).astimezone(timezone.utc)
+                except Exception:
+                    continue
+    return None
+
+
+def _classify(score, positive, opposite, risk_flags=None):
+    risk_flags=risk_flags or []
+    if positive < WATCH_MIN_DIRECTION or opposite >= max(3, positive+1):
+        return None
+    if score >= HERO_SCORE and not risk_flags:
+        return 'HERO'
+    if score >= STRONG_SCORE:
+        return 'STRONG'
+    if score >= WATCH_SCORE:
+        return 'WATCH'
+    return None
 
 def explosive_setup_score(m, direction, spread, delta, vol, oi, dte):
     """Score contracts for explosive momentum setups (0-100).
@@ -597,112 +719,293 @@ def explosive_setup_score(m, direction, spread, delta, vol, oi, dte):
 
 
 def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_underlying=None):
-    # `symbol` is the technical-data symbol; `option_underlying` can override the
-    # Alpaca options root. This is used for SPXW: SPY supplies IEX technical bars
-    # while SPX supplies the actual SPXW option chain.
-    m=multi_tf(symbol,caches); chain_root=option_underlying or symbol; progress('fetching_options', symbol=chain_root); chain=option_chain(chain_root, root_symbol=None); rows=chain.get('snapshots') or {}; out=[]; today=datetime.now(timezone.utc).date()
-    rej={'prefix':0,'bad_contract':0,'dte':0,'premium':0,'spread':0,'liquidity':0,'score':0,'alignment':0,'regime':0,'relaxed_candidates':0,'after_hours_candidates':0}
+    # Analyze the underlying once, then reuse the same multi-timeframe state for
+    # every option contract. SPXW uses SPY IEX technicals with an SPX option chain.
+    m=multi_tf(symbol,caches)
+    chain_root=option_underlying or symbol
+    is_spxw=bool(contract_prefix and option_underlying=='SPX')
+    progress('fetching_options', symbol=chain_root)
+    chain=option_chain(chain_root, root_symbol=None)
+    rows=chain.get('snapshots') or {}
+    out=[]; today=datetime.now(timezone.utc).date()
+    rej={k:0 for k in (
+        'prefix','bad_contract','dte','premium','spread','liquidity','score',
+        'alignment','regime','quote_stale','no_bid','no_ask','invalid_quote',
+        'direction','hard_premium','after_hours_candidates','relaxed_candidates'
+    )}
+    tier_counts={'HERO':0,'STRONG':0,'WATCH':0}
+    potential=0
+    no_setup_reasons=[]
     progress('scoring', symbol=symbol, contracts=len(rows))
+
+    # Security-only premium ceiling. The configured MIN/MAX premium values are
+    # no longer hard opportunity filters.
+    configured_cap=float(os.getenv('SPXW_MAX_PREMIUM','75.00')) if is_spxw else MAX_PREMIUM
+    hard_premium_cap=max(configured_cap, configured_cap*HARD_MAX_PREMIUM_MULTIPLIER)
+    if str(session).upper() in ('AFTER_HOURS','CLOSED'):
+        hard_premium_cap=max(hard_premium_cap, AFTER_HOURS_MAX_PREMIUM*HARD_MAX_PREMIUM_MULTIPLIER)
+
     for contract,snap in rows.items():
         details=snap.get('details') or {}
         exp,strike,typ=parse_contract(contract,details)
-        # SPXW is often returned by Alpaca inside the SPX option chain.
-        # Depending on the endpoint/snapshot payload, root_symbol may be SPX,
-        # SPXW, or omitted. For SPXW scans, do not require a literal SPXW
-        # prefix (that was causing every contract to be rejected).
+
         if contract_prefix:
             root=(details.get('root_symbol') or details.get('rootSymbol') or details.get('underlying_symbol') or details.get('underlyingSymbol') or '').upper().strip()
-            if option_underlying=='SPX':
-                # Alpaca documents that SPXW weekly contracts are listed under
-                # the SPX underlier. Snapshot payloads may expose the root as SPX,
-                # SPXW, or omit it, so a literal prefix filter can incorrectly
-                # discard the entire chain. For SPX scans, accept the SPX chain
-                # here and identify the weekly product using metadata/expiry when
-                # available. This keeps candidates flowing even when the snapshot
-                # omits the weekly root metadata.
-                is_spx_family = root in ('', 'SPX', 'SPXW') or contract.upper().startswith(('SPX','SPXW'))
+            if is_spxw:
+                is_spx_family=root in ('','SPX','SPXW') or contract.upper().startswith(('SPX','SPXW'))
                 if not is_spx_family:
                     rej['prefix']+=1; continue
             elif not contract.upper().startswith(contract_prefix):
                 rej['prefix']+=1; continue
-        if not exp or not strike or typ not in ('CALL','PUT'): rej['bad_contract']+=1; continue
-        try:dte=(datetime.fromisoformat(exp).date()-today).days
-        except Exception: rej['bad_contract']+=1; continue
-        if dte<0 or dte>30: rej['dte']+=1; continue
-        quote=snap.get('latestQuote') or {}; trade=snap.get('latestTrade') or {}; greeks=snap.get('greeks') or {}
-        bid=num(quote.get('bp')); ask=num(quote.get('ap')); last=num(trade.get('p')); premium=(bid+ask)/2 if bid>0 and ask>0 else last
-        is_spxw = bool(contract_prefix and option_underlying=='SPX')
-        # SPXW contracts are structurally more expensive than single-stock
-        # options, so use a separate envelope. User env vars still override.
-        premium_floor = float(os.getenv('SPXW_MIN_PREMIUM','0.50')) if is_spxw else MIN_PREMIUM
-        premium_cap = float(os.getenv('SPXW_MAX_PREMIUM','75.00')) if is_spxw else MAX_PREMIUM
-        affordable_cap = float(os.getenv('SPXW_MAX_AFFORDABLE_PREMIUM','75.00')) if is_spxw else MAX_AFFORDABLE_PREMIUM
-        spread_cap = float(os.getenv('SPXW_MAX_SPREAD_PCT','35')) if is_spxw else MAX_SPREAD
-        oi_floor = int(os.getenv('SPXW_MIN_OI','5')) if is_spxw else MIN_OI
-        vol_floor = int(os.getenv('SPXW_MIN_VOLUME','1')) if is_spxw else MIN_VOL
-        after_hours = str(session).upper() in ('AFTER_HOURS','CLOSED')
-        ah_cap = AFTER_HOURS_MAX_PREMIUM if after_hours else premium_cap
-        ah_affordable = AFTER_HOURS_MAX_PREMIUM if after_hours else affordable_cap
-        if premium<premium_floor or premium>ah_cap or premium>ah_affordable: rej['premium']+=1; continue
-        spread=((ask-bid)/premium*100) if premium and ask>=bid else 999
-        daily=snap.get('dailyBar') or snap.get('daily_bar') or {}; vol=int(num(daily.get('v'))); oi=int(num(details.get('open_interest') or details.get('openInterest')))
-        if vol<=0:vol=int(num(trade.get('s'))) if trade else 0
-        strict_liquidity = spread<=spread_cap and vol>=vol_floor and oi>=oi_floor
-        relaxed_liquidity = spread<=max(spread_cap, RELAXED_MAX_SPREAD) and vol>=min(vol_floor, RELAXED_MIN_VOL) and oi>=min(oi_floor, RELAXED_MIN_OI)
-        # After-hours option quotes can be stale and spreads/OI/volume can be
-        # incomplete. Do not throw away every technically valid contract just
-        # because the market is closed; score liquidity as a risk factor instead.
-        after_hours_liquidity = after_hours and spread<=AFTER_HOURS_MAX_SPREAD and vol>=AFTER_HOURS_MIN_VOL and oi>=AFTER_HOURS_MIN_OI
-        # Momentum lane: do not discard a potentially explosive setup solely because
-        # displayed OI/volume are stale or incomplete.  We still require a bounded
-        # spread and a strong underlying/contract score before allowing an alert.
-        momentum_liquidity = (spread <= float(os.getenv('MOMENTUM_MAX_SPREAD_PCT','150'))
-                              and (after_hours or vol >= int(os.getenv('MOMENTUM_MIN_VOLUME','0')))
-                              and (after_hours or oi >= int(os.getenv('MOMENTUM_MIN_OI','0'))))
-        if not strict_liquidity and not relaxed_liquidity and not after_hours_liquidity and not momentum_liquidity:
-            rej['spread' if spread>RELAXED_MAX_SPREAD else 'liquidity']+=1; continue
-        delta=num(greeks.get('delta'),0.25 if typ=='CALL' else -0.25); direction=typ
-        score,reasons,a4,a1,a15,a5=score_setup(m,direction,spread,delta,vol,oi)
-        explosive_score, explosive_flags = explosive_setup_score(m,direction,spread,delta,vol,oi,dte)
-        explosive_ok = (explosive_score >= EXPLOSIVE_MIN_SCORE and (relaxed_liquidity or after_hours_liquidity or momentum_liquidity) and m['regime'] not in ('SIDEWAYS','CHOPPY'))
-        strict_ok = score>=MIN_SCORE and (a4 or not REQUIRE_4H_ALIGNMENT) and (m['regime'] not in ('SIDEWAYS','CHOPPY') or not BLOCK_SIDEWAYS_CHOPPY)
-        relaxed_ok = score>=FALLBACK_MIN_SCORE and (relaxed_liquidity or after_hours_liquidity or momentum_liquidity) and (a4 or not REQUIRE_4H_ALIGNMENT) and (m['regime'] not in ('SIDEWAYS','CHOPPY') or not BLOCK_SIDEWAYS_CHOPPY)
-        after_hours_ok = after_hours and score>=FALLBACK_MIN_SCORE and (after_hours_liquidity or momentum_liquidity) and (a4 or not REQUIRE_4H_ALIGNMENT) and (m['regime'] not in ('SIDEWAYS','CHOPPY') or not BLOCK_SIDEWAYS_CHOPPY)
-        if not strict_ok and not relaxed_ok and not explosive_ok and not after_hours_ok:
-            if score<MIN_SCORE: rej['score']+=1
+
+        if not exp or not strike or typ not in ('CALL','PUT'):
+            rej['bad_contract']+=1; continue
+        try:
+            dte=(datetime.fromisoformat(exp).date()-today).days
+        except Exception:
+            rej['bad_contract']+=1; continue
+        if dte < MIN_DTE or dte > MAX_DTE:
+            rej['dte']+=1; continue
+
+        quote=snap.get('latestQuote') or {}
+        trade=snap.get('latestTrade') or {}
+        greeks=snap.get('greeks') or {}
+        bid=num(quote.get('bp')); ask=num(quote.get('ap')); last=num(trade.get('p'))
+
+        if bid <= 0:
+            rej['no_bid']+=1
+            continue
+        if ask <= 0:
+            rej['no_ask']+=1
+            continue
+        if ask < bid:
+            rej['invalid_quote']+=1
+            continue
+        premium=(bid+ask)/2
+        if premium <= 0:
+            rej['invalid_quote']+=1
+            continue
+
+        qdt=_quote_timestamp(snap,quote,trade)
+        if qdt is None and REQUIRE_QUOTE_TIMESTAMP:
+            rej['quote_stale']+=1
+            continue
+        if qdt is not None:
+            stale_limit=AFTER_HOURS_STALE_SECONDS if str(session).upper() in ('AFTER_HOURS','CLOSED') else QUOTE_STALE_SECONDS
+            if (datetime.now(timezone.utc)-qdt).total_seconds() > stale_limit:
+                rej['quote_stale']+=1
+                continue
+
+        spread=((ask-bid)/premium*100)
+        if spread > HARD_MAX_SPREAD:
+            rej['spread']+=1
+            continue
+
+        # Premium is soft. Track preferred-range misses for diagnostics, but do
+        # not reject a contract solely because it is cheap or expensive.
+        preferred_floor = float(os.getenv('SPXW_MIN_PREMIUM','0.50')) if is_spxw else MIN_PREMIUM
+        preferred_cap = float(os.getenv('SPXW_MAX_PREMIUM','75.00')) if is_spxw else MAX_PREMIUM
+        if premium < preferred_floor or premium > preferred_cap:
+            rej['premium']+=1
+        if premium > hard_premium_cap:
+            rej['hard_premium']+=1
+            continue
+
+        daily=snap.get('dailyBar') or snap.get('daily_bar') or {}
+        vol=int(num(daily.get('v')))
+        if vol<=0:
+            vol=int(num(trade.get('s'))) if trade else 0
+        oi=int(num(details.get('open_interest') or details.get('openInterest')))
+        delta=num(greeks.get('delta'),0.25 if typ=='CALL' else -0.25)
+
+        # Liquidity is primarily scored. Only invalid quotes/extreme spreads are
+        # hard filters. Very illiquid contracts can still become WATCH/STRONG only
+        # when the underlying setup is exceptional, and the alert carries the risk.
+        liquidity_soft = (
+            spread <= max(MAX_SPREAD, RELAXED_MAX_SPREAD) and
+            (vol >= MIN_VOL or oi >= MIN_OI)
+        )
+        if not liquidity_soft:
+            # Keep the contract for scoring only when the quote is bounded and
+            # underlying momentum is strong; otherwise it is genuinely unusable.
+            momentum_lane = (
+                spread <= float(os.getenv('MOMENTUM_MAX_SPREAD_PCT','150')) and
+                m['volume_ratio'] >= EXPLOSIVE_MIN_VOLUME_RATIO
+            )
+            if not momentum_lane:
+                rej['liquidity']+=1
+                continue
+
+        score,reasons,a4,a1,a15,a5,components,positive,opposite=score_setup(
+            m,typ,spread,delta,vol,oi,dte,strike,is_spxw=is_spxw
+        )
+        pscore,plabel=premium_quality(premium,is_spxw)
+        # Premium is a soft component. Add at most 8 points, preserving the 0-100
+        # ceiling. This is intentionally not a rejection condition.
+        score=round(min(100,max(0,score + pscore - 8.0)),1)
+        components['premium']=round(pscore-8.0,1)
+
+        explosive_score, explosive_flags=explosive_setup_score(m,typ,spread,delta,vol,oi,dte)
+        potential += 1
+
+        risk_flags=[]
+        if spread > max(MAX_SPREAD,RELAXED_MAX_SPREAD): risk_flags.append('wide spread')
+        if vol < MIN_VOL and oi < MIN_OI: risk_flags.append('thin option liquidity')
+        if premium > max(MAX_AFFORDABLE_PREMIUM,1.0) and not is_spxw: risk_flags.append('capital intensive')
+        if m['regime']=='SIDEWAYS' and BLOCK_SIDEWAYS_CHOPPY: risk_flags.append('sideways regime')
+        if m['regime']=='CHOPPY' and BLOCK_SIDEWAYS_CHOPPY: risk_flags.append('choppy regime')
+        if REQUIRE_4H_ALIGNMENT and not a4: risk_flags.append('4H misalignment')
+        # HERO is deliberately stricter than STRONG/WATCH: a top-tier setup
+        # must have 4H alignment and a non-choppy/non-sideways regime.
+        if score >= HERO_SCORE and not a4: risk_flags.append('4H not aligned for HERO')
+        if score >= HERO_SCORE and m['regime'] in ('SIDEWAYS','CHOPPY'): risk_flags.append('weak regime for HERO')
+
+        tier=_classify(score,positive,opposite,risk_flags if score>=HERO_SCORE else [])
+        # Hard user settings remain respected, but as classification restrictions
+        # rather than a blanket score rejection.
+        if REQUIRE_4H_ALIGNMENT and not a4:
+            if tier=='HERO': tier='STRONG'
+            elif tier=='STRONG': tier='WATCH'
+        if BLOCK_SIDEWAYS_CHOPPY and m['regime'] in ('SIDEWAYS','CHOPPY'):
+            tier=None
+        if tier is None:
+            rej['score']+=1
+            if positive < WATCH_MIN_DIRECTION or opposite >= max(3,positive+1): rej['direction']+=1
             if REQUIRE_4H_ALIGNMENT and not a4: rej['alignment']+=1
             if BLOCK_SIDEWAYS_CHOPPY and m['regime'] in ('SIDEWAYS','CHOPPY'): rej['regime']+=1
             continue
-        relaxed = not strict_ok and not explosive_ok and not after_hours_ok
-        if explosive_ok:
+
+        if tier in tier_counts: tier_counts[tier]+=1
+        if tier=='WATCH':
+            rej['relaxed_candidates']+=1
+        if pscore < 4: reasons.append(f'Premium quality: {plabel}')
+        elif pscore >= 8: reasons.append('Balanced premium')
+        if vol < MIN_VOL or oi < MIN_OI: reasons.append('⚠️ Liquidity below preferred threshold; setup quality compensates')
+        if not a4: reasons.append('4H not fully aligned — classified below HERO when applicable')
+        if explosive_score >= EXPLOSIVE_MIN_SCORE and m['regime'] not in ('SIDEWAYS','CHOPPY'):
             reasons.append('💥 EXPLOSIVE MOMENTUM SETUP')
             reasons.extend(explosive_flags)
-        elif after_hours_ok:
-            rej['after_hours_candidates']+=1
-            reasons.append('🌙 AFTER-HOURS HERO FALLBACK — verify live spread at open')
-        elif relaxed:
-            rej['relaxed_candidates']+=1
-            reasons.append('RELAXED LIQUIDITY/SCORE FALLBACK')
-        risk=max(premium*.20,0.10); entry_low=round(premium*.97,2); entry_high=round(premium*1.03,2); stop=round(max(.05,entry_low-risk),2)
-        tp1=round(entry_high+risk,2); tp2=round(entry_high+2*risk,2); tp3=round(entry_high+3*risk,2)
-        contracts=max(0,int(RISK//(risk*100))); max_loss=round(risk*100*contracts,2)
-        reward1=round(max(0,tp1-entry_high)*100*contracts,2); reward2=round(max(0,tp2-entry_high)*100*contracts,2); reward3=round(max(0,tp3-entry_high)*100*contracts,2)
-        atr_points=max(m['5m']['atr'],m['5m']['last']*0.001); u_entry=round(m['5m']['last'],2)
-        if direction=='CALL': u_stop=round(u_entry-atr_points,2); u_tp1=round(u_entry+atr_points,2); u_tp2=round(u_entry+2*atr_points,2); u_tp3=round(u_entry+3*atr_points,2)
-        else: u_stop=round(u_entry+atr_points,2); u_tp1=round(u_entry-atr_points,2); u_tp2=round(u_entry-2*atr_points,2); u_tp3=round(u_entry-3*atr_points,2)
-        confidence=round(min(94,max(50,50+score*.44)),0)
-        tp1_conf=round(min(95,confidence+4)); tp2_conf=round(max(25,confidence-9)); tp3_conf=round(max(15,confidence-20))
-        if direction=='CALL': projected_underlying=round(max(u_tp3, m['recent_high'] + 2*atr_points),2); underlying_move=max(0.0, projected_underlying-u_entry)
-        else: projected_underlying=round(min(u_tp3, m['recent_low'] - 2*atr_points),2); underlying_move=max(0.0, u_entry-projected_underlying)
-        projected_premium=max(0.05, premium + abs(delta)*underlying_move); projected_upside_pct=round(max(0.0,(projected_premium/premium-1)*100),1) if premium>0 else 0.0
-        extreme_upside=projected_upside_pct>=UPSIDE_ALERT_PCT and premium<=affordable_cap
+        if tier=='WATCH':
+            reasons.append('🟡 WATCH — monitor; not a full entry signal')
+        elif tier=='STRONG':
+            reasons.append('🟢 STRONG setup')
+        else:
+            reasons.append('🏆 HERO setup')
+
+        # Model levels use the live option quote plus underlying ATR. If ATR is not
+        # available, do not invent target numbers.
+        entry_low=round(bid,2); entry_high=round(ask,2)
+        atr_points=num(m['5m'].get('atr'))
+        u_entry=round(m['5m']['last'],2)
+        if atr_points>0 and u_entry>0:
+            if typ=='CALL':
+                u_stop=round(u_entry-atr_points,2); u_tp1=round(u_entry+atr_points,2)
+                u_tp2=round(u_entry+2*atr_points,2); u_tp3=round(u_entry+3*atr_points,2)
+                projected_underlying=u_tp3
+                underlying_move=max(0,projected_underlying-u_entry)
+            else:
+                u_stop=round(u_entry+atr_points,2); u_tp1=round(u_entry-atr_points,2)
+                u_tp2=round(u_entry-2*atr_points,2); u_tp3=round(u_entry-3*atr_points,2)
+                projected_underlying=u_tp3
+                underlying_move=max(0,u_entry-projected_underlying)
+        else:
+            u_stop=u_tp1=u_tp2=u_tp3=projected_underlying=None
+            underlying_move=0
+
+        # Premium target is a conservative delta-based scenario only when both
+        # delta and underlying ATR are available; otherwise explicitly unavailable.
+        if underlying_move>0 and abs(delta)>0:
+            projected_premium=max(0.01, premium + abs(delta)*underlying_move)
+            projected_upside_pct=round(max(0,(projected_premium/premium-1)*100),1)
+        else:
+            projected_premium=None; projected_upside_pct=None
+        extreme_upside=bool(projected_upside_pct is not None and projected_upside_pct>=UPSIDE_ALERT_PCT)
         if extreme_upside: reasons.append(f'projected upside > {UPSIDE_ALERT_PCT:.0f}%')
-        out.append({'signal':direction,'market':'OPTIONS','symbol':symbol,'contract':contract,'dte':dte,'premium':round(premium,2),'bid':round(bid,2),'ask':round(ask,2),'entry_low':entry_low,'entry_high':entry_high,'stop_loss':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'affordable':contracts>0,'max_loss':max_loss,'expected_profit_tp1':reward1,'expected_profit_tp2':reward2,'expected_profit_tp3':reward3,'underlying_entry':u_entry,'underlying_stop_loss':u_stop,'underlying_tp1':u_tp1,'underlying_tp2':u_tp2,'underlying_tp3':u_tp3,'atr_5m_points':round(atr_points,2),'score':round(score,1),'explosive_score':explosive_score,'explosive_setup':bool(explosive_ok),'explosive_flags':explosive_flags,'confidence':confidence,'tp1_confidence':tp1_conf,'tp2_confidence':tp2_conf,'tp3_confidence':tp3_conf,'projected_underlying_target':projected_underlying,'projected_premium':round(projected_premium,2),'projected_upside_pct':projected_upside_pct,'extreme_upside':extreme_upside,'market_regime':m['regime'],'volume':vol,'open_interest':oi,'spread_pct':round(spread,1),'delta':round(delta,3),'underlying':u_entry,'indicator_symbol':symbol,'option_underlying':chain_root,'vwap_state':'BULLISH' if u_entry>m['vwap'] else 'BEARISH','ema_state':'BULLISH' if m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH','rsi':round(m['5m']['rsi'],1),'macd_state':'BULLISH' if m['5m']['macd_delta']>0 else 'BEARISH','volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout'],'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL','adx_4h':round(m['4h']['adx'],1),'rsi_4h':round(m['4h']['rsi'],1),'reasons':reasons,'session':session,'data_mode':options_data_mode()})
-    return out, {'chain_items':len(rows),'scored':len(out), 'parse_note':'OCC fallback enabled', 'chain_fallback':bool(chain.get('fallback')), 'chain_pages':chain.get('pages',0), 'contracts_discovered':chain.get('contracts_discovered',0), 'primary_chain_error':chain.get('primary_error'),'underlying':chain_root,'indicator_source':'Alpaca IEX multi-timeframe 5m/15m/1h/4h','option_source':'Alpaca options '+os.getenv('ALPACA_OPTIONS_FEED','indicative'),'market_regime':m['regime'],'rejections':rej,'config':{'after_hours_max_premium':AFTER_HOURS_MAX_PREMIUM,'after_hours_max_spread':AFTER_HOURS_MAX_SPREAD,'momentum_max_spread':float(os.getenv('MOMENTUM_MAX_SPREAD_PCT','150')),'explosive_min_score':EXPLOSIVE_MIN_SCORE,'explosive_min_volume_ratio':EXPLOSIVE_MIN_VOLUME_RATIO,'explosive_max_dte':EXPLOSIVE_MAX_DTE,'spxw_max_premium':float(os.getenv('SPXW_MAX_PREMIUM','75.00')),'spxw_max_spread':float(os.getenv('SPXW_MAX_SPREAD_PCT','35')),'spxw_min_oi':int(os.getenv('SPXW_MIN_OI','5')),'spxw_min_volume':int(os.getenv('SPXW_MIN_VOLUME','1')),'min_score':MIN_SCORE,'fallback_min_score':FALLBACK_MIN_SCORE,'require_4h_alignment':REQUIRE_4H_ALIGNMENT,'block_sideways_choppy':BLOCK_SIDEWAYS_CHOPPY,'max_spread':MAX_SPREAD,'relaxed_max_spread':RELAXED_MAX_SPREAD,'min_oi':MIN_OI,'relaxed_min_oi':RELAXED_MIN_OI,'min_volume':MIN_VOL,'relaxed_min_volume':RELAXED_MIN_VOL},'trend_4h':'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL','trend_1h':'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL','trend_15m':'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL','trend_5m':'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL'}
+
+        # Option stop/targets are derived from current bid/ask risk, not arbitrary
+        # percentages. If the quote is valid, these are available model levels.
+        risk=max((ask-bid)*1.5, premium*0.20)
+        risk=max(risk,0.05)
+        stop=round(max(0.01,bid-risk),2)
+        tp1=round(ask+risk,2); tp2=round(ask+2*risk,2); tp3=round(ask+3*risk,2)
+        contracts=max(0,int(RISK//(risk*100)))
+        max_loss=round(risk*100*contracts,2)
+        reward1=round(max(0,tp1-entry_high)*100*contracts,2)
+        reward2=round(max(0,tp2-entry_high)*100*contracts,2)
+        reward3=round(max(0,tp3-entry_high)*100*contracts,2)
+        confidence=round(min(97,max(50,score*.92)),0)
+        tp1_conf=round(min(98,confidence+3)); tp2_conf=round(max(25,confidence-8)); tp3_conf=round(max(15,confidence-18))
+
+        trend4='BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL'
+        trend1='BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL'
+        trend15='BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL'
+        trend5='BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL'
+
+        out.append({
+            'signal':typ,'tier':tier,'market':'OPTIONS','symbol':symbol,'contract':contract,
+            'dte':dte,'strike':round(strike,2),'premium':round(premium,2),'bid':round(bid,2),'ask':round(ask,2),
+            'entry_low':entry_low,'entry_high':entry_high,'stop_loss':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,
+            'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'affordable':contracts>0,
+            'max_loss':max_loss,'expected_profit_tp1':reward1,'expected_profit_tp2':reward2,'expected_profit_tp3':reward3,
+            'underlying_entry':u_entry,'underlying_stop_loss':u_stop,'underlying_tp1':u_tp1,'underlying_tp2':u_tp2,'underlying_tp3':u_tp3,
+            'atr_5m_points':round(atr_points,2) if atr_points else None,'score':score,'score_components':components,
+            'direction_evidence':positive,'opposite_evidence':opposite,'explosive_score':explosive_score,
+            'explosive_setup':bool(explosive_score>=EXPLOSIVE_MIN_SCORE and positive>=4),
+            'explosive_flags':explosive_flags,'confidence':confidence,'tp1_confidence':tp1_conf,
+            'tp2_confidence':tp2_conf,'tp3_confidence':tp3_conf,'projected_underlying_target':projected_underlying,
+            'projected_premium':round(projected_premium,2) if projected_premium is not None else None,
+            'projected_upside_pct':projected_upside_pct,'extreme_upside':extreme_upside,'market_regime':m['regime'],
+            'volume':vol,'open_interest':oi,'spread_pct':round(spread,1),'delta':round(delta,3),
+            'underlying':u_entry,'indicator_symbol':symbol,'indicator_proxy':symbol if not is_spxw else 'SPY',
+            'option_underlying':chain_root,'vwap_state':'BULLISH' if u_entry>m['vwap'] else 'BEARISH',
+            'ema_state':'BULLISH' if m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH',
+            'rsi':round(m['5m']['rsi'],1),'macd_state':'BULLISH' if m['5m']['macd_delta']>0 else 'BEARISH',
+            'volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout'],'trend_4h':trend4,
+            'trend_1h':trend1,'trend_15m':trend15,'trend_5m':trend5,'adx_4h':round(m['4h']['adx'],1),
+            'rsi_4h':round(m['4h']['rsi'],1),'reasons':reasons,'session':session,'data_mode':options_data_mode(),
+            'premium_quality':round(pscore,1),'premium_quality_label':plabel,'quote_timestamp':qdt.isoformat() if qdt else None
+        })
+
+    if potential==0:
+        if not rows: no_setup_reasons.append('No option-chain contracts returned')
+        if rej['dte']: no_setup_reasons.append('DTE outside configured window')
+        if rej['premium'] or rej['hard_premium']: no_setup_reasons.append('Premium outside soft/security envelope')
+        if rej['liquidity'] or rej['spread']: no_setup_reasons.append('Options liquidity/spread insufficient')
+        if rej['quote_stale']: no_setup_reasons.append('Quotes stale')
+        if rej['direction'] or rej['score']: no_setup_reasons.append('Underlying direction/score below WATCH threshold')
+    if not no_setup_reasons and not out:
+        no_setup_reasons.append('No qualified setup')
+    return out, {
+        'chain_items':len(rows),'potential_setups':potential,'scored':len(out),'hero':tier_counts['HERO'],
+        'strong':tier_counts['STRONG'],'watch':tier_counts['WATCH'],'parse_note':'OCC fallback enabled',
+        'chain_fallback':bool(chain.get('fallback')),'chain_pages':chain.get('pages',0),
+        'contracts_discovered':chain.get('contracts_discovered',0),'primary_chain_error':chain.get('primary_error'),
+        'underlying':chain_root,'indicator_source':'Alpaca IEX multi-timeframe 5m/15m/1h/4h',
+        'option_source':'Alpaca options '+str(chain.get('feed_used') or os.getenv('ALPACA_OPTIONS_FEED','indicative')),
+        'market_regime':m['regime'],'rejections':rej,'no_setup_reasons':list(dict.fromkeys(no_setup_reasons)),
+        'direction_summary':{
+            'call_evidence':_direction_state(m,'CALL')[1],
+            'put_evidence':_direction_state(m,'PUT')[1],
+            'regime':m['regime'],'volume_ratio':round(m['volume_ratio'],2),
+            'breakout':m['breakout']
+        },
+        'config':{
+            'hero_score':HERO_SCORE,'strong_score':STRONG_SCORE,'watch_score':WATCH_SCORE,
+            'watch_min_direction':WATCH_MIN_DIRECTION,'hard_max_spread':HARD_MAX_SPREAD,
+            'hard_premium_cap':hard_premium_cap,'quote_stale_seconds':QUOTE_STALE_SECONDS,
+            'max_dte':MAX_DTE,'min_dte':MIN_DTE,'min_score_legacy':MIN_SCORE,
+            'fallback_min_score_legacy':FALLBACK_MIN_SCORE,'require_4h_alignment':REQUIRE_4H_ALIGNMENT,
+            'block_sideways_choppy':BLOCK_SIDEWAYS_CHOPPY,'spxw':is_spxw
+        },
+        'trend_4h': 'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL',
+        'trend_1h': 'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL',
+        'trend_15m': 'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL',
+        'trend_5m': 'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL'
+    }
 
 def scan_all(session):
     if not headers():raise RuntimeError('Missing ALPACA_API_KEY / ALPACA_API_SECRET')
-    results=[]; diagnostics={}; symbols=list(dict.fromkeys(STOCKS+(['SPX'] if 'SPXW' in INDEX_ROOTS else [])))
+    results=[]; diagnostics={}; symbols=list(dict.fromkeys(STOCKS))  # SPX is an index; never request it from IEX stock bars.
     periods={'5m':('5Min',7),'15m':('15Min',20),'1h':('1Hour',45),'4h':('4Hour',180)}; caches={}
     progress('fetching_bars', symbols_total=len(symbols), timeframes=len(periods), completed=0)
     # Fetch the four timeframes concurrently. Each request still has its own
@@ -781,8 +1084,40 @@ def scan_all(session):
         except Exception as e:
             diagnostics['SPXW']={'error':f'{type(e).__name__}: {e}','provider':'Alpaca','endpoint':getattr(e,'endpoint',''),'status_code':getattr(e,'status_code',None),'retry_count':getattr(e,'retry_count',None),'detail':repr(e)}
     progress('sorting', candidates=len(results))
-    results.sort(key=lambda x:(x.get('explosive_setup',False),x.get('explosive_score',0),x['extreme_upside'],x['projected_upside_pct'],x['score'],x['confidence'],x['volume'],x['open_interest']),reverse=True)
-    diagnostics['__meta__']={'symbols_scanned':symbols_scanned,'contracts_scanned':contracts_scanned,'candidates':len(results),'provider':provider_status()}
+    tier_rank={'HERO':3,'STRONG':2,'WATCH':1}
+    results.sort(key=lambda x:(
+        tier_rank.get(x.get('tier'),0),
+        x.get('score',0),
+        x.get('explosive_score',0),
+        x.get('confidence',0),
+        x.get('volume',0),
+        x.get('open_interest',0)
+    ),reverse=True)
+
+    aggregate_rej={}
+    heroes=sum(1 for x in results if x.get('tier')=='HERO')
+    strongs=sum(1 for x in results if x.get('tier')=='STRONG')
+    watchs=sum(1 for x in results if x.get('tier')=='WATCH')
+    relaxed_mode = heroes == 0 and strongs == 0 and watchs > 0
+    if relaxed_mode:
+        for x in results:
+            if x.get('tier')=='WATCH':
+                x['relaxed_mode']=True
+                if '⚠️ RELAXED SETUP — no HERO/STRONG qualified in this scan' not in x.get('reasons',[]):
+                    x.setdefault('reasons',[]).append('⚠️ RELAXED SETUP — no HERO/STRONG qualified in this scan')
+    no_setup=[]
+    for key,d in diagnostics.items():
+        if not isinstance(d,dict): continue
+        for rk,rv in (d.get('rejections') or {}).items():
+            aggregate_rej[rk]=aggregate_rej.get(rk,0)+int(rv or 0)
+        no_setup.extend(d.get('no_setup_reasons') or [])
+    diagnostics['__meta__']={
+        'symbols_scanned':symbols_scanned,'contracts_scanned':contracts_scanned,
+        'candidates':len(results),'heroes':heroes,'strong':strongs,'watch':watchs,
+        'rejections':aggregate_rej,'no_setup_reasons':list(dict.fromkeys(no_setup))[:8],
+        'provider':provider_status()
+    }
+    progress('sorting', candidates=len(results), heroes=heroes, strong=strongs, watch=watchs)
     return results,diagnostics
 
 def options_data_mode():
