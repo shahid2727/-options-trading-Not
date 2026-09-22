@@ -53,62 +53,48 @@ def points_text(target, entry):
 
 def format_alert(x):
     tier=x.get('tier','STRONG')
-    badge=('⚠️ RELAXED SETUP' if x.get('relaxed_mode') else {'HERO':'🏆 HERO SETUP','STRONG':'🟢 STRONG SETUP','WATCH':'🟡 WATCH'}.get(tier,'⚠️ RELAXED SETUP'))
-    entry_low=x.get('entry_low'); entry_high=x.get('entry_high')
-    premium=x.get('premium'); bid=x.get('bid'); ask=x.get('ask')
-    stop=x.get('stop_loss'); tp1=x.get('tp1'); tp2=x.get('tp2'); tp3=x.get('tp3')
-    data_mode=x.get('data_mode','INDICATIVE').upper()
-    session=x.get('session',phase())
+    badge={'HERO':'🏆 HERO SETUP','STRONG':'🟢 STRONG SETUP','WATCH':'🟡 WATCH'}.get(tier,'🔎 TOP CANDIDATE')
     def money(v):
-        return f"${float(v):.2f}" if isinstance(v,(int,float)) else "Target unavailable"
-    def pct(v,base):
-        try: return f"{(float(v)/float(base)-1)*100:+.0f}%"
-        except Exception: return "n/a"
-    level_line=lambda label,v: f"{label}: {money(v)}"
-    reasons=', '.join(x.get('reasons',[])) or '—'
-    setup_text=reasons.replace(', ', '\n• ')
+        return f"${float(v):.2f}" if isinstance(v,(int,float)) else "—"
+    reasons=x.get('reasons') or []
+    spread=x.get('spread_pct')
+    spread_text=f"{float(spread):.1f}%" if spread is not None else "—"
     risk=[]
-    if x.get('spread_pct',0)>25: risk.append('Wide spread vs preferred threshold')
+    if spread is not None and float(spread)>25: risk.append('Wide spread vs preferred threshold')
     if x.get('volume',0)<5 and x.get('open_interest',0)<10: risk.append('Low option liquidity')
     if x.get('trend_4h')=='NEUTRAL': risk.append('4H neutral')
     if x.get('market_regime') in ('SIDEWAYS','CHOPPY'): risk.append(f"{x.get('market_regime')} regime")
+    if x.get('quote_is_stale'): risk.append('Quote is stale')
     if not risk: risk.append('No major model risk flag')
-    target_note='Model levels are derived from the current quote and available ATR; they are not guaranteed fills.'
     return (
         f"{badge}\n\n"
-        f"Symbol: {x.get('symbol','')}\n"
-        f"Direction: {x.get('signal','')}\n"
-        f"Contract: {x.get('contract','')}\n"
-        f"Expiry/DTE: {x.get('dte','—')} days\n"
-        f"Strike: {money(x.get('strike'))}\n\n"
-        f"CURRENT QUOTE\n"
-        f"Bid: {money(bid)} | Ask: {money(ask)} | Mid: {money(premium)}\n"
-        f"Entry: {money(entry_low)} – {money(entry_high)}\n\n"
-        f"RISK / TARGETS\n"
-        f"{level_line('STOP',stop)}\n"
-        f"{level_line('TP1',tp1)}\n"
-        f"{level_line('TP2',tp2)}\n"
-        f"{level_line('TP3',tp3)}\n"
-        f"Risk/contract: ${float(x.get('risk_dollars_per_contract',0) or 0):.2f}\n"
-        f"Suggested contracts: {int(x.get('suggested_contracts',0) or 0)}\n\n"
-        f"UNDERLYING\n"
-        f"Entry: {x.get('underlying_entry') if x.get('underlying_entry') is not None else 'Target unavailable'}\n"
-        f"Stop: {x.get('underlying_stop_loss') if x.get('underlying_stop_loss') is not None else 'Target unavailable'}\n"
-        f"TP1/TP2/TP3: {x.get('underlying_tp1') if x.get('underlying_tp1') is not None else 'Target unavailable'} / "
-        f"{x.get('underlying_tp2') if x.get('underlying_tp2') is not None else 'Target unavailable'} / "
-        f"{x.get('underlying_tp3') if x.get('underlying_tp3') is not None else 'Target unavailable'}\n\n"
-        f"SCORE: {float(x.get('score',0) or 0):.0f}/100 | {tier}\n"
-        f"Explosive score: {float(x.get('explosive_score',0) or 0):.0f}/100\n"
-        f"Direction evidence: {x.get('direction_evidence',0)} | Opposite: {x.get('opposite_evidence',0)}\n"
-        f"15M: {x.get('trend_15m','NEUTRAL')} | 4H: {x.get('trend_4h','NEUTRAL')}\n"
-        f"VWAP: {x.get('vwap_state','—')} | Breakout: {x.get('breakout','NO')}\n"
-        f"Volume: {x.get('volume',0)} | RV: {x.get('volume_ratio',0)} | OI: {x.get('open_interest',0)}\n"
-        f"Spread: {x.get('spread_pct',0):.1f}% | Delta: {x.get('delta',0):.2f}\n"
-        f"Regime: {x.get('market_regime','—')} | Data: {data_mode}\n\n"
-        f"SETUP\n• {setup_text}\n\n"
-        f"RISK\n• " + "\n• ".join(risk) + "\n\n"
-        f"{target_note}\n"
-        f"Model upside scenario: {('+'+str(x.get('projected_upside_pct'))+'%') if x.get('projected_upside_pct') is not None else 'Target unavailable'}\n"
+        f"Underlying: {x.get('symbol','—')}\n"
+        f"Contract: {x.get('contract','—')}\n"
+        f"Direction: {x.get('signal','—')}\n"
+        f"Strike: {money(x.get('strike'))}\n"
+        f"Expiration/DTE: {x.get('dte','—')}\n\n"
+        f"Entry: {money(x.get('entry'))}\n"
+        f"Current: {money(x.get('premium'))}\n"
+        f"Bid: {money(x.get('bid'))} | Ask: {money(x.get('ask'))}\n"
+        f"Spread: {spread_text}\n"
+        f"Volume: {x.get('volume',0)} | OI: {x.get('open_interest',0)} | DTE: {x.get('dte','—')}\n\n"
+        f"Score: {float(x.get('score',0) or 0):.0f}/100 | Setup: {tier or 'BELOW_WATCH'}\n"
+        f"Liquidity: {x.get('score_components',{}).get('volume_oi','—')}\n"
+        f"Momentum: {x.get('score_components',{}).get('momentum','—')}\n"
+        f"Trend: {x.get('score_components',{}).get('trend','—')}\n"
+        f"Technical: {x.get('score_components',{}).get('price_action','—')}\n"
+        f"Options: {x.get('score_components',{}).get('options_activity','—')}\n\n"
+        f"🎯 TARGETS\nTP1: {money(x.get('tp1'))}\nTP2: {money(x.get('tp2'))}\nTP3: {money(x.get('tp3'))}\n\n"
+        f"🛑 STOP: {money(x.get('stop_loss'))}\n"
+        f"Risk/Reward: {x.get('risk_reward','—')}\n"
+        f"Expected Profit %: {x.get('expected_profit_pct','—')}\n"
+        f"Expected Loss %: {x.get('expected_loss_pct','—')}\n"
+        f"📈 Expected Move: {x.get('projected_upside_pct','—')}%\n\n"
+        f"🔥 Reasons:\n• " + "\n• ".join(reasons[:8] or ['—']) + "\n\n"
+        f"Risk flags:\n• " + "\n• ".join(risk) + "\n\n"
+        f"Quote source: {x.get('quote_source','—')}\n"
+        f"Quote age: {x.get('quote_age_sec','—')} sec\n"
+        f"Data mode: {x.get('data_mode','—')}\n"
         f"⚠️ Analysis + alerts only. No brokerage execution. No guaranteed profit."
     )
 
@@ -292,6 +278,8 @@ def _finalize_scan(p, scan_id, results, diagnostics, started_at, error=None):
                     with lock: state['hero_sent_date']=today_key
 
     meta=diagnostics.get('__meta__',{}) if isinstance(diagnostics,dict) else {}
+    if isinstance(meta, dict):
+        meta['scan_id'] = scan_id
     provider_errors=[]
     for k,v in (diagnostics or {}).items():
         if isinstance(v,dict) and v.get('error'):
@@ -306,7 +294,7 @@ def _finalize_scan(p, scan_id, results, diagnostics, started_at, error=None):
             last_error=error, last_session=p, scan_id=scan_id, scan_running=False,
             scan_finished=now.isoformat(), scan_duration=round(duration,2),
             scan_stage='complete' if error is None else 'failed',
-            last_top=ordered[:max_alerts], diagnostics=diagnostics or {},
+            last_top=(meta.get('top_candidates') or ordered[:10]), diagnostics=diagnostics or {},
             alert_diagnostics=alert_diag,
             symbols_scanned=meta.get('symbols_scanned',state.get('symbols_scanned',0)),
             contracts_scanned=meta.get('contracts_scanned',state.get('contracts_scanned',0)),
@@ -379,85 +367,142 @@ def start_scan(p):
 
 
 def _status_text():
-    _max_alerts=max(1,int(os.getenv('MAX_ALERTS_PER_SCAN',os.getenv('MAX_ALERTS','5')) or 5))
-    _cooldown=max(300,int(os.getenv('ALERT_COOLDOWN_SECONDS','300') or 900))
-    with lock: s=dict(state); ad=dict(s.get('alert_diagnostics') or {})
-    td=telegram_diagnostics(); ps=provider_status()
-    lines=[
-        "🟢 Bot status",
-        f"Phase: {phase_label(phase())}",
-        f"Running: {s['running']}",
-        f"Scan running: {s['scan_running']}",
-        f"Scan stage: {s.get('scan_stage')}",
-        f"Bars: {s.get('fetching_completed',0)}/{s.get('fetching_total',4)} {s.get('fetching_timeframe') or ''} {s.get('fetching_state') or ''}",
-        f"Scan ID: {s.get('scan_id') or '—'}",
-        f"Symbols scanned: {s.get('symbols_scanned',0)}",
-        f"Contracts scanned: {s.get('contracts_scanned',0)}",
-        f"Last candidates: {s['last_candidates']}",
-        f"Last alerts: {s['last_alerts']}",
-        f"Last scan: {s['last_scan'] or '—'}",
-        f"Scan duration: {s.get('scan_duration') if s.get('scan_duration') is not None else '—'} s",
-        f"Last error: {s['last_error'] or 'None'}",
-        f"Telegram polling: {td.get('telegram_running')}",
-        f"Telegram last update: {td.get('telegram_last_update') or '—'}",
-        f"Telegram last error: {td.get('telegram_last_error') or 'None'}",
-        f"Provider: {ps.get('name')} | Options feed: {ps.get('options_feed')} | Underlying feed: {ps.get('underlying_feed')}",
-        f"Data mode: {ps.get('data_mode')}",
-        f"Provider errors: {len(s.get('provider_errors') or [])}",
-        "",
-        "🔔 Alert diagnostics",
-        f"Max alerts/scan: {ad.get('max_alerts',_max_alerts)} | Cooldown: {ad.get('cooldown_seconds',_cooldown)}s",
-        f"Candidates: {len(ad.get('candidates') or [])} | Eligible: {ad.get('eligible',0)} | Cooldown rejected: {ad.get('cooldown_rejected',0)} | Max-alerts rejected: {ad.get('max_alerts_rejected',0)}",
-        f"Send attempted: {ad.get('send_attempted',0)} | Success: {ad.get('send_success',0)} | Failed: {ad.get('send_failed',0)}",
-    ]
-    di=s.get('diagnostics') or {}
+    with lock:
+        s=dict(state)
+        ad=dict(s.get('alert_diagnostics') or {})
+        di=dict(s.get('diagnostics') or {})
+    td=telegram_diagnostics() or {}
+    try:
+        ps=provider_status() or {}
+    except Exception as e:
+        ps={'name':'Alpaca','options_feed':os.getenv('ALPACA_OPTIONS_FEED','—'),
+            'underlying_feed':'iex','data_mode':'UNKNOWN','error':f'{type(e).__name__}: {e}'}
     meta=di.get('__meta__') if isinstance(di,dict) else {}
-    if isinstance(meta,dict):
+    meta=meta if isinstance(meta,dict) else {}
+    c=meta.get('counters') or {}
+    lines=[
+        "🟢 BOT STATUS",
+        f"Phase: {phase_label(phase())}",
+        f"ET clock: {datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        f"Running: {s.get('running',False)}",
+        f"Scan running: {s.get('scan_running',False)}",
+        f"Scan stage: {s.get('scan_stage') or '—'}",
+        f"Scan ID: {s.get('scan_id') or '—'}",
+        f"Symbols scanned: {s.get('symbols_scanned',0) or 0}",
+        f"Contracts scanned: {s.get('contracts_scanned',0) or 0}",
+        f"Valid contracts: {meta.get('valid_contracts',c.get('contracts_valid',0)) or 0}",
+        f"Candidates: {meta.get('candidates',s.get('last_candidates',0)) or 0}",
+        f"HERO: {meta.get('heroes',c.get('hero_count',0)) or 0}",
+        f"STRONG: {meta.get('strong',c.get('strong_count',0)) or 0}",
+        f"WATCH: {meta.get('watch',c.get('watch_count',0)) or 0}",
+        f"Last scan: {s.get('last_scan') or '—'}",
+        f"Scan duration: {s.get('scan_duration') if s.get('scan_duration') is not None else '—'} s",
+        f"Last error: {s.get('last_error') or '—'}",
+        f"Provider: {ps.get('name','Alpaca')}{' / DEGRADED' if ps.get('error') else ''}",
+        f"Options feed: {ps.get('options_feed') or '—'}",
+        f"Telegram polling: {bool(td.get('telegram_running'))}",
+        f"Telegram last update: {td.get('telegram_last_update') if td.get('telegram_last_update') is not None else '—'}",
+        f"Telegram last error: {td.get('telegram_last_error') or '—'}",
+    ]
+    if meta.get('zero_candidate_diagnostics'):
+        z=meta['zero_candidate_diagnostics']
         lines += [
             "",
-            "📊 MARKET SCAN SUMMARY",
-            f"Potential setups: {meta.get('candidates',0)}",
-            f"🏆 HERO: {meta.get('heroes',0)} | 🟢 STRONG: {meta.get('strong',0)} | 🟡 WATCH: {meta.get('watch',0)}"
+            "🔍 ZERO-CANDIDATE DIAGNOSTICS",
+            f"Contracts scanned: {z.get('contracts_scanned',0)}",
+            f"Contracts with valid quotes: {z.get('contracts_with_valid_quotes',0)}",
+            f"Contracts stale: {z.get('contracts_stale',0)}",
+            f"Contracts scored: {z.get('contracts_scored',0)}",
+            f"Rejected price: {z.get('rejected_price',0)}",
+            f"Rejected spread: {z.get('rejected_spread',0)}",
+            f"Rejected liquidity: {z.get('rejected_liquidity',0)}",
+            f"Rejected DTE: {z.get('rejected_dte',0)}",
+            f"Rejected momentum: {z.get('rejected_momentum',0)}",
+            f"Rejected trend: {z.get('rejected_trend',0)}",
+            f"Rejected score: {z.get('rejected_score',0)}",
+            f"Top rejection reason: {z.get('top_rejection_reason','—')}",
         ]
-        if not meta.get('candidates'):
-            reasons=meta.get('no_setup_reasons') or ['No qualified setup']
-            lines.append("NO QUALIFIED SETUPS")
-            lines.extend(f"• {r}" for r in reasons[:6])
-
-    # Every symbol gets its own diagnostics, not only SPXW.
-    for key,d in di.items() if isinstance(di,dict) else []:
+    if isinstance(c,dict):
+        lines += [
+            "",
+            "📊 SCAN COUNTERS",
+            f"Received: {c.get('contracts_received',0)} | Valid: {c.get('contracts_valid',0)} | Scored: {c.get('contracts_scored',0)}",
+            f"Quotes: {c.get('contracts_with_quotes',0)} | Stale: {c.get('contracts_stale_quotes',0)}",
+            f"Missing bid/ask/last: {c.get('contracts_missing_bid',0)}/{c.get('contracts_missing_ask',0)}/{c.get('contracts_missing_last',0)}",
+            f"Missing volume/OI: {c.get('contracts_missing_volume',0)}/{c.get('contracts_missing_oi',0)}",
+            f"Pool: {c.get('candidate_pool_size',0)}",
+        ]
+    lines += ["", "🔔 ALERT DIAGNOSTICS",
+               f"Max alerts/scan: {ad.get('max_alerts',os.getenv('MAX_ALERTS_PER_SCAN','5'))} | Cooldown: {ad.get('cooldown_seconds',os.getenv('ALERT_COOLDOWN_SECONDS','300'))}s",
+               f"Eligible: {ad.get('eligible',0)} | Cooldown rejected: {ad.get('cooldown_rejected',0)} | Max-alerts rejected: {ad.get('max_alerts_rejected',0)}"]
+    # Compact per-symbol health so one provider failure is visible without breaking status.
+    for key,d in sorted(di.items()):
         if key.startswith('__') or not isinstance(d,dict): continue
-        r=d.get('rejections') or {}
-        lines.append("")
-        lines.append(
-            f"{key}: {'OK' if not d.get('error') else 'ERROR'} | Chain: {d.get('chain_items',0)} | "
-            f"HERO: {d.get('hero',0)} | STRONG: {d.get('strong',0)} | WATCH: {d.get('watch',0)}"
-        )
-        lines.append(
-            f"Rejected: Prefix={r.get('prefix',0)} | BadContract={r.get('bad_contract',0)} | "
-            f"DTE={r.get('dte',0)} | Premium soft={r.get('premium',0)} | HardPremium={r.get('hard_premium',0)} | Spread={r.get('spread',0)} | "
-            f"Liquidity={r.get('liquidity',0)} | Score={r.get('score',0)} | 4H={r.get('alignment',0)} | "
-            f"Regime={r.get('regime',0)} | Stale={r.get('quote_stale',0)} | NoBid={r.get('no_bid',0)} | "
-            f"NoAsk={r.get('no_ask',0)} | InvalidQuote={r.get('invalid_quote',0)}"
-        )
-        if d.get('no_setup_reasons'):
-            lines.append("Reason: " + " | ".join(d.get('no_setup_reasons')[:4]))
         if d.get('error'):
-            lines.append(f"Provider detail: {str(d.get('error'))[:300]}")
+            lines.append(f"⚠️ {key}: ERROR — {str(d.get('error'))[:180]}")
+        else:
+            r=d.get('rejections') or {}
+            lines.append(f"✅ {key}: scanned | Chain {d.get('chain_items',0)} | Scored {d.get('scored',0)} | H/S/W {d.get('hero',0)}/{d.get('strong',0)}/{d.get('watch',0)}")
+            if DEBUG_STATUS := (os.getenv('DEBUG_SCANNER','false').lower() in ('1','true','yes','on')):
+                lines.append(f"   Rejects: price={r.get('price',0)} spread={r.get('spread',0)} dte={r.get('dte',0)} score={r.get('score',0)}")
+    return "\n".join(lines)
 
-    provider_errors=s.get('provider_errors') or []
-    if provider_errors:
-        lines.append("")
-        lines.append("⚠️ Provider error details")
-        for pe in provider_errors[:8]:
-            if isinstance(pe,dict):
-                lines.append(f"• {pe.get('source','?')}: {pe.get('error','?')} | HTTP={pe.get('status_code','—')} | {pe.get('endpoint','')}")
-    for c in (ad.get('candidates') or [])[:50]:
-        lines.append(
-            f"• {c.get('symbol','—')} {c.get('direction','—')} | {c.get('contract','—')} | "
-            f"{c.get('tier','—')} | score={c.get('score','—')} | premium=${c.get('premium','—')} | "
-            f"status={c.get('status','—')} | {c.get('reason','—')}"
-        )
+def _top_text(limit=10):
+    with lock:
+        di=dict(state.get('diagnostics') or {})
+        top=list(state.get('last_top') or [])
+    meta=di.get('__meta__') if isinstance(di,dict) else {}
+    if not top and isinstance(meta,dict): top=list(meta.get('top_candidates') or [])
+    if not top:
+        return "🔎 TOP CANDIDATES\nNo scored candidates are available from the last scan."
+    lines=["🔎 TOP CANDIDATES"]
+    for i,x in enumerate(top[:limit],1):
+        lines += [
+            f"{i}️⃣ {x.get('symbol','—')} {x.get('contract','—')}",
+            f"Score: {float(x.get('score',0) or 0):.1f} | Setup: {x.get('tier') or 'BELOW_WATCH'}",
+            f"Underlying: {x.get('underlying','—')} | {x.get('signal','—')} | Strike: {x.get('strike','—')} | DTE: {x.get('dte','—')}",
+            f"Premium: ${x.get('premium','—')} | Bid: {x.get('bid','—')} | Ask: {x.get('ask','—')} | Spread: {x.get('spread_pct','—')}%",
+            f"Volume: {x.get('volume',0)} | OI: {x.get('open_interest',0)} | Quote: {x.get('quote_source','—')} age={x.get('quote_age_sec','—')}",
+            f"Reason: {', '.join(x.get('reasons',[])[:4]) or '—'}",
+            ""
+        ]
+    return "\n".join(lines).strip()
+
+
+def _diagnostics_text():
+    with lock:
+        di=dict(state.get('diagnostics') or {})
+    meta=di.get('__meta__') if isinstance(di,dict) else {}
+    c=(meta or {}).get('counters') or {}
+    z=(meta or {}).get('zero_candidate_diagnostics') or {}
+    lines=[
+        "🔍 SCAN DIAGNOSTICS",
+        f"Scan ID: {(meta or {}).get('scan_id') or '—'}",
+        f"Phase: {phase_label(phase())}",
+        f"Symbols: {(meta or {}).get('symbols_scanned',0)}",
+        f"Contracts: {(meta or {}).get('contracts_scanned',0)}",
+        f"Valid: {(meta or {}).get('valid_contracts',0)}",
+        f"Scored: {(meta or {}).get('contracts_scored',0)}",
+        f"Candidates: {(meta or {}).get('candidates',0)}",
+        "",
+        f"Quotes: {c.get('contracts_with_quotes',0)}",
+        f"Fresh: {max(0,c.get('contracts_with_quotes',0)-c.get('contracts_stale_quotes',0))}",
+        f"Stale: {c.get('contracts_stale_quotes',0)}",
+        "",
+        f"Rejected Price: {c.get('rejected_price',0)}",
+        f"Rejected Spread: {c.get('rejected_spread',0)}",
+        f"Rejected Liquidity: {c.get('rejected_liquidity',0)}",
+        f"Rejected DTE: {c.get('rejected_dte',0)}",
+        f"Rejected Momentum: {c.get('rejected_momentum',0)}",
+        f"Rejected Trend: {c.get('rejected_trend',0)}",
+        f"Rejected Score: {c.get('rejected_score',0)}",
+        "",
+        f"HERO: {(meta or {}).get('heroes',0)}",
+        f"STRONG: {(meta or {}).get('strong',0)}",
+        f"WATCH: {(meta or {}).get('watch',0)}",
+    ]
+    if z:
+        lines += ["",f"Top rejection reason: {z.get('top_rejection_reason','—')}"]
     return "\n".join(lines)
 
 def telegram_command_loop():
@@ -474,7 +519,7 @@ def telegram_command_loop():
                     if not text: continue
                     cmd=text.split()[0].split('@')[0].lower()
                     if cmd in ('/start','/help'):
-                        send_message('🤖 Options Opportunity Bot V13.8\n\nAlert-only options scanner.\n/start — start\n/help — help\n/status — diagnostics\n/scan — manual scan\n/top — top setups\n/heroes — HERO setups\n/watchlist — WATCH setups\n/diagnostics — rejection diagnostics',chat_id); continue
+                        send_message('🤖 Options Opportunity Bot V13.9\n\nAlert-only options scanner.\n/start — start\n/help — help\n/status — diagnostics\n/scan — manual scan\n/top — top setups\n/heroes — HERO setups\n/watchlist — WATCH setups\n/diagnostics — rejection diagnostics',chat_id); continue
                     if cmd=='/privacy':
                         send_message('🔐 البوت Alert-only ولا ينفذ صفقات عبر وسيط.',chat_id); continue
                     if not allowed_chat or chat_id != allowed_chat:
@@ -490,12 +535,14 @@ def telegram_command_loop():
                             top=[x for x in top if x.get('tier')=='HERO']
                         elif cmd=='/watchlist':
                             top=[x for x in top if x.get('tier')=='WATCH']
-                        if not top:
+                        if cmd=='/top':
+                            send_message(_top_text(10),chat_id)
+                        elif not top:
                             send_message('ℹ️ لا توجد setups من هذا النوع في آخر scan.',chat_id)
                         else:
                             for x in top[:10]: send_message(format_alert(x),chat_id)
                     elif cmd=='/diagnostics':
-                        send_message(_status_text(),chat_id)
+                        send_message(_diagnostics_text(),chat_id)
                     else:
                         send_message('الأوامر: /start /help /status /scan /top /heroes /watchlist /diagnostics',chat_id)
             except Exception as e:
@@ -518,13 +565,13 @@ def loop():
         time.sleep(interval)
 
 @app.get('/')
-def root(): return jsonify({'service':'options-opportunity-bot','version':'13.8.0','status':'ok','docs':'/health','scan':'/scan','scan_status':'/scan/status'})
+def root(): return jsonify({'service':'options-opportunity-bot','version':'13.9.0','status':'ok','docs':'/health','scan':'/scan','scan_status':'/scan/status'})
 
 @app.get('/health')
 def health():
     with lock: s=dict(state)
     s['telegram_configured']=bool(os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID')); s['scan_secret_configured']=bool(os.getenv('SCAN_SECRET')); s['provider']=provider_status(); s['telegram']=telegram_diagnostics()
-    return jsonify({'service':'options-opportunity-bot','version':'13.8.0','status':'ok','phase':phase(),'scanner':s})
+    return jsonify({'service':'options-opportunity-bot','version':'13.9.0','status':'ok','phase':phase(),'scanner':s})
 
 @app.get('/status')
 def status(): return health()
@@ -543,6 +590,14 @@ def scan_status():
     if not secret_ok(): return jsonify({'ok':False,'error':'unauthorized'}),401
     with lock: s=dict(state)
     s['telegram']=telegram_diagnostics(); return jsonify({'ok':True,**s,'phase':phase()})
+
+@app.get('/top')
+def top():
+    return jsonify({'ok':True,'top':(lambda: None)()}) if False else jsonify({'ok':True,'text':_top_text(10)})
+
+@app.get('/diagnostics')
+def diagnostics_route():
+    return jsonify({'ok':True,'text':_diagnostics_text()})
 
 @app.get('/telegram-test')
 def telegram_test():

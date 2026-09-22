@@ -1,4 +1,4 @@
-# Options Opportunity Bot V13.8
+# Options Opportunity Bot V13.9
 
 SPXW final fix: technical indicators use SPY IEX bars while the real SPXW option chain is fetched from Alpaca under the SPX options root. SPXW failures are isolated from other symbols.
 
@@ -23,7 +23,7 @@ The scanner now separately scores high-momentum option setups using multi-timefr
 - One market-close HERO alert per trading day when a candidate exists.
 
 
-## V13.8 setup engine
+## V13.9 setup engine
 - Preserves the existing Alpaca/OPRA/IEX scanner, Telegram polling, worker timeout, SPXW proxy-chain architecture, caching, and alert-only risk controls.
 - Separates hard contract/quote safety filters from soft setup factors.
 - Premium, 4H alignment, regime, RSI, VWAP, volume, momentum and score are soft factors unless an explicit safety setting is enabled.

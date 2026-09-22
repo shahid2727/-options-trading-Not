@@ -10,6 +10,7 @@ _diag = {
     'telegram_last_update': None,
     'telegram_last_error': None,
     'telegram_last_poll': None,
+    'telegram_polling': False,
 }
 
 def _token():
@@ -31,7 +32,7 @@ def diagnostics():
         return dict(_diag)
 
 def mark_polling_running(running=True):
-    _set_diag(telegram_running=bool(running))
+    _set_diag(telegram_running=bool(running), telegram_polling=bool(running))
 
 def send_message(text, chat_id=None):
     token = _token(); chat = chat_id or os.getenv('TELEGRAM_CHAT_ID')
@@ -58,7 +59,7 @@ def get_updates(offset=None, timeout=20):
         params = {'timeout': timeout, 'allowed_updates': ['message']}
         if offset is not None: params['offset'] = offset
         r = _client().get(API.format(token, 'getUpdates'), params=params, timeout=timeout + 5)
-        _set_diag(telegram_last_poll=True)
+        _set_diag(telegram_last_poll=__import__('datetime').datetime.utcnow().isoformat()+'Z')
         r.raise_for_status()
         data = r.json()
         if not data.get('ok'):
