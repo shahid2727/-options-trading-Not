@@ -12,7 +12,7 @@ state = {
     'last_scan': None, 'last_candidates': 0, 'last_alerts': 0, 'last_error': None,
     'last_session': 'CLOSED', 'running': True, 'scan_id': None,
     'scan_running': False, 'scan_started': None, 'scan_finished': None,
-    'scan_duration': None, 'scan_stage': 'idle', 'symbols_scanned': 0, 'contracts_scanned': 0,
+    'scan_duration': None, 'scan_stage': 'idle', 'symbols_scanned': 0, 'contracts_scanned': 0, 'valid_contracts': 0, 'contracts_scored': 0,
     'last_top': [], 'diagnostics': {}, 'last_alert_keys': {}, 'market_warning_sent': None,
     'provider_errors': [], 'scan_process_pid': None, 'fetching_timeframe': None, 'fetching_completed': 0, 'fetching_total': 4, 'fetching_state': None, 'alert_diagnostics': {'candidates': []}, 'hero_sent_date': None
 }
@@ -116,6 +116,8 @@ def _apply_progress(msg):
         state['scan_stage'] = msg.get('stage', state['scan_stage'])
         for key in ('symbols_scanned','contracts_scanned','last_candidates'):
             if key in msg: state[key] = msg[key]
+        if 'valid_contracts' in msg: state['valid_contracts'] = msg['valid_contracts']
+        if 'contracts_scored' in msg: state['contracts_scored'] = msg['contracts_scored']
         if msg.get('stage') in ('fetching_bars','fetching_bars_page','fetching_bars_complete'):
             if 'timeframe' in msg: state['fetching_timeframe'] = msg.get('timeframe')
             if 'completed' in msg: state['fetching_completed'] = msg.get('completed', state.get('fetching_completed',0))
@@ -298,6 +300,8 @@ def _finalize_scan(p, scan_id, results, diagnostics, started_at, error=None):
             alert_diagnostics=alert_diag,
             symbols_scanned=meta.get('symbols_scanned',state.get('symbols_scanned',0)),
             contracts_scanned=meta.get('contracts_scanned',state.get('contracts_scanned',0)),
+            valid_contracts=meta.get('valid_contracts',state.get('valid_contracts',0)),
+            contracts_scored=meta.get('contracts_scored',state.get('contracts_scored',0)),
             provider_errors=provider_errors, scan_process_pid=None
         )
 
@@ -349,7 +353,7 @@ def start_scan(p):
         scan_id=uuid.uuid4().hex[:10]; started=datetime.now(TZ).isoformat()
         state.update(scan_running=True, scan_id=scan_id, scan_started=started, scan_finished=None,
                      scan_duration=None, scan_stage='starting', last_error=None, last_session=p,
-                     symbols_scanned=0, contracts_scanned=0, provider_errors=[], fetching_timeframe=None,
+                     symbols_scanned=0, contracts_scanned=0, valid_contracts=0, contracts_scored=0, provider_errors=[], fetching_timeframe=None,
                      fetching_completed=0, fetching_total=4, fetching_state=None)
     ctx=multiprocessing.get_context('fork' if 'fork' in multiprocessing.get_all_start_methods() else 'spawn')
     parent_conn, child_conn=ctx.Pipe(duplex=False)
@@ -388,9 +392,9 @@ def _status_text():
         f"Scan running: {s.get('scan_running',False)}",
         f"Scan stage: {s.get('scan_stage') or '—'}",
         f"Scan ID: {s.get('scan_id') or '—'}",
-        f"Symbols scanned: {s.get('symbols_scanned',0) or 0}",
-        f"Contracts scanned: {s.get('contracts_scanned',0) or 0}",
-        f"Valid contracts: {meta.get('valid_contracts',c.get('contracts_valid',0)) or 0}",
+        f"Symbols scanned: {meta.get('symbols_scanned',s.get('symbols_scanned',0)) or 0}",
+        f"Contracts scanned: {meta.get('contracts_scanned',s.get('contracts_scanned',0)) or 0}",
+        f"Valid contracts: {meta.get('valid_contracts',s.get('valid_contracts',c.get('contracts_valid',0))) or 0}",
         f"Normalized: {c.get('contracts_normalized',0) or 0}",
         f"Quote stage: {c.get('contracts_quote_stage',0) or 0}",
         f"Candidates: {meta.get('candidates',s.get('last_candidates',0)) or 0}",

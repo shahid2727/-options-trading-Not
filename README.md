@@ -39,3 +39,8 @@ The scanner now separately scores high-momentum option setups using multi-timefr
 
 ## V14 pipeline validation
 V14 separates chain receipt, contract normalization, quote-stage validation, and scoring. Set `DEBUG_SCANNER=true`, `DEBUG_SAMPLE=true`, or `DEBUG_BYPASS_SCORING=true` to diagnose data flow without changing production scoring thresholds.
+
+
+## V14.2 reconciliation fix
+- Final scan counters and HERO/STRONG/WATCH totals are recomputed from actual result rows and per-symbol diagnostics.
+- Prevents a state/aggregation mismatch where candidates existed but summary counters displayed zero.

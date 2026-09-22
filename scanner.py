@@ -1008,6 +1008,15 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
     if quote_with_data==0 and quote_stage>0: no_setup_reasons.append('No usable quotes')
     if potential and not qualified: no_setup_reasons.append('Contracts scored but none reached WATCH threshold')
     diag={'chain_items':received,'contracts_received':received,'normalized':normalized_count,'potential_setups':potential,'scored':len([x for x in scored_rows if x.get('score') is not None]),'quote_stage':quote_stage,'quotes_received':quotes_received,'scored_rows':len(scored_rows),'rejections':rej,'quote_metrics':{'with_data':quote_with_data,'fresh':quote_fresh,'stale':quote_stale,'bid_present':bid_present,'ask_present':ask_present,'last_present':last_present,'volume_present':volume_present,'oi_present':oi_present},'no_setup_reasons':no_setup_reasons,'chain_fallback':bool(chain.get('fallback')),'chain_pages':chain.get('pages',0),'contracts_discovered':chain.get('contracts_discovered',0),'primary_chain_error':chain.get('primary_error'),'underlying':chain_root,'option_source':'Alpaca options '+str(chain.get('feed_used') or os.getenv('ALPACA_OPTIONS_FEED','indicative')),'top_candidates':top_pool,'tier_counts':tier_counts,'dte_rejected':dte_rejected,'feed_used':chain.get('feed_used')}
+    # Authoritative tier counts come from the actual qualified rows. This avoids
+    # any counter drift if a row is classified after the local counter update.
+    tier_counts = {
+        'HERO': sum(1 for x in qualified if x.get('tier') == 'HERO'),
+        'STRONG': sum(1 for x in qualified if x.get('tier') == 'STRONG'),
+        'WATCH': sum(1 for x in qualified if x.get('tier') == 'WATCH'),
+    }
+    diag['tier_counts'] = tier_counts
+    diag['hero']=tier_counts['HERO']; diag['strong']=tier_counts['STRONG']; diag['watch']=tier_counts['WATCH']
     return qualified, diag
 
 def scan_all(session):
@@ -1159,10 +1168,13 @@ def scan_all(session):
         if not isinstance(d,dict): continue
         counters['contracts_received'] += int(d.get('chain_items',0) or 0)
         counters['contracts_normalized'] += int(d.get('normalized',0) or 0)
-        counters['contracts_valid'] += int(d.get('quote_stage',0) or 0)
+        # A contract is counted as VALID only after it reaches the quote stage
+        # and has a usable quote (BID/ASK or valid LAST fallback). Quote-stage
+        # entry remains tracked separately.
+        qm=d.get('quote_metrics') or {}
+        counters['contracts_valid'] += int(qm.get('with_data',0) or 0)
         counters['contracts_scored'] += int(d.get('scored',0) or 0)
         counters['contracts_quote_stage'] += int(d.get('quote_stage',0) or 0)
-        qm=d.get('quote_metrics') or {}
         counters['contracts_with_quotes'] += int(qm.get('with_data',0) or 0)
         counters['contracts_stale_quotes'] += int(qm.get('stale',0) or 0)
         r=d.get('rejections') or {}
@@ -1180,11 +1192,31 @@ def scan_all(session):
             if rk in counters: counters[rk]+=int(rv or 0)
         no_setup.extend(d.get('no_setup_reasons') or [])
 
-    heroes=sum(1 for x in results if x.get('tier')=='HERO')
-    strongs=sum(1 for x in results if x.get('tier')=='STRONG')
-    watchs=sum(1 for x in results if x.get('tier')=='WATCH')
+    # Recompute authoritative totals from the actual result rows. Do not rely
+    # on intermediate counters when building the final scan state.
+    heroes=sum(1 for x in results if str(x.get('tier') or '').upper()=='HERO')
+    strongs=sum(1 for x in results if str(x.get('tier') or '').upper()=='STRONG')
+    watchs=sum(1 for x in results if str(x.get('tier') or '').upper()=='WATCH')
     counters.update({'hero_count':heroes,'strong_count':strongs,'watch_count':watchs})
+    # Defensive reconciliation: every per-symbol diagnostic is authoritative
+    # for the pipeline counters if an intermediate aggregate was lost.
+    if counters['contracts_received'] == 0:
+        counters['contracts_received'] = sum(int((d or {}).get('chain_items',0) or 0) for d in diagnostics.values() if isinstance(d,dict))
+    if counters['contracts_normalized'] == 0:
+        counters['contracts_normalized'] = sum(int((d or {}).get('normalized',0) or 0) for d in diagnostics.values() if isinstance(d,dict))
+    if counters['contracts_quote_stage'] == 0:
+        counters['contracts_quote_stage'] = sum(int((d or {}).get('quote_stage',0) or 0) for d in diagnostics.values() if isinstance(d,dict))
+    if counters['contracts_with_quotes'] == 0:
+        counters['contracts_with_quotes'] = sum(int(((d or {}).get('quote_metrics') or {}).get('with_data',0) or 0) for d in diagnostics.values() if isinstance(d,dict))
+    if counters['contracts_valid'] == 0:
+        counters['contracts_valid'] = counters['contracts_with_quotes']
+    if counters['contracts_scored'] == 0:
+        counters['contracts_scored'] = sum(int((d or {}).get('scored',0) or 0) for d in diagnostics.values() if isinstance(d,dict))
 
+    # Keep the authoritative scan summary inside diagnostics so the parent
+    # process (/status, /top, /diagnostics and Telegram summary) never loses
+    # the final counters. V14 previously built `meta` locally but returned it
+    # only indirectly, causing a real scan with candidates to display zeros.
     meta={
         'scan_id':None,'symbols_scanned':len(symbols)+ (1 if 'SPXW' in diagnostics else 0),
         'contracts_scanned':counters['contracts_received'],'valid_contracts':counters['contracts_valid'],'contracts_normalized':counters['contracts_normalized'],'quote_stage':counters['contracts_quote_stage'],
@@ -1209,9 +1241,13 @@ def scan_all(session):
         top_reason=max(aggregate_rej.items(),key=lambda kv:kv[1])[0] if aggregate_rej else 'none'
         meta['zero_candidate_diagnostics']['top_rejection_reason']=top_reason
 
-    progress('final_ranking',candidates=len(results),heroes=heroes,strong=strongs,watch=watchs,top=len(top_candidates))
+    diagnostics['__meta__'] = meta
+    progress('final_ranking',candidates=len(results),heroes=heroes,strong=strongs,watch=watchs,top=len(top_candidates),
+             symbols_scanned=meta['symbols_scanned'],contracts_scanned=meta['contracts_scanned'],
+             valid_contracts=meta['valid_contracts'],contracts_scored=meta['contracts_scored'])
     progress('scan_complete',symbols=meta['symbols_scanned'],contracts=meta['contracts_scanned'],
-             candidates=len(results),heroes=heroes,strong=strongs,watch=watchs)
+             candidates=len(results),heroes=heroes,strong=strongs,watch=watchs,
+             valid_contracts=meta['valid_contracts'],contracts_scored=meta['contracts_scored'])
     return results,diagnostics
 
 def options_data_mode():
