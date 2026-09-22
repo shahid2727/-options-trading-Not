@@ -44,3 +44,6 @@ V14 separates chain receipt, contract normalization, quote-stage validation, and
 ## V14.2 reconciliation fix
 - Final scan counters and HERO/STRONG/WATCH totals are recomputed from actual result rows and per-symbol diagnostics.
 - Prevents a state/aggregation mismatch where candidates existed but summary counters displayed zero.
+
+
+V14.8: bounded options-feed retries, batch sizing, per-request timeout, overall chain deadline, partial-batch fallback, and feed telemetry. Scoring thresholds unchanged.

@@ -1,0 +1,14 @@
+V14.8 OPTIONS FEED FIXES
+
+Based on V14.7 Candidate Diagnostics.
+
+Fixes:
+- Bounded OPRA/indicative options-feed retries.
+- Per-request options-feed timeout and overall option-chain deadline.
+- Smaller snapshot batches to reduce request-size/rate-limit failures.
+- Failed snapshot batches are skipped instead of aborting the whole chain.
+- Primary feed failure falls through to configured fallback feed.
+- Contracts fallback now returns partial successful snapshot batches.
+- Added progress telemetry for options feed page/batch/attempt/timeout.
+- Preserved V14.6 bars timeout fixes and V14.7 candidate diagnostics.
+- No scoring thresholds were changed.

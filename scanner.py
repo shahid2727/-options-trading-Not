@@ -51,6 +51,10 @@ STOCKS_PAGE_TIMEOUT = max(1, float(os.getenv('STOCKS_PAGE_TIMEOUT_SECONDS','12')
 OPTIONS_PAGE_LIMIT = max(100, min(1000, int(os.getenv('OPTIONS_PAGE_LIMIT','1000'))))
 OPTIONS_MAX_PAGES = max(1, int(os.getenv('OPTIONS_MAX_PAGES','12')))
 OPTIONS_MIN_INTERVAL = max(0.05, float(os.getenv('OPTIONS_MIN_INTERVAL_SECONDS','0.20')))
+OPTIONS_SNAPSHOT_BATCH_SIZE = max(10, min(50, int(os.getenv('OPTIONS_SNAPSHOT_BATCH_SIZE','25'))))
+OPTIONS_FEED_RETRIES = max(0, int(os.getenv('OPTIONS_FEED_RETRIES','1')))
+OPTIONS_FEED_TIMEOUT = max(1.0, float(os.getenv('OPTIONS_FEED_TIMEOUT_SECONDS','6')))
+OPTIONS_CHAIN_TIMEOUT = max(10.0, float(os.getenv('OPTIONS_CHAIN_TIMEOUT_SECONDS','45')))
 STOCKS_PAGE_LIMIT = max(100, min(10000, int(os.getenv('STOCKS_PAGE_LIMIT','10000'))))
 STOCKS_MAX_PAGES = max(1, int(os.getenv('STOCKS_MAX_PAGES','5')))
 # V13.8 setup classification / risk controls. These are soft-scoring thresholds
@@ -480,40 +484,49 @@ def _option_contracts_fallback(underlying, side=None, root_symbol=None):
             }
         }
 
-    merged={}; batch_size=100
+    merged={}; batch_size=OPTIONS_SNAPSHOT_BATCH_SIZE; failed_batches=0
     for i in range(0,len(symbols),batch_size):
         batch=symbols[i:i+batch_size]
-        last_error=None
-        data=None
+        data=None; feed_used=None; batch_errors=[]
         for feed in _options_feeds():
-            try:
-                data=req(f'{OPTIONS}/snapshots', {
-                    'symbols':','.join(batch),
-                    'feed':feed,
-                    'limit':len(batch),
-                })
+            for attempt in range(OPTIONS_FEED_RETRIES + 1):
+                try:
+                    progress('options_feed_fetch', underlying=underlying, feed=feed,
+                             batch=(i//batch_size)+1, batch_total=(len(symbols)+batch_size-1)//batch_size,
+                             batch_size=len(batch), attempt=attempt+1)
+                    data=req(f'{OPTIONS}/snapshots', {
+                        'symbols':','.join(batch),
+                        'feed':feed,
+                    }, timeout=OPTIONS_FEED_TIMEOUT)
+                    feed_used=feed
+                    break
+                except Exception as e:
+                    batch_errors.append(f'{feed}[{attempt+1}]: {str(e)[:180]}')
+                    if attempt < OPTIONS_FEED_RETRIES:
+                        progress('options_feed_retry', underlying=underlying, feed=feed,
+                                 batch=(i//batch_size)+1, retry=attempt+1, error=str(e)[:300])
+            if data is not None:
                 break
-            except Exception as e:
-                last_error=e
-                progress('options_feed_retry', underlying=underlying, feed=feed,
-                         error=str(e)[:300])
         if data is None:
-            raise last_error or ProviderRequestError('No options snapshot feed available',
-                                                     endpoint='/options/snapshots')
+            failed_batches += 1
+            progress('options_feed_batch_failed', underlying=underlying,
+                     batch=(i//batch_size)+1, error=' | '.join(batch_errors)[:500])
+            continue
         snaps=data.get('snapshots') or {}
         for sym in batch:
             base=metadata.get(sym,{}); snap=snaps.get(sym) or {}
             if snap:
                 snap.setdefault('details',{}).update(base.get('details') or {})
-                # Record the effective feed without changing the configured
-                # provider status shown to the user.
-                snap.setdefault('_scanner_meta', {})['feed_used'] = feed
+                snap.setdefault('_scanner_meta', {})['feed_used'] = feed_used
                 merged[sym]=snap
-    return {'snapshots':merged,'pages':pages,'fallback':True,'contracts_discovered':len(symbols)}
+    if not merged and failed_batches:
+        raise ProviderRequestError('No option snapshots available after bounded feed retries',
+                                   endpoint='/options/snapshots')
+    return {'snapshots':merged,'pages':pages,'fallback':True,'contracts_discovered':len(symbols),
+            'failed_batches':failed_batches,'feed_used':feed_used}
 
 def option_chain(underlying, side=None, root_symbol=None):
-    # Restrict snapshots to the next 30 calendar days. This dramatically reduces
-    # pagination and Alpaca rate-limit pressure while matching the scanner DTE rule.
+    """Fetch option snapshots with bounded feed retries and a non-blocking fallback."""
     today=datetime.now(timezone.utc).date()
     base_params={
         'limit':min(1000, OPTIONS_PAGE_LIMIT),
@@ -523,26 +536,30 @@ def option_chain(underlying, side=None, root_symbol=None):
     if side: base_params['type']=side.lower()
     if root_symbol: base_params['root_symbol']=root_symbol
     merged={}; page_token=None; pages=0; primary_error=None; feed_used=None
+    deadline=time.monotonic()+OPTIONS_CHAIN_TIMEOUT
     try:
         for feed in _options_feeds():
             try:
                 merged={}; page_token=None; pages=0
-                while pages < OPTIONS_MAX_PAGES:
+                while pages < OPTIONS_MAX_PAGES and time.monotonic() < deadline:
                     q=dict(base_params); q['feed']=feed
                     if page_token: q['page_token']=page_token
-                    data=req(f'{OPTIONS}/snapshots/{underlying}',q)
+                    remaining=max(1.0, min(OPTIONS_FEED_TIMEOUT, deadline-time.monotonic()))
+                    progress('options_feed_fetch', underlying=underlying, feed=feed,
+                             page=pages+1, attempt=1, timeout=round(remaining,1))
+                    data=req(f'{OPTIONS}/snapshots/{underlying}',q,timeout=remaining)
                     rows=data.get('snapshots') or {}
                     merged.update(rows)
                     pages += 1
                     page_token=data.get('next_page_token')
                     if not page_token: break
-                feed_used=feed
-                if merged or feed == _options_feeds()[-1]:
+                if merged:
+                    feed_used=feed
                     break
             except Exception as e:
                 primary_error=e
                 progress('options_feed_retry', underlying=underlying, feed=feed,
-                         error=str(e)[:300])
+                         error=str(e)[:300], elapsed=round(time.monotonic()-(deadline-OPTIONS_CHAIN_TIMEOUT),1))
                 continue
         if merged:
             for snap in merged.values():
@@ -553,7 +570,7 @@ def option_chain(underlying, side=None, root_symbol=None):
                     'primary_error':str(primary_error)[:500] if primary_error else None}
         if primary_error:
             raise primary_error
-        return {'snapshots':{},'pages':pages,'fallback':False,'feed_used':feed_used}
+        raise ProviderRequestError('Options feed returned no snapshots', endpoint=f'/options/snapshots/{underlying}')
     except Exception as primary_error:
         if str(os.getenv('OPTIONS_CHAIN_FALLBACK','true')).lower() not in ('1','true','yes','on'):
             raise
@@ -563,6 +580,8 @@ def option_chain(underlying, side=None, root_symbol=None):
             result['primary_error']=str(primary_error)[:500]
             return result
         except Exception as fallback_error:
+            progress('options_chain_failed', underlying=underlying,
+                     error=f'primary={str(primary_error)[:220]} fallback={str(fallback_error)[:220]}')
             raise ProviderRequestError(
                 f'Option chain failed; fallback also failed. primary={primary_error}; fallback={fallback_error}',
                 endpoint=getattr(fallback_error,'endpoint',f'/options/snapshots/{underlying}'),
