@@ -1,4 +1,4 @@
-# Options Opportunity Bot V13.9
+# Options Opportunity Bot V14
 
 SPXW final fix: technical indicators use SPY IEX bars while the real SPXW option chain is fetched from Alpaca under the SPX options root. SPXW failures are isolated from other symbols.
 
@@ -23,7 +23,7 @@ The scanner now separately scores high-momentum option setups using multi-timefr
 - One market-close HERO alert per trading day when a candidate exists.
 
 
-## V13.9 setup engine
+## V14 setup engine
 - Preserves the existing Alpaca/OPRA/IEX scanner, Telegram polling, worker timeout, SPXW proxy-chain architecture, caching, and alert-only risk controls.
 - Separates hard contract/quote safety filters from soft setup factors.
 - Premium, 4H alignment, regime, RSI, VWAP, volume, momentum and score are soft factors unless an explicit safety setting is enabled.
@@ -36,3 +36,6 @@ The scanner now separately scores high-momentum option setups using multi-timefr
 - Quote validation rejects zero/invalid bid/ask and explicit stale quotes; missing timestamps are not treated as stale unless `REQUIRE_QUOTE_TIMESTAMP=true`.
 - Entry/stop/target levels are model-derived from current bid/ask and available ATR. When the required volatility data is unavailable, the alert reports the target as unavailable instead of inventing a number.
 - The bot never places brokerage orders.
+
+## V14 pipeline validation
+V14 separates chain receipt, contract normalization, quote-stage validation, and scoring. Set `DEBUG_SCANNER=true`, `DEBUG_SAMPLE=true`, or `DEBUG_BYPASS_SCORING=true` to diagnose data flow without changing production scoring thresholds.

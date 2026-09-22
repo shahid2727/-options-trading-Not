@@ -20,6 +20,8 @@ MIN_SCORE_WATCH = float(os.getenv('MIN_SCORE_WATCH', os.getenv('WATCH_SCORE','55
 MAX_QUOTE_AGE = int(os.getenv('MAX_QUOTE_AGE', os.getenv('QUOTE_STALE_SECONDS','300')))
 MAX_CONCURRENCY = max(1, int(os.getenv('MAX_CONCURRENCY','8')))
 DEBUG_SCANNER = os.getenv('DEBUG_SCANNER','false').strip().lower() in ('1','true','yes','on')
+DEBUG_BYPASS_SCORING = os.getenv('DEBUG_BYPASS_SCORING','false').strip().lower() in ('1','true','yes','on')
+DEBUG_SAMPLE = os.getenv('DEBUG_SAMPLE','false').strip().lower() in ('1','true','yes','on')
 UPSIDE_ALERT_PCT = float(os.getenv('UPSIDE_ALERT_PCT','1000'))
 MAX_AFFORDABLE_PREMIUM = float(os.getenv('MAX_AFFORDABLE_PREMIUM','25.00'))
 MAX_SPREAD = MAX_SPREAD_PCT; MIN_OI = MIN_OPEN_INTEREST; MIN_VOL = MIN_OPTION_VOLUME
@@ -525,38 +527,78 @@ def option_chain(underlying, side=None, root_symbol=None):
                 cause=fallback_error
             )
 
-def parse_contract(sym, details):
-    """Parse Alpaca option details, with OCC-symbol fallback.
+def _optional_float(v):
+    """Return None for missing/non-finite values; preserve legitimate zero."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        x=float(v)
+        return x if math.isfinite(x) else None
+    except (TypeError, ValueError):
+        return None
 
-    Alpaca can return incomplete/variant contract metadata for index options.
-    SPX/SPXW OCC symbols encode YYMMDD + C/P + strike*1000, so use that
-    information when metadata fields are absent.
-    """
+
+def _optional_int(v):
+    x=_optional_float(v)
+    if x is None:
+        return None
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+
+def parse_contract(sym, details):
+    """Parse Alpaca contract metadata and OCC symbols for equity + index options."""
     details = details or {}
     exp = details.get('expiration_date') or details.get('expirationDate')
-    strike = num(details.get('strike_price') or details.get('strikePrice'))
-    typ = (details.get('type') or details.get('option_type') or '').upper()
+    strike_raw = details.get('strike_price') if details.get('strike_price') is not None else details.get('strikePrice')
+    strike = _optional_float(strike_raw)
+    typ = str(details.get('type') or details.get('option_type') or '').upper().strip()
 
-    # OCC-style index option symbol, e.g. SPXW260921C06600000
-    m = re.search(r'(?:SPXW|SPX)(\d{6})([CP])(\d{8})$', str(sym).upper())
+    # OCC option symbols: ROOT + YYMMDD + C/P + 8-digit strike*1000.
+    # Roots may be 1-6 letters (and Alpaca index roots such as SPXW).
+    m = re.match(r'^([A-Z]{1,6})(\d{6})([CP])(\d{8})$', str(sym).upper().strip())
     if m:
-        yy, mm, dd = int(m.group(1)[:2]), int(m.group(1)[2:4]), int(m.group(1)[4:6])
+        yy, mm, dd = int(m.group(2)[:2]), int(m.group(2)[2:4]), int(m.group(2)[4:6])
         try:
             exp = f"20{yy:02d}-{mm:02d}-{dd:02d}"
         except Exception:
             pass
-        typ = 'CALL' if m.group(2) == 'C' else 'PUT'
-        if strike <= 0:
-            strike = int(m.group(3)) / 1000.0
+        typ = 'CALL' if m.group(3) == 'C' else 'PUT'
+        if strike is None:
+            strike = int(m.group(4)) / 1000.0
 
-    # A few APIs return "call"/"put" and occasionally omit the strike in
-    # details while exposing it in the symbol.
-    if typ in ('C', 'CALL'):
-        typ = 'CALL'
-    elif typ in ('P', 'PUT'):
-        typ = 'PUT'
+    if typ in ('C','CALL'):
+        typ='CALL'
+    elif typ in ('P','PUT'):
+        typ='PUT'
 
     return exp, strike, typ
+
+
+def normalize_contract(raw, contract_symbol=None):
+    """Normalize snapshot/contract variants without hiding parsing failures."""
+    raw = raw or {}
+    symbol = str(contract_symbol or raw.get('symbol') or raw.get('option_symbol') or raw.get('optionSymbol') or '').upper().strip()
+    details = raw.get('details') if isinstance(raw.get('details'), dict) else {}
+    if not details:
+        details = raw
+    exp, strike, typ = parse_contract(symbol, details)
+    underlying = (details.get('underlying_symbol') or details.get('underlyingSymbol') or
+                  details.get('underlying') or details.get('root_symbol') or details.get('rootSymbol'))
+    underlying = str(underlying or '').upper().strip() or None
+    if not symbol:
+        return None, 'missing_symbol'
+    if not exp:
+        return None, 'invalid_expiration'
+    if strike is None or strike <= 0:
+        return None, 'invalid_strike'
+    if not typ:
+        return None, 'missing_type'
+    if typ not in ('CALL','PUT'):
+        return None, 'invalid_type'
+    return {'symbol':symbol,'underlying':underlying,'expiration':exp,'strike':strike,'option_type':typ,'details':details}, None
 
 def _direction_state(m, direction):
     """Return directional evidence without making 4H/regime a hard gate."""
@@ -747,326 +789,226 @@ def explosive_setup_score(m, direction, spread, delta, vol, oi, dte):
 
 
 def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_underlying=None):
-    """Scan one underlying without treating secondary option quality as hard filters."""
+    """Scan one underlying. Validation is staged and every rejection is observable."""
     m = multi_tf(symbol, caches)
     chain_root = option_underlying or symbol
     is_spxw = bool(contract_prefix and option_underlying == 'SPX')
     progress('fetching_options', symbol=chain_root)
     chain = option_chain(chain_root, root_symbol=None)
     rows = chain.get('snapshots') or {}
+    received = len(rows)
     qualified, scored_rows = [], []
     today = datetime.now(timezone.utc).date()
 
     rej = {k: 0 for k in (
-        'prefix','bad_contract','dte','price','spread','liquidity','score',
-        'alignment','regime','quote_stale','no_bid','no_ask','missing_last',
-        'invalid_quote','missing_volume','missing_oi','direction','premium',
-        'hard_premium','after_hours_candidates','quote_fallback'
+        'bad_contract_schema','missing_symbol','invalid_expiration','expired','dte','invalid_strike',
+        'missing_type','invalid_type','missing_quote','invalid_bid','invalid_ask','invalid_last',
+        'zero_volume','zero_open_interest','spread_too_wide','premium_too_low','premium_too_high',
+        'delta','technical','score','prefix','quote_stale','quote_fallback','no_bid','no_ask',
+        'missing_last','missing_volume','missing_oi','invalid_quote','liquidity','price','spread',
+        'alignment','regime','direction','premium','hard_premium','after_hours_candidates'
     )}
-    tier_counts = {'HERO': 0, 'STRONG': 0, 'WATCH': 0}
+    quote_fresh = quote_stale = quote_with_data = 0
+    quote_stage = 0
+    quotes_received = 0
+    bid_present = ask_present = last_present = volume_present = oi_present = 0
+    normalized_count = 0
+    dte_rejected = 0
+    sample_done = False
+    tier_counts = {'HERO':0,'STRONG':0,'WATCH':0}
     potential = 0
-    quote_fresh = quote_stale = 0
-    quote_with_data = 0
     hard_spread = float(os.getenv('ABSOLUTE_MAX_SPREAD_PCT','500'))
-    configured_cap = float(os.getenv('SPXW_MAX_PREMIUM','75.00')) if is_spxw else max(MAX_PREMIUM, 20.0)
-    hard_premium_cap = max(configured_cap * max(2.0, HARD_MAX_PREMIUM_MULTIPLIER), 100.0)
+    configured_cap = float(os.getenv('SPXW_MAX_PREMIUM','75.00')) if is_spxw else max(MAX_PREMIUM,20.0)
+    hard_premium_cap = max(configured_cap * max(2.0,HARD_MAX_PREMIUM_MULTIPLIER),100.0)
 
-    progress('scoring', symbol=symbol, contracts=len(rows))
-    for contract, snap in rows.items():
-        snap = snap or {}
-        details = snap.get('details') or {}
-        exp, strike, typ = parse_contract(contract, details)
+    progress('scoring', symbol=symbol, contracts=received)
+    if DEBUG_SCANNER:
+        print(f'DEBUG {symbol} | chain={received} | feed={chain.get("feed_used") or "—"}')
 
-        if contract_prefix:
-            root = (details.get('root_symbol') or details.get('rootSymbol') or
-                    details.get('underlying_symbol') or details.get('underlyingSymbol') or '').upper().strip()
-            if is_spxw:
-                is_spx_family = root in ('','SPX','SPXW') or str(contract).upper().startswith(('SPX','SPXW'))
-                if not is_spx_family:
-                    rej['prefix'] += 1
-                    debug_rejection('prefix', symbol=symbol, contract=contract)
-                    continue
-            elif not str(contract).upper().startswith(contract_prefix):
-                rej['prefix'] += 1
-                debug_rejection('prefix', symbol=symbol, contract=contract)
-                continue
-
-        if not exp or not strike or typ not in ('CALL','PUT'):
-            rej['bad_contract'] += 1
-            debug_rejection('bad_contract', symbol=symbol, contract=contract)
+    for idx,(contract,snap) in enumerate(rows.items()):
+        snap = snap if isinstance(snap,dict) else {}
+        details = snap.get('details') if isinstance(snap.get('details'),dict) else {}
+        normalized, norm_reason = normalize_contract(snap, contract)
+        if DEBUG_SCANNER and idx < 2:
+            print(f'DEBUG {symbol} Raw contract sample #{idx+1}: {contract} {snap if idx < 2 else ""}')
+            print(f'DEBUG {symbol} Normalized: {normalized if normalized else norm_reason}')
+        if normalized is None:
+            rej['bad_contract_schema'] += 1
+            if norm_reason in rej: rej[norm_reason] += 1
+            debug_rejection(norm_reason or 'bad_contract_schema',symbol=symbol,contract=contract)
             continue
+        normalized_count += 1
+        exp = normalized['expiration']; strike = normalized['strike']; typ = normalized['option_type']
+        if contract_prefix:
+            root = str(details.get('root_symbol') or details.get('rootSymbol') or normalized.get('underlying') or '').upper().strip()
+            if is_spxw:
+                if not (root in ('','SPX','SPXW') or str(contract).upper().startswith(('SPX','SPXW'))):
+                    rej['prefix'] += 1; continue
+            elif not str(contract).upper().startswith(contract_prefix):
+                rej['prefix'] += 1; continue
+
         try:
-            dte = (datetime.fromisoformat(str(exp).replace('Z','+00:00')).date() - today).days
+            exp_date = datetime.fromisoformat(str(exp).replace('Z','+00:00')).date()
         except Exception:
-            rej['bad_contract'] += 1
+            rej['invalid_expiration'] += 1
+            continue
+        dte = (exp_date - today).days
+        if dte < 0:
+            rej['expired'] += 1
             continue
         if dte < MIN_DTE or dte > MAX_DTE:
-            rej['dte'] += 1
-            debug_rejection('dte', symbol=symbol, contract=contract, dte=dte)
+            rej['dte'] += 1; dte_rejected += 1
             continue
+        quote_stage += 1
 
         quote = snap.get('latestQuote') or {}
         trade = snap.get('latestTrade') or {}
         greeks = snap.get('greeks') or {}
-        bid = num(quote.get('bp'))
-        ask = num(quote.get('ap'))
-        last = num(trade.get('p'))
+        bid = _optional_float(quote.get('bp'))
+        ask = _optional_float(quote.get('ap'))
+        last = _optional_float(trade.get('p'))
+        if bid is not None: bid_present += 1
+        if ask is not None: ask_present += 1
+        if last is not None: last_present += 1
+        if bid is None: rej['no_bid'] += 1
+        if ask is None: rej['no_ask'] += 1
+        if last is None: rej['missing_last'] += 1
+        if bid is not None and bid < 0: rej['invalid_bid'] += 1; bid=None
+        if ask is not None and ask < 0: rej['invalid_ask'] += 1; ask=None
+        if last is not None and last < 0: rej['invalid_last'] += 1; last=None
 
-        # Quote fallback: valid bid/ask -> mid; otherwise use a valid last trade.
-        quote_source = 'BID_ASK'
-        if bid > 0 and ask > 0 and ask >= bid:
-            premium = (bid + ask) / 2.0
-        elif last > 0:
-            premium = last
-            quote_source = 'LAST'
-            rej['quote_fallback'] += 1
+        premium = None; quote_source='FALLBACK'
+        if bid is not None and ask is not None and bid > 0 and ask > 0 and ask >= bid:
+            premium=(bid+ask)/2.0; quote_source='BID_ASK'
+            quotes_received += 1
+        elif last is not None and last > 0:
+            premium=last; quote_source='LAST'; quotes_received += 1; rej['quote_fallback'] += 1
         else:
-            rej['price'] += 1
-            if bid <= 0: rej['no_bid'] += 1
-            if ask <= 0: rej['no_ask'] += 1
-            if last <= 0: rej['missing_last'] += 1
-            debug_rejection('price', symbol=symbol, contract=contract)
+            rej['missing_quote'] += 1
             continue
-
-        qdt = _quote_timestamp(snap, quote, trade)
-        quote_age_sec = None
-        stale = False
-        if qdt is not None:
-            quote_age_sec = max(0.0, (datetime.now(timezone.utc) - qdt).total_seconds())
-            stale_limit = AFTER_HOURS_STALE_SECONDS if str(session).upper() in ('AFTER_HOURS','CLOSED') else MAX_QUOTE_AGE
-            stale = quote_age_sec > stale_limit
-            if stale:
-                quote_stale += 1
-                rej['quote_stale'] += 1
-            else:
-                quote_fresh += 1
-        else:
-            # Missing timestamp is not fatal; data quality is exposed explicitly.
-            quote_stale += 1
-            rej['quote_stale'] += 1
         quote_with_data += 1
 
-        if bid <= 0: rej['no_bid'] += 1
-        if ask <= 0: rej['no_ask'] += 1
-        if bid > 0 and ask > 0 and ask < bid:
-            rej['invalid_quote'] += 1
+        qdt=_quote_timestamp(snap,quote,trade)
+        quote_age_sec=None; stale=False
+        if qdt is not None:
+            quote_age_sec=max(0.0,(datetime.now(timezone.utc)-qdt).total_seconds())
+            stale_limit=AFTER_HOURS_STALE_SECONDS if str(session).upper() in ('AFTER_HOURS','CLOSED') else MAX_QUOTE_AGE
+            stale=quote_age_sec>stale_limit
+        else:
+            stale=True
+        if stale: quote_stale += 1; rej['quote_stale'] += 1
+        else: quote_fresh += 1
 
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            if ask < bid:
+                rej['invalid_quote'] += 1
+                spread=None
+            else:
+                mid=(bid+ask)/2.0
+                spread=(ask-bid)/max(mid,1e-9)*100.0
+        else:
+            spread=None
+        if spread is not None and spread > hard_spread:
+            rej['spread_too_wide'] += 1; rej['spread'] += 1
+            continue
         if premium <= 0:
             rej['price'] += 1
             continue
 
-        if bid > 0 and ask > 0:
-            spread = max(0.0, (ask-bid) / max((bid+ask)/2.0, 1e-9) * 100.0)
-        else:
-            # Unknown spread is neutral rather than fabricated.
-            spread = None
-            rej['spread'] += 0
-
-        if spread is not None and spread > hard_spread:
-            rej['spread'] += 1
-            debug_rejection('spread', symbol=symbol, contract=contract, spread=spread)
-            continue
-
-        preferred_floor = float(os.getenv('SPXW_MIN_PREMIUM','0.05')) if is_spxw else MIN_PREMIUM
-        preferred_cap = float(os.getenv('SPXW_MAX_PREMIUM','20.00')) if is_spxw else MAX_PREMIUM
-        if premium < preferred_floor or premium > preferred_cap:
-            rej['premium'] += 1
+        preferred_floor=float(os.getenv('SPXW_MIN_PREMIUM','0.05')) if is_spxw else MIN_PREMIUM
+        preferred_cap=float(os.getenv('SPXW_MAX_PREMIUM','20.00')) if is_spxw else MAX_PREMIUM
+        if premium < preferred_floor: rej['premium_too_low'] += 1; rej['premium'] += 1
+        if premium > preferred_cap: rej['premium_too_high'] += 1; rej['premium'] += 1
         if premium > hard_premium_cap:
-            rej['hard_premium'] += 1
+            rej['hard_premium'] += 1; continue
+
+        daily=snap.get('dailyBar') or snap.get('daily_bar') or {}
+        vol=_optional_int(daily.get('v'))
+        if vol is None:
+            vol=_optional_int(trade.get('s')) if trade else None
+        oi_raw=details.get('open_interest') if details.get('open_interest') is not None else details.get('openInterest')
+        if oi_raw is None: oi_raw=snap.get('openInterest')
+        oi=_optional_int(oi_raw)
+        if vol is None: rej['missing_volume'] += 1
+        elif vol == 0: rej['zero_volume'] += 1
+        else: volume_present += 1
+        if oi is None: rej['missing_oi'] += 1
+        elif oi == 0: rej['zero_open_interest'] += 1
+        else: oi_present += 1
+
+        if DEBUG_SAMPLE and not sample_done:
+            mid=(bid+ask)/2.0 if bid is not None and ask is not None and bid>0 and ask>0 else premium
+            print('SAMPLE CONTRACT', {'Underlying':chain_root,'Contract':contract,'Expiration':exp,'DTE':dte,'Strike':strike,'Type':typ,'Bid':bid,'Ask':ask,'Last':last,'Mid':mid,'Spread':spread,'Volume':vol,'Open Interest':oi,'Stock Price':m['5m']['last'],'Distance From Strike':round(abs(m['5m']['last']-strike),4),'Passed':'YES','contract_structure':'YES','expiration':'YES','quote':'YES','liquidity':'SOFT','premium':'SOFT','technical':'SOFT'})
+            sample_done=True
+
+        potential += 1
+        if DEBUG_BYPASS_SCORING:
+            scored_rows.append({'signal':typ,'tier':None,'symbol':symbol,'contract':contract,'underlying':m['5m']['last'],'option_underlying':chain_root,'expiration':exp,'dte':dte,'strike':round(strike,2),'premium':round(premium,2),'bid':round(bid,2) if bid is not None and bid>0 else None,'ask':round(ask,2) if ask is not None and ask>0 else None,'last':round(last,2) if last is not None and last>0 else None,'volume':vol or 0,'open_interest':oi or 0,'spread_pct':round(spread,1) if spread is not None else None,'score':None,'qualification':'VALIDATION_ONLY','quote_source':quote_source,'quote_age_sec':round(quote_age_sec,1) if quote_age_sec is not None else None,'quote_is_stale':stale,'reasons':['DEBUG_BYPASS_SCORING']})
             continue
 
-        daily = snap.get('dailyBar') or snap.get('daily_bar') or {}
-        vol = int(num(daily.get('v')))
-        if vol <= 0:
-            vol = int(num(trade.get('s'))) if trade else 0
-        oi_raw = details.get('open_interest') if details.get('open_interest') is not None else details.get('openInterest')
-        oi = int(num(oi_raw))
-        if vol <= 0: rej['missing_volume'] += 1
-        if oi <= 0: rej['missing_oi'] += 1
-
-        # Missing Greeks are neutral. A conservative placeholder is only used for
-        # scoring and is explicitly reported in the result.
-        delta_raw = greeks.get('delta')
-        greeks_available = delta_raw is not None and num(delta_raw) != 0
-        delta = num(delta_raw, 0.25 if typ == 'CALL' else -0.25)
-
-        score, reasons, a4, a1, a15, a5, components, positive, opposite = score_setup(
-            m, typ, spread if spread is not None else 20.0, delta, vol, oi, dte, strike, is_spxw=is_spxw
-        )
-        pscore, plabel = premium_quality(premium, is_spxw)
-        # Premium quality is a small soft adjustment, never a filter.
-        score = round(min(100.0, max(0.0, score + pscore - 5.0)), 1)
-        components['premium'] = round(pscore - 5.0, 1)
-
-        explosive_score, explosive_flags = explosive_setup_score(
-            m, typ, spread if spread is not None else 20.0, delta, vol, oi, dte
-        )
-        potential += 1
-
-        risk_flags = []
-        if spread is not None and spread > max(MAX_SPREAD, RELAXED_MAX_SPREAD):
-            risk_flags.append('wide spread')
-        if vol < MIN_VOL and oi < MIN_OI:
-            risk_flags.append('thin option liquidity')
-        if stale:
-            risk_flags.append('stale quote')
-        if not greeks_available:
-            reasons.append('Greeks unavailable — neutral score treatment')
-        if vol <= 0:
-            reasons.append('Volume unavailable — neutral score treatment')
-        if oi <= 0:
-            reasons.append('Open interest unavailable — neutral score treatment')
-        if premium < preferred_floor:
-            reasons.append('Low premium — higher sensitivity risk')
-        elif premium > preferred_cap:
-            reasons.append('High premium — capital intensive')
-        if explosive_score >= EXPLOSIVE_MIN_SCORE and m['regime'] not in ('SIDEWAYS','CHOPPY'):
-            reasons.append('💥 Momentum/volume expansion setup')
-            reasons.extend(explosive_flags)
-
-        tier = _classify(score, positive, opposite, risk_flags if score >= HERO_SCORE else [])
-        # Optional legacy settings downgrade classification; they do not erase data.
+        delta_raw=greeks.get('delta')
+        greeks_available=delta_raw is not None and _optional_float(delta_raw) is not None
+        delta=_optional_float(delta_raw)
+        if delta is None:
+            delta=0.25 if typ=='CALL' else -0.25
+            rej['delta'] += 1
+        score,reasons,a4,a1,a15,a5,components,positive,opposite=score_setup(m,typ,spread if spread is not None else 20.0,delta,vol or 0,oi or 0,dte,strike,is_spxw=is_spxw)
+        pscore,plabel=premium_quality(premium,is_spxw)
+        score=round(min(100.0,max(0.0,score+pscore-5.0)),1); components['premium']=round(pscore-5.0,1)
+        explosive_score,explosive_flags=explosive_setup_score(m,typ,spread if spread is not None else 20.0,delta,vol or 0,oi or 0,dte)
+        risk_flags=[]
+        if spread is not None and spread>max(MAX_SPREAD,RELAXED_MAX_SPREAD): risk_flags.append('wide spread')
+        if (vol or 0)<MIN_VOL and (oi or 0)<MIN_OI: risk_flags.append('thin option liquidity')
+        if stale: risk_flags.append('stale quote')
+        if not greeks_available: reasons.append('Greeks unavailable — neutral score treatment')
+        if vol is None: reasons.append('Volume unavailable — neutral score treatment')
+        if oi is None: reasons.append('Open interest unavailable — neutral score treatment')
+        if premium<preferred_floor: reasons.append('Low premium — higher sensitivity risk')
+        elif premium>preferred_cap: reasons.append('High premium — capital intensive')
+        if explosive_score>=EXPLOSIVE_MIN_SCORE and m['regime'] not in ('SIDEWAYS','CHOPPY'):
+            reasons.append('💥 Momentum/volume expansion setup'); reasons.extend(explosive_flags)
+        tier=_classify(score,positive,opposite,risk_flags if score>=HERO_SCORE else [])
         if REQUIRE_4H_ALIGNMENT and not a4:
-            if tier == 'HERO': tier = 'STRONG'
-            elif tier == 'STRONG': tier = 'WATCH'
-        if BLOCK_SIDEWAYS_CHOPPY and m['regime'] in ('SIDEWAYS','CHOPPY'):
-            tier = None
-
-        if tier in tier_counts:
-            tier_counts[tier] += 1
+            if tier=='HERO': tier='STRONG'
+            elif tier=='STRONG': tier='WATCH'
+        if BLOCK_SIDEWAYS_CHOPPY and m['regime'] in ('SIDEWAYS','CHOPPY'): tier=None
+        if tier in tier_counts: tier_counts[tier]+=1
         if tier is None:
-            rej['score'] += 1
-            if positive < WATCH_MIN_DIRECTION: rej['direction'] += 1
-            if REQUIRE_4H_ALIGNMENT and not a4: rej['alignment'] += 1
-            if BLOCK_SIDEWAYS_CHOPPY and m['regime'] in ('SIDEWAYS','CHOPPY'): rej['regime'] += 1
+            rej['score']+=1
+            if positive<WATCH_MIN_DIRECTION: rej['direction']+=1
+            if REQUIRE_4H_ALIGNMENT and not a4: rej['alignment']+=1
+            if BLOCK_SIDEWAYS_CHOPPY and m['regime'] in ('SIDEWAYS','CHOPPY'): rej['regime']+=1
+        if tier=='WATCH': reasons.append('🟡 WATCH — monitor; not a full entry signal')
+        elif tier=='STRONG': reasons.append('🟢 STRONG setup')
+        elif tier=='HERO': reasons.append('🏆 HERO setup')
+        else: reasons.append('Below configured WATCH threshold')
 
-        if tier == 'WATCH':
-            reasons.append('🟡 WATCH — monitor; not a full entry signal')
-        elif tier == 'STRONG':
-            reasons.append('🟢 STRONG setup')
-        elif tier == 'HERO':
-            reasons.append('🏆 HERO setup')
-        else:
-            reasons.append('Below configured WATCH threshold')
-
-        # Use actual quote source for entry; never fabricate a price.
-        entry_low = round(bid,2) if bid > 0 else round(premium,2)
-        entry_high = round(ask,2) if ask > 0 else round(premium,2)
-        entry = premium
-        atr_points = num(m['5m'].get('atr'))
-        u_entry = round(m['5m']['last'],2)
-        if atr_points > 0 and u_entry > 0:
-            if typ == 'CALL':
-                u_stop = round(u_entry-atr_points,2); u_tp1 = round(u_entry+atr_points,2)
-                u_tp2 = round(u_entry+2*atr_points,2); u_tp3 = round(u_entry+3*atr_points,2)
-                projected_underlying = u_tp3; underlying_move = max(0, projected_underlying-u_entry)
-            else:
-                u_stop = round(u_entry+atr_points,2); u_tp1 = round(u_entry-atr_points,2)
-                u_tp2 = round(u_entry-2*atr_points,2); u_tp3 = round(u_entry-3*atr_points,2)
-                projected_underlying = u_tp3; underlying_move = max(0, u_entry-projected_underlying)
-        else:
-            u_stop=u_tp1=u_tp2=u_tp3=projected_underlying=None; underlying_move=0
-
-        if underlying_move > 0 and abs(delta) > 0:
-            projected_premium = max(0.01, premium + abs(delta)*underlying_move)
-            projected_upside_pct = round(max(0,(projected_premium/premium-1)*100),1)
-        else:
-            projected_premium = projected_upside_pct = None
-
-        # Option risk/targets are quote-derived. With LAST fallback, entry is the
-        # last trade and bid/ask remain unavailable rather than invented.
-        risk = max(((ask-bid)*1.5 if bid > 0 and ask > 0 else premium*0.20), 0.05)
-        stop = round(max(0.01, entry-risk),2)
-        tp1 = round(entry+risk,2); tp2 = round(entry+2*risk,2); tp3 = round(entry+3*risk,2)
-        contracts = max(0, int(RISK // (risk*100)))
-        max_loss = round(risk*100*contracts,2)
-        reward1 = round(max(0,tp1-entry)*100*contracts,2)
-        reward2 = round(max(0,tp2-entry)*100*contracts,2)
-        reward3 = round(max(0,tp3-entry)*100*contracts,2)
-        confidence = round(min(97,max(50,score*.92)),0)
-
-        trend4 = 'BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL'
-        trend1 = 'BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL'
-        trend15 = 'BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL'
-        trend5 = 'BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL'
-
-        item = {
-            'signal':typ,'tier':tier,'market':'OPTIONS','symbol':symbol,'contract':contract,
-            'dte':dte,'strike':round(strike,2),'premium':round(premium,2),
-            'bid':round(bid,2) if bid > 0 else None,'ask':round(ask,2) if ask > 0 else None,
-            'entry_low':entry_low,'entry_high':entry_high,'entry':round(entry,2),
-            'stop_loss':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,
-            'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,
-            'affordable':contracts>0,'max_loss':max_loss,
-            'expected_profit_tp1':reward1,'expected_profit_tp2':reward2,'expected_profit_tp3':reward3,
-            'expected_loss_pct':round(risk/max(entry,0.01)*100,1),
-            'expected_profit_pct':round((tp1/entry-1)*100,1),
-            'risk_reward':round((tp1-entry)/risk,2) if risk else None,
-            'underlying_entry':u_entry,'underlying_stop_loss':u_stop,'underlying_tp1':u_tp1,'underlying_tp2':u_tp2,'underlying_tp3':u_tp3,
-            'atr_5m_points':round(atr_points,2) if atr_points else None,
-            'score':score,'score_components':components,'direction_evidence':positive,'opposite_evidence':opposite,
-            'explosive_score':explosive_score,'explosive_setup':bool(explosive_score>=EXPLOSIVE_MIN_SCORE and positive>=3),
-            'explosive_flags':explosive_flags,'confidence':confidence,'projected_underlying_target':projected_underlying,
-            'projected_premium':round(projected_premium,2) if projected_premium is not None else None,
-            'projected_upside_pct':projected_upside_pct,'market_regime':m['regime'],
-            'volume':vol,'open_interest':oi,'spread_pct':round(spread,1) if spread is not None else None,
-            'delta':round(delta,3),'underlying':u_entry,'indicator_symbol':symbol,
-            'indicator_proxy':symbol if not is_spxw else 'SPY','option_underlying':chain_root,
-            'vwap_state':'BULLISH' if u_entry>m['vwap'] else 'BEARISH',
-            'ema_state':'BULLISH' if m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH',
-            'rsi':round(m['5m']['rsi'],1),'macd_state':'BULLISH' if m['5m']['macd_delta']>0 else 'BEARISH',
-            'volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout'],
-            'trend_4h':trend4,'trend_1h':trend1,'trend_15m':trend15,'trend_5m':trend5,
-            'adx_4h':round(m['4h']['adx'],1),'rsi_4h':round(m['4h']['rsi'],1),
-            'reasons':reasons,'session':session,'data_mode':options_data_mode(),
-            'premium_quality':round(pscore,1),'premium_quality_label':plabel,
-            'quote_timestamp':qdt.isoformat() if qdt else None,
-            'quote_source':quote_source,'quote_age_sec':round(quote_age_sec,1) if quote_age_sec is not None else None,
-            'quote_is_stale':stale,'greeks_available':greeks_available,
-            'qualification': tier or 'BELOW_WATCH'
-        }
+        entry_low=round(bid,2) if bid is not None and bid>0 else round(premium,2); entry_high=round(ask,2) if ask is not None and ask>0 else round(premium,2); entry=premium
+        atr_points=num(m['5m'].get('atr')); u_entry=round(m['5m']['last'],2)
+        if atr_points>0 and u_entry>0:
+            if typ=='CALL': u_stop=round(u_entry-atr_points,2); u_tp1=round(u_entry+atr_points,2); u_tp2=round(u_entry+2*atr_points,2); u_tp3=round(u_entry+3*atr_points,2); projected_underlying=u_tp3; underlying_move=max(0,projected_underlying-u_entry)
+            else: u_stop=round(u_entry+atr_points,2); u_tp1=round(u_entry-atr_points,2); u_tp2=round(u_entry-2*atr_points,2); u_tp3=round(u_entry-3*atr_points,2); projected_underlying=u_tp3; underlying_move=max(0,u_entry-projected_underlying)
+        else: u_stop=u_tp1=u_tp2=u_tp3=projected_underlying=None; underlying_move=0
+        projected_premium=max(0.01,premium+abs(delta)*underlying_move) if underlying_move>0 and abs(delta)>0 else None
+        projected_upside_pct=round(max(0,(projected_premium/premium-1)*100),1) if projected_premium is not None else None
+        risk=max(((ask-bid)*1.5 if bid is not None and ask is not None and bid>0 and ask>0 else premium*0.20),0.05); stop=round(max(0.01,entry-risk),2); tp1=round(entry+risk,2); tp2=round(entry+2*risk,2); tp3=round(entry+3*risk,2)
+        contracts=max(0,int(RISK//(risk*100))); max_loss=round(risk*100*contracts,2); reward1=round(max(0,tp1-entry)*100*contracts,2); reward2=round(max(0,tp2-entry)*100*contracts,2); reward3=round(max(0,tp3-entry)*100*contracts,2)
+        confidence=round(min(97,max(50,score*.92)),0)
+        trend4='BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL'; trend1='BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL'; trend15='BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL'; trend5='BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL'
+        item={'signal':typ,'tier':tier,'market':'OPTIONS','symbol':symbol,'contract':contract,'dte':dte,'strike':round(strike,2),'expiration':exp,'premium':round(premium,2),'bid':round(bid,2) if bid is not None and bid>0 else None,'ask':round(ask,2) if ask is not None and ask>0 else None,'entry_low':entry_low,'entry_high':entry_high,'entry':round(entry,2),'stop_loss':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'affordable':contracts>0,'max_loss':max_loss,'expected_profit_tp1':reward1,'expected_profit_tp2':reward2,'expected_profit_tp3':reward3,'expected_loss_pct':round(risk/max(entry,0.01)*100,1),'expected_profit_pct':round((tp1/entry-1)*100,1),'risk_reward':round((tp1-entry)/risk,2) if risk else None,'underlying_entry':u_entry,'underlying_stop_loss':u_stop,'underlying_tp1':u_tp1,'underlying_tp2':u_tp2,'underlying_tp3':u_tp3,'atr_5m_points':round(atr_points,2) if atr_points else None,'score':score,'score_components':components,'direction_evidence':positive,'opposite_evidence':opposite,'explosive_score':explosive_score,'explosive_setup':bool(explosive_score>=EXPLOSIVE_MIN_SCORE and positive>=3),'explosive_flags':explosive_flags,'confidence':confidence,'projected_underlying_target':projected_underlying,'projected_premium':round(projected_premium,2) if projected_premium is not None else None,'projected_upside_pct':projected_upside_pct,'market_regime':m['regime'],'volume':vol or 0,'open_interest':oi or 0,'spread_pct':round(spread,1) if spread is not None else None,'delta':round(delta,3),'underlying':u_entry,'indicator_symbol':symbol,'indicator_proxy':symbol if not is_spxw else 'SPY','option_underlying':chain_root,'vwap_state':'BULLISH' if u_entry>m['vwap'] else 'BEARISH','ema_state':'BULLISH' if m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH','rsi':round(m['5m']['rsi'],1),'macd_state':'BULLISH' if m['5m']['macd_delta']>0 else 'BEARISH','volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout'],'trend_4h':trend4,'trend_1h':trend1,'trend_15m':trend15,'trend_5m':trend5,'adx_4h':round(m['4h']['adx'],1),'rsi_4h':round(m['4h']['rsi'],1),'reasons':reasons,'session':session,'data_mode':options_data_mode(),'premium_quality':round(pscore,1),'premium_quality_label':plabel,'quote_timestamp':qdt.isoformat() if qdt else None,'quote_source':quote_source,'quote_age_sec':round(quote_age_sec,1) if quote_age_sec is not None else None,'quote_is_stale':stale,'greeks_available':greeks_available,'qualification':tier or 'BELOW_WATCH'}
         scored_rows.append(item)
-        if tier:
-            qualified.append(item)
+        if tier: qualified.append(item)
 
-    # Best 1-3 per underlying, including below-WATCH candidates for diagnostics.
-    scored_rows.sort(key=lambda x: (float(x.get('score',0)), float(x.get('explosive_score',0)),
-                                    float(x.get('volume',0)), float(x.get('open_interest',0))), reverse=True)
-    top_pool = scored_rows[:max(3, int(os.getenv('TOP_POOL_PER_UNDERLYING','3')))]
-    no_setup_reasons = []
-    if not qualified:
-        if not rows: no_setup_reasons.append('No option-chain contracts returned')
-        if not potential: no_setup_reasons.append('No contracts reached scoring')
-        if rej['price']: no_setup_reasons.append(f"Price/quote unavailable: {rej['price']}")
-        if rej['dte']: no_setup_reasons.append(f"DTE outside configured window: {rej['dte']}")
-        if rej['spread']: no_setup_reasons.append(f"Extreme spread rejected: {rej['spread']}")
-        if rej['hard_premium']: no_setup_reasons.append(f"Security premium cap rejected: {rej['hard_premium']}")
-        if potential: no_setup_reasons.append('Contracts scored but none reached WATCH threshold')
-    return qualified, {
-        'chain_items':len(rows),'potential_setups':potential,'scored':len(scored_rows),
-        'hero':tier_counts['HERO'],'strong':tier_counts['STRONG'],'watch':tier_counts['WATCH'],
-        'parse_note':'OCC fallback enabled','chain_fallback':bool(chain.get('fallback')),
-        'chain_pages':chain.get('pages',0),'contracts_discovered':chain.get('contracts_discovered',0),
-        'primary_chain_error':chain.get('primary_error'),'underlying':chain_root,
-        'indicator_source':'Alpaca IEX multi-timeframe 5m/15m/1h/4h',
-        'option_source':'Alpaca options '+str(chain.get('feed_used') or os.getenv('ALPACA_OPTIONS_FEED','indicative')),
-        'market_regime':m['regime'],'rejections':rej,
-        'no_setup_reasons':list(dict.fromkeys(no_setup_reasons)),
-        'top_candidates':top_pool,'quote_metrics':{
-            'with_data':quote_with_data,'fresh':quote_fresh,'stale':quote_stale
-        },
-        'direction_summary':{
-            'call_evidence':_direction_state(m,'CALL')[1],
-            'put_evidence':_direction_state(m,'PUT')[1],
-            'regime':m['regime'],'volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout']
-        },
-        'config':{
-            'hero_score':HERO_SCORE,'strong_score':STRONG_SCORE,'watch_score':WATCH_SCORE,
-            'max_spread_pct':MAX_SPREAD,'absolute_max_spread_pct':hard_spread,
-            'max_quote_age':MAX_QUOTE_AGE,'max_dte':MAX_DTE,'min_dte':MIN_DTE,
-            'min_option_volume':MIN_VOL,'min_open_interest':MIN_OI,'spxw':is_spxw
-        }
-    }
+    scored_rows.sort(key=lambda x:(float(x.get('score') or 0),float(x.get('explosive_score') or 0),float(x.get('volume') or 0),float(x.get('open_interest') or 0)),reverse=True)
+    top_pool=scored_rows[:max(3,int(os.getenv('TOP_POOL_PER_UNDERLYING','3')))]
+    no_setup_reasons=[]
+    if not rows: no_setup_reasons.append('No option-chain contracts returned')
+    if normalized_count==0: no_setup_reasons.append('No contracts passed normalization')
+    if quote_stage==0 and normalized_count>0: no_setup_reasons.append('No contracts reached quote stage')
+    if quote_with_data==0 and quote_stage>0: no_setup_reasons.append('No usable quotes')
+    if potential and not qualified: no_setup_reasons.append('Contracts scored but none reached WATCH threshold')
+    diag={'chain_items':received,'contracts_received':received,'normalized':normalized_count,'potential_setups':potential,'scored':len([x for x in scored_rows if x.get('score') is not None]),'quote_stage':quote_stage,'quotes_received':quotes_received,'scored_rows':len(scored_rows),'rejections':rej,'quote_metrics':{'with_data':quote_with_data,'fresh':quote_fresh,'stale':quote_stale,'bid_present':bid_present,'ask_present':ask_present,'last_present':last_present,'volume_present':volume_present,'oi_present':oi_present},'no_setup_reasons':no_setup_reasons,'chain_fallback':bool(chain.get('fallback')),'chain_pages':chain.get('pages',0),'contracts_discovered':chain.get('contracts_discovered',0),'primary_chain_error':chain.get('primary_error'),'underlying':chain_root,'option_source':'Alpaca options '+str(chain.get('feed_used') or os.getenv('ALPACA_OPTIONS_FEED','indicative')),'top_candidates':top_pool,'tier_counts':tier_counts,'dte_rejected':dte_rejected,'feed_used':chain.get('feed_used')}
+    return qualified, diag
 
 def scan_all(session):
     if not headers():
@@ -1205,19 +1147,21 @@ def scan_all(session):
 
     aggregate_rej={}
     counters={
-        'contracts_received':0,'contracts_valid':0,'contracts_scored':0,
-        'contracts_with_quotes':0,'contracts_stale_quotes':0,'contracts_missing_bid':0,
+        'contracts_received':0,'contracts_normalized':0,'contracts_valid':0,'contracts_scored':0,
+        'contracts_with_quotes':0,'contracts_stale_quotes':0,'contracts_missing_bid':0,'contracts_quote_stage':0,
         'contracts_missing_ask':0,'contracts_missing_last':0,'contracts_missing_volume':0,
         'contracts_missing_oi':0,'rejected_price':0,'rejected_spread':0,
         'rejected_liquidity':0,'rejected_dte':0,'rejected_momentum':0,
-        'rejected_trend':0,'rejected_score':0,'candidate_pool_size':len(top_candidates)
+        'rejected_trend':0,'rejected_score':0,'candidate_pool_size':len(top_candidates),'bad_contract_schema':0,'missing_symbol':0,'invalid_expiration':0,'expired':0,'invalid_strike':0,'missing_type':0,'invalid_type':0,'missing_quote':0,'invalid_bid':0,'invalid_ask':0,'invalid_last':0,'zero_volume':0,'zero_open_interest':0,'spread_too_wide':0,'premium_too_low':0,'premium_too_high':0
     }
     no_setup=[]
     for key,d in diagnostics.items():
         if not isinstance(d,dict): continue
         counters['contracts_received'] += int(d.get('chain_items',0) or 0)
-        counters['contracts_valid'] += int(d.get('potential_setups',0) or 0)
+        counters['contracts_normalized'] += int(d.get('normalized',0) or 0)
+        counters['contracts_valid'] += int(d.get('quote_stage',0) or 0)
         counters['contracts_scored'] += int(d.get('scored',0) or 0)
+        counters['contracts_quote_stage'] += int(d.get('quote_stage',0) or 0)
         qm=d.get('quote_metrics') or {}
         counters['contracts_with_quotes'] += int(qm.get('with_data',0) or 0)
         counters['contracts_stale_quotes'] += int(qm.get('stale',0) or 0)
@@ -1231,7 +1175,9 @@ def scan_all(session):
         counters['contracts_missing_last'] += int(r.get('missing_last',0) or 0)
         counters['contracts_missing_volume'] += int(r.get('missing_volume',0) or 0)
         counters['contracts_missing_oi'] += int(r.get('missing_oi',0) or 0)
-        for rk,rv in r.items(): aggregate_rej[rk]=aggregate_rej.get(rk,0)+int(rv or 0)
+        for rk,rv in r.items():
+            aggregate_rej[rk]=aggregate_rej.get(rk,0)+int(rv or 0)
+            if rk in counters: counters[rk]+=int(rv or 0)
         no_setup.extend(d.get('no_setup_reasons') or [])
 
     heroes=sum(1 for x in results if x.get('tier')=='HERO')
@@ -1241,7 +1187,7 @@ def scan_all(session):
 
     meta={
         'scan_id':None,'symbols_scanned':len(symbols)+ (1 if 'SPXW' in diagnostics else 0),
-        'contracts_scanned':counters['contracts_received'],'valid_contracts':counters['contracts_valid'],
+        'contracts_scanned':counters['contracts_received'],'valid_contracts':counters['contracts_valid'],'contracts_normalized':counters['contracts_normalized'],'quote_stage':counters['contracts_quote_stage'],
         'contracts_scored':counters['contracts_scored'],'candidates':len(results),
         'heroes':heroes,'strong':strongs,'watch':watchs,'top_candidates':top_candidates,
         'candidate_pool_size':len(top_candidates),'rejections':aggregate_rej,
@@ -1255,7 +1201,7 @@ def scan_all(session):
             'contracts_with_valid_quotes':counters['contracts_with_quotes'],
             'contracts_stale':counters['contracts_stale_quotes'],
             'contracts_scored':counters['contracts_scored'],
-            'rejected_price':counters['rejected_price'],'rejected_spread':counters['rejected_spread'],
+            'rejected_price':counters['rejected_price'],'rejected_spread':counters['rejected_spread'],'normalized':counters['contracts_normalized'],'quote_stage':counters['contracts_quote_stage'],'rejected_dte':counters['rejected_dte'],
             'rejected_liquidity':counters['rejected_liquidity'],'rejected_dte':counters['rejected_dte'],
             'rejected_momentum':counters['rejected_momentum'],'rejected_trend':counters['rejected_trend'],
             'rejected_score':counters['rejected_score']

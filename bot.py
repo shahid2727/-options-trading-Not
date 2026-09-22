@@ -391,6 +391,8 @@ def _status_text():
         f"Symbols scanned: {s.get('symbols_scanned',0) or 0}",
         f"Contracts scanned: {s.get('contracts_scanned',0) or 0}",
         f"Valid contracts: {meta.get('valid_contracts',c.get('contracts_valid',0)) or 0}",
+        f"Normalized: {c.get('contracts_normalized',0) or 0}",
+        f"Quote stage: {c.get('contracts_quote_stage',0) or 0}",
         f"Candidates: {meta.get('candidates',s.get('last_candidates',0)) or 0}",
         f"HERO: {meta.get('heroes',c.get('hero_count',0)) or 0}",
         f"STRONG: {meta.get('strong',c.get('strong_count',0)) or 0}",
@@ -431,8 +433,22 @@ def _status_text():
             f"Missing bid/ask/last: {c.get('contracts_missing_bid',0)}/{c.get('contracts_missing_ask',0)}/{c.get('contracts_missing_last',0)}",
             f"Missing volume/OI: {c.get('contracts_missing_volume',0)}/{c.get('contracts_missing_oi',0)}",
             f"Pool: {c.get('candidate_pool_size',0)}",
+            f"Zero-candidate mode: {'DATA / VALIDATION FAILURE' if not meta.get('contracts_scored',0) and not meta.get('candidates',0) and c.get('contracts_received',0) else '—'}",
         ]
-    lines += ["", "🔔 ALERT DIAGNOSTICS",
+    lines += ["", "🔎 REJECTION BREAKDOWN",
+               f"Received: {c.get('contracts_received',0)}",
+               f"Normalized: {c.get('contracts_normalized',0)}",
+               f"Expired: {c.get('expired',0)}",
+               f"DTE rejected: {c.get('rejected_dte',0)}",
+               f"Quote rejected: {c.get('missing_quote',0) + c.get('invalid_quote',0)}",
+               f"Liquidity rejected: {c.get('rejected_liquidity',0)}",
+               f"Premium rejected: {c.get('premium_too_low',0) + c.get('premium_too_high',0) + c.get('hard_premium',0)}",
+               f"Technical rejected: {c.get('rejected_momentum',0) + c.get('rejected_trend',0) + c.get('rejected_direction',0) if 'rejected_direction' in c else c.get('rejected_momentum',0) + c.get('rejected_trend',0)}",
+               f"Scored: {c.get('contracts_scored',0)}",
+               f"Bad schema: {c.get('bad_contract_schema',0)} | Missing symbol: {c.get('missing_symbol',0)} | Strike: {c.get('invalid_strike',0)}",
+               f"Missing bid/ask/last: {c.get('contracts_missing_bid',0)}/{c.get('contracts_missing_ask',0)}/{c.get('contracts_missing_last',0)}",
+               f"Zero volume/OI: {c.get('zero_volume',0)}/{c.get('zero_open_interest',0)}",
+               "", "🔔 ALERT DIAGNOSTICS",
                f"Max alerts/scan: {ad.get('max_alerts',os.getenv('MAX_ALERTS_PER_SCAN','5'))} | Cooldown: {ad.get('cooldown_seconds',os.getenv('ALERT_COOLDOWN_SECONDS','300'))}s",
                f"Eligible: {ad.get('eligible',0)} | Cooldown rejected: {ad.get('cooldown_rejected',0)} | Max-alerts rejected: {ad.get('max_alerts_rejected',0)}"]
     # Compact per-symbol health so one provider failure is visible without breaking status.
@@ -481,6 +497,9 @@ def _diagnostics_text():
         f"Phase: {phase_label(phase())}",
         f"Symbols: {(meta or {}).get('symbols_scanned',0)}",
         f"Contracts: {(meta or {}).get('contracts_scanned',0)}",
+        f"Received: {c.get('contracts_received',0)}",
+        f"Normalized: {c.get('contracts_normalized',0)}",
+        f"Quote stage: {c.get('contracts_quote_stage',0)}",
         f"Valid: {(meta or {}).get('valid_contracts',0)}",
         f"Scored: {(meta or {}).get('contracts_scored',0)}",
         f"Candidates: {(meta or {}).get('candidates',0)}",
@@ -519,7 +538,7 @@ def telegram_command_loop():
                     if not text: continue
                     cmd=text.split()[0].split('@')[0].lower()
                     if cmd in ('/start','/help'):
-                        send_message('🤖 Options Opportunity Bot V13.9\n\nAlert-only options scanner.\n/start — start\n/help — help\n/status — diagnostics\n/scan — manual scan\n/top — top setups\n/heroes — HERO setups\n/watchlist — WATCH setups\n/diagnostics — rejection diagnostics',chat_id); continue
+                        send_message('🤖 Options Opportunity Bot V14\n\nAlert-only options scanner.\n/start — start\n/help — help\n/status — diagnostics\n/scan — manual scan\n/top — top setups\n/heroes — HERO setups\n/watchlist — WATCH setups\n/diagnostics — rejection diagnostics',chat_id); continue
                     if cmd=='/privacy':
                         send_message('🔐 البوت Alert-only ولا ينفذ صفقات عبر وسيط.',chat_id); continue
                     if not allowed_chat or chat_id != allowed_chat:
@@ -565,13 +584,13 @@ def loop():
         time.sleep(interval)
 
 @app.get('/')
-def root(): return jsonify({'service':'options-opportunity-bot','version':'13.9.0','status':'ok','docs':'/health','scan':'/scan','scan_status':'/scan/status'})
+def root(): return jsonify({'service':'options-opportunity-bot','version':'14.0.0','status':'ok','docs':'/health','scan':'/scan','scan_status':'/scan/status'})
 
 @app.get('/health')
 def health():
     with lock: s=dict(state)
     s['telegram_configured']=bool(os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID')); s['scan_secret_configured']=bool(os.getenv('SCAN_SECRET')); s['provider']=provider_status(); s['telegram']=telegram_diagnostics()
-    return jsonify({'service':'options-opportunity-bot','version':'13.9.0','status':'ok','phase':phase(),'scanner':s})
+    return jsonify({'service':'options-opportunity-bot','version':'14.0.0','status':'ok','phase':phase(),'scanner':s})
 
 @app.get('/status')
 def status(): return health()
