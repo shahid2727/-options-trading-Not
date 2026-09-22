@@ -794,7 +794,7 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
     chain_root = option_underlying or symbol
     is_spxw = bool(contract_prefix and option_underlying == 'SPX')
     progress('fetching_options', symbol=chain_root)
-    chain = option_chain(chain_root, root_symbol=None)
+    chain = option_chain(chain_root, root_symbol=(contract_prefix if is_spxw else None))
     rows = chain.get('snapshots') or {}
     received = len(rows)
     qualified, scored_rows = [], []
@@ -842,7 +842,12 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
         if contract_prefix:
             root = str(details.get('root_symbol') or details.get('rootSymbol') or normalized.get('underlying') or '').upper().strip()
             if is_spxw:
-                if not (root in ('','SPX','SPXW') or str(contract).upper().startswith(('SPX','SPXW'))):
+                contract_upper = str(contract).upper().strip()
+                # SPXW is a distinct weekly root. Do not let ordinary SPX
+                # contracts leak into the SPXW result set. The Alpaca chain
+                # endpoint is requested with root_symbol=SPXW as the primary
+                # protection; this check is the defensive second layer.
+                if not (root == 'SPXW' or contract_upper.startswith('SPXW')):
                     rej['prefix'] += 1; continue
             elif not str(contract).upper().startswith(contract_prefix):
                 rej['prefix'] += 1; continue
