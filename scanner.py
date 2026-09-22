@@ -45,7 +45,9 @@ AFTER_HOURS_MIN_OI = int(os.getenv('AFTER_HOURS_MIN_OI','0'))
 AFTER_HOURS_MIN_VOL = int(os.getenv('AFTER_HOURS_MIN_VOLUME','0'))
 ALERT_COOLDOWN = int(os.getenv('ALERT_COOLDOWN_SECONDS','300'))
 HTTP_TIMEOUT = max(1, float(os.getenv('ALPACA_HTTP_TIMEOUT','8')))
+HTTP_CONNECT_TIMEOUT = max(1, float(os.getenv('ALPACA_CONNECT_TIMEOUT','3')))
 RETRIES = max(0, int(os.getenv('ALPACA_RETRIES','2')))
+STOCKS_PAGE_TIMEOUT = max(1, float(os.getenv('STOCKS_PAGE_TIMEOUT_SECONDS','12')))
 OPTIONS_PAGE_LIMIT = max(100, min(1000, int(os.getenv('OPTIONS_PAGE_LIMIT','1000'))))
 OPTIONS_MAX_PAGES = max(1, int(os.getenv('OPTIONS_MAX_PAGES','12')))
 OPTIONS_MIN_INTERVAL = max(0.05, float(os.getenv('OPTIONS_MIN_INTERVAL_SECONDS','0.20')))
@@ -139,7 +141,7 @@ def req(url, params=None, timeout=None):
     for attempt in range(RETRIES + 1):
         try:
             _pace_options_request(url)
-            r=_session.get(url, headers=headers(), params=params or {}, timeout=timeout)
+            r=_session.get(url, headers=headers(), params=params or {}, timeout=(HTTP_CONNECT_TIMEOUT, timeout))
             if r.status_code in (401, 403):
                 raise ProviderRequestError(f'Alpaca HTTP {r.status_code}', endpoint=endpoint, status_code=r.status_code, retry_count=attempt)
             if r.status_code == 429:
@@ -235,7 +237,7 @@ def adx(bars,n=14):
 
 def fetch_bars(symbol,timeframe,days=45,limit=1000):
     end_dt=datetime.now(timezone.utc); start_dt=end_dt-timedelta(days=days)
-    data=req(f'{ALPACA}/stocks/{symbol}/bars', {'timeframe':timeframe,'start':start_dt.isoformat().replace('+00:00','Z'),'end':end_dt.isoformat().replace('+00:00','Z'),'limit':limit,'feed':'iex','sort':'asc'})
+    data=req(f'{ALPACA}/stocks/{symbol}/bars', {'timeframe':timeframe,'start':start_dt.isoformat().replace('+00:00','Z'),'end':end_dt.isoformat().replace('+00:00','Z'),'limit':limit,'feed':'iex','sort':'asc'}, timeout=STOCKS_PAGE_TIMEOUT)
     return data.get('bars') or []
 
 def fetch_bars_batch(symbols,timeframe,days=45,limit=None):
@@ -261,16 +263,37 @@ def fetch_bars_batch(symbols,timeframe,days=45,limit=None):
         }
         if page_token:
             params['page_token']=page_token
-        progress('fetching_bars_page', timeframe=timeframe, page=pages+1, symbols_total=len(symbols))
-        data=req(f'{ALPACA}/stocks/bars', params)
+        page_no=pages+1
+        started=time.monotonic()
+        progress('fetching_bars_page', timeframe=timeframe, page=page_no,
+                 symbols_total=len(symbols), symbols=len(merged), state='started')
+        try:
+            data=req(f'{ALPACA}/stocks/bars', params, timeout=STOCKS_PAGE_TIMEOUT)
+        except Exception as e:
+            elapsed=round(time.monotonic()-started,2)
+            # A failed/slow page must never freeze the complete market scan.
+            # Return any data already collected and let the scanner continue
+            # with its per-symbol fallback/repair path.
+            progress('bars_page_failed', timeframe=timeframe, page=page_no,
+                     symbols=len(merged), elapsed=elapsed,
+                     error=f'{type(e).__name__}: {e}'[:400])
+            break
+        elapsed=round(time.monotonic()-started,2)
         rows=data.get('bars') or {}
+        page_rows=0
         for sym, bars in rows.items():
-            merged.setdefault(sym, []).extend(bars or [])
+            vals=bars or []
+            merged.setdefault(sym, []).extend(vals)
+            page_rows += len(vals)
         pages += 1
         page_token=data.get('next_page_token')
+        progress('fetching_bars_page', timeframe=timeframe, page=page_no,
+                 symbols=len(merged), rows=page_rows, elapsed=elapsed,
+                 state='complete', has_next=bool(page_token))
         if not page_token:
             break
-    progress('fetching_bars_page', timeframe=timeframe, page=pages, symbols=len(merged), complete=True)
+    progress('fetching_bars_complete_page', timeframe=timeframe, page=pages,
+             symbols=len(merged), pages=pages)
     return merged
 
 def _bar_dt(value):
@@ -1087,11 +1110,15 @@ def scan_all(session):
     def _fetch_period(item):
         key,(tf,days)=item
         progress('fetching_bars', timeframe=key, state='started', symbols_total=len(symbols))
+        started=time.monotonic()
         try:
             data=fetch_bars_batch(symbols,tf,days)
             return key,data,None
         except Exception as e:
             return key,{},e
+        finally:
+            progress('fetching_bars', timeframe=key, state='finished',
+                     elapsed=round(time.monotonic()-started,2))
 
     completed=0
     with ThreadPoolExecutor(max_workers=min(4,len(periods))) as ex:

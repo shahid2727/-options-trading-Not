@@ -12,7 +12,7 @@ state = {
     'last_scan': None, 'last_candidates': 0, 'last_alerts': 0, 'last_error': None,
     'last_session': 'CLOSED', 'running': True, 'scan_id': None,
     'scan_running': False, 'scan_started': None, 'scan_finished': None,
-    'scan_duration': None, 'scan_stage': 'idle', 'symbols_scanned': 0, 'contracts_scanned': 0, 'valid_contracts': 0, 'contracts_scored': 0,
+    'scan_duration': None, 'scan_stage': 'idle', 'scan_stage_started': None, 'scan_stage_elapsed': None, 'fetching_page': 0, 'fetching_page_started': None, 'symbols_scanned': 0, 'contracts_scanned': 0, 'valid_contracts': 0, 'contracts_scored': 0,
     'last_top': [], 'diagnostics': {}, 'last_alert_keys': {}, 'weak_alert_keys': {}, 'alert_snapshots': {}, 'market_warning_sent': None,
     'provider_errors': [], 'scan_process_pid': None, 'fetching_timeframe': None, 'fetching_completed': 0, 'fetching_total': 4, 'fetching_state': None, 'alert_diagnostics': {'candidates': []}, 'hero_sent_date': None
 }
@@ -116,7 +116,21 @@ def market_warning(diagnostics):
 def _apply_progress(msg):
     with lock:
         if msg.get('scan_id') and msg.get('scan_id') != state.get('scan_id'): return
-        state['scan_stage'] = msg.get('stage', state['scan_stage'])
+        new_stage = msg.get('stage', state['scan_stage'])
+        if new_stage != state.get('scan_stage'):
+            state['scan_stage_started'] = datetime.now(TZ).isoformat()
+        state['scan_stage'] = new_stage
+        if 'elapsed' in msg:
+            state['scan_stage_elapsed'] = msg.get('elapsed')
+        elif state.get('scan_stage_started'):
+            try:
+                state['scan_stage_elapsed'] = round((datetime.now(TZ)-datetime.fromisoformat(state['scan_stage_started'])).total_seconds(),1)
+            except Exception:
+                pass
+        if new_stage == 'fetching_bars_page':
+            if 'page' in msg: state['fetching_page'] = msg.get('page')
+            if msg.get('state') == 'started':
+                state['fetching_page_started'] = datetime.now(TZ).isoformat()
         for key in ('symbols_scanned','contracts_scanned','last_candidates'):
             if key in msg: state[key] = msg[key]
         # Scanner progress uses the canonical `candidates` field; the public
@@ -203,7 +217,7 @@ def _finalize_scan(p, scan_id, results, diagnostics, started_at, error=None):
     now=datetime.now(TZ)
     duration=max(0.0,(now-datetime.fromisoformat(started_at)).total_seconds())
     max_alerts=max(1,int(os.getenv('MAX_ALERTS_PER_SCAN', os.getenv('MAX_ALERTS','5')) or 5))
-    cooldown=max(300,int(os.getenv('ALERT_COOLDOWN_SECONDS','300') or 900))
+    cooldown=max(0,int(os.getenv('ALERT_COOLDOWN_SECONDS','300') or 0))
     ordered=_sorted_setups(results)
     alert_diag={
         'max_alerts':max_alerts,'cooldown_seconds':cooldown,'candidates':[],
@@ -270,7 +284,7 @@ def _finalize_scan(p, scan_id, results, diagnostics, started_at, error=None):
             alert_diag['candidates'].append(item)
 
         # Monitor previously alerted contracts for deterioration on every scan.
-        weak_cooldown=max(300,int(os.getenv('WEAK_ALERT_COOLDOWN_SECONDS','900') or 900))
+        weak_cooldown=max(0,int(os.getenv('WEAK_ALERT_COOLDOWN_SECONDS','900') or 0))
         weak_max=max(0,int(os.getenv('MAX_WEAK_ALERTS_PER_SCAN','3') or 3))
         weak_sent=0
         for x in ordered:
@@ -461,6 +475,8 @@ def _status_text():
         f"Running: {s.get('running',False)}",
         f"Scan running: {s.get('scan_running',False)}",
         f"Scan stage: {s.get('scan_stage') or '—'}",
+        f"Stage elapsed: {s.get('scan_stage_elapsed') if s.get('scan_stage_elapsed') is not None else '—'} s",
+        f"Bars page: {s.get('fetching_page') or '—'}",
         f"Scan ID: {s.get('scan_id') or '—'}",
         f"Symbols scanned: {meta.get('symbols_scanned',s.get('symbols_scanned',0)) or 0}",
         f"Contracts scanned: {meta.get('contracts_scanned',s.get('contracts_scanned',0)) or 0}",

@@ -1,0 +1,8 @@
+V14.6 FINAL FIXES
+- Applies STOCKS_PAGE_TIMEOUT_SECONDS to both multi-symbol bars pages and per-symbol bars fallback.
+- Bars page failures remain isolated and do not stop the scan.
+- Keeps SPXW independent from SPX stock-bars requests; SPY remains the technical proxy.
+- Keeps Telegram polling independent from the scanner worker.
+- Removes the hard-coded 300-second minimum from alert and weak-alert cooldowns so environment values such as 90 seconds are honored.
+- Preserves normalization, quote handling, filtering, scoring, candidate diagnostics, and alert logic.
+- Scanner worker retains a global SCAN_TIMEOUT_SECONDS safety kill.

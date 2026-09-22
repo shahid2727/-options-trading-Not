@@ -1,0 +1,7 @@
+V14.5 scanner stability fixes
+- Stock bars pagination now catches page-level provider/timeouts and returns partial data instead of blocking the scan.
+- Requests use separate connect/read timeouts.
+- Bar-page telemetry now reports start/complete/failure, elapsed seconds, page number, rows and symbols.
+- Scanner continues to per-symbol fallback/repair when multi-symbol bars fail.
+- Telegram status exposes stage elapsed time and current bars page.
+- Existing options filtering/scoring/alert logic is preserved.
