@@ -1,0 +1,10 @@
+V14.8.1 OPTIONS FEED / SCANNER STABILITY FIXES
+
+- Prevented nested Alpaca retries from multiplying option-feed wait time.
+- Options snapshot requests use zero transport retries; feed fallback handles recovery.
+- Added hard bounded option-chain timeout (30s default).
+- Reduced option-chain pages from 12 to 6 by default; configurable.
+- Reduced scanner option-chain concurrency from 8 to 4 to reduce 429/rate-limit pressure.
+- Disabled the large Trading API contracts->snapshots fallback by default because it can
+  generate hundreds of requests and stall a Render scan. It remains configurable.
+- Preserved scoring, filtering, alert, Telegram, SPXW proxy, and diagnostics logic.

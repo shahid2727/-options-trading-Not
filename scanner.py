@@ -18,7 +18,7 @@ MIN_SCORE_HERO = float(os.getenv('MIN_SCORE_HERO', os.getenv('HERO_SCORE','85'))
 MIN_SCORE_STRONG = float(os.getenv('MIN_SCORE_STRONG', os.getenv('STRONG_SCORE','70')))
 MIN_SCORE_WATCH = float(os.getenv('MIN_SCORE_WATCH', os.getenv('WATCH_SCORE','55')))
 MAX_QUOTE_AGE = int(os.getenv('MAX_QUOTE_AGE', os.getenv('QUOTE_STALE_SECONDS','300')))
-MAX_CONCURRENCY = max(1, int(os.getenv('MAX_CONCURRENCY','8')))
+MAX_CONCURRENCY = max(1, int(os.getenv('MAX_CONCURRENCY','4')))
 DEBUG_SCANNER = os.getenv('DEBUG_SCANNER','false').strip().lower() in ('1','true','yes','on')
 DEBUG_BYPASS_SCORING = os.getenv('DEBUG_BYPASS_SCORING','false').strip().lower() in ('1','true','yes','on')
 DEBUG_SAMPLE = os.getenv('DEBUG_SAMPLE','false').strip().lower() in ('1','true','yes','on')
@@ -49,12 +49,12 @@ HTTP_CONNECT_TIMEOUT = max(1, float(os.getenv('ALPACA_CONNECT_TIMEOUT','3')))
 RETRIES = max(0, int(os.getenv('ALPACA_RETRIES','2')))
 STOCKS_PAGE_TIMEOUT = max(1, float(os.getenv('STOCKS_PAGE_TIMEOUT_SECONDS','12')))
 OPTIONS_PAGE_LIMIT = max(100, min(1000, int(os.getenv('OPTIONS_PAGE_LIMIT','1000'))))
-OPTIONS_MAX_PAGES = max(1, int(os.getenv('OPTIONS_MAX_PAGES','12')))
+OPTIONS_MAX_PAGES = max(1, int(os.getenv('OPTIONS_MAX_PAGES','6')))
 OPTIONS_MIN_INTERVAL = max(0.05, float(os.getenv('OPTIONS_MIN_INTERVAL_SECONDS','0.20')))
 OPTIONS_SNAPSHOT_BATCH_SIZE = max(10, min(50, int(os.getenv('OPTIONS_SNAPSHOT_BATCH_SIZE','25'))))
 OPTIONS_FEED_RETRIES = max(0, int(os.getenv('OPTIONS_FEED_RETRIES','1')))
 OPTIONS_FEED_TIMEOUT = max(1.0, float(os.getenv('OPTIONS_FEED_TIMEOUT_SECONDS','6')))
-OPTIONS_CHAIN_TIMEOUT = max(10.0, float(os.getenv('OPTIONS_CHAIN_TIMEOUT_SECONDS','45')))
+OPTIONS_CHAIN_TIMEOUT = max(10.0, float(os.getenv('OPTIONS_CHAIN_TIMEOUT_SECONDS','30')))
 STOCKS_PAGE_LIMIT = max(100, min(10000, int(os.getenv('STOCKS_PAGE_LIMIT','10000'))))
 STOCKS_MAX_PAGES = max(1, int(os.getenv('STOCKS_MAX_PAGES','5')))
 # V13.8 setup classification / risk controls. These are soft-scoring thresholds
@@ -138,18 +138,19 @@ def _pace_options_request(url):
         _options_last_request=time.monotonic()
 
 
-def req(url, params=None, timeout=None):
+def req(url, params=None, timeout=None, retries=None):
     timeout = HTTP_TIMEOUT if timeout is None else timeout
+    max_retries = RETRIES if retries is None else max(0, int(retries))
     last=None
     endpoint=url.replace(ALPACA, '').replace(OPTIONS, '/options')
-    for attempt in range(RETRIES + 1):
+    for attempt in range(max_retries + 1):
         try:
             _pace_options_request(url)
             r=_session.get(url, headers=headers(), params=params or {}, timeout=(HTTP_CONNECT_TIMEOUT, timeout))
             if r.status_code in (401, 403):
                 raise ProviderRequestError(f'Alpaca HTTP {r.status_code}', endpoint=endpoint, status_code=r.status_code, retry_count=attempt)
             if r.status_code == 429:
-                if attempt < RETRIES:
+                if attempt < max_retries:
                     retry_after = r.headers.get('Retry-After')
                     try: delay=min(5.0, max(0.5, float(retry_after)))
                     except Exception: delay=min(5.0, 1.0 * (attempt + 1))
@@ -158,7 +159,7 @@ def req(url, params=None, timeout=None):
                     continue
                 raise ProviderRequestError('Alpaca HTTP 429 rate limited', endpoint=endpoint, status_code=429, retry_count=attempt)
             if 500 <= r.status_code <= 599:
-                if attempt < RETRIES:
+                if attempt < max_retries:
                     progress('provider_retry', endpoint=endpoint, status_code=r.status_code, retry=attempt + 1)
                     time.sleep(min(4.0, 0.8 * (attempt + 1)))
                     continue
@@ -176,21 +177,21 @@ def req(url, params=None, timeout=None):
             return data
         except ProviderRequestError as e:
             last=e
-            if e.status_code in (401,403,429) or attempt >= RETRIES:
+            if e.status_code in (401,403,429) or attempt >= max_retries:
                 raise
         except (requests.Timeout, requests.ConnectionError) as e:
             last=e
-            if attempt < RETRIES:
+            if attempt < max_retries:
                 progress('provider_retry', endpoint=endpoint, status_code='timeout/connection', retry=attempt + 1)
                 time.sleep(min(4.0, 0.8 * (attempt + 1)))
                 continue
         except requests.RequestException as e:
             last=e
-            if attempt >= RETRIES: raise ProviderRequestError(type(e).__name__, endpoint=endpoint, retry_count=attempt, cause=e)
+            if attempt >= max_retries: raise ProviderRequestError(type(e).__name__, endpoint=endpoint, retry_count=attempt, cause=e)
         except Exception as e:
             last=e
-            if attempt >= RETRIES: raise
-        if attempt < RETRIES:
+            if attempt >= max_retries: raise
+        if attempt < max_retries:
             time.sleep(min(4.0, 0.8 * (attempt + 1)))
     raise last or RuntimeError('Alpaca request failed')
 
@@ -497,7 +498,7 @@ def _option_contracts_fallback(underlying, side=None, root_symbol=None):
                     data=req(f'{OPTIONS}/snapshots', {
                         'symbols':','.join(batch),
                         'feed':feed,
-                    }, timeout=OPTIONS_FEED_TIMEOUT)
+                    }, timeout=OPTIONS_FEED_TIMEOUT, retries=0)
                     feed_used=feed
                     break
                 except Exception as e:
@@ -526,7 +527,7 @@ def _option_contracts_fallback(underlying, side=None, root_symbol=None):
             'failed_batches':failed_batches,'feed_used':feed_used}
 
 def option_chain(underlying, side=None, root_symbol=None):
-    """Fetch option snapshots with bounded feed retries and a non-blocking fallback."""
+    """Fetch option snapshots with hard bounded time/retries; never let one feed hang the scan."""
     today=datetime.now(timezone.utc).date()
     base_params={
         'limit':min(1000, OPTIONS_PAGE_LIMIT),
@@ -547,7 +548,7 @@ def option_chain(underlying, side=None, root_symbol=None):
                     remaining=max(1.0, min(OPTIONS_FEED_TIMEOUT, deadline-time.monotonic()))
                     progress('options_feed_fetch', underlying=underlying, feed=feed,
                              page=pages+1, attempt=1, timeout=round(remaining,1))
-                    data=req(f'{OPTIONS}/snapshots/{underlying}',q,timeout=remaining)
+                    data=req(f'{OPTIONS}/snapshots/{underlying}',q,timeout=remaining, retries=0)
                     rows=data.get('snapshots') or {}
                     merged.update(rows)
                     pages += 1
@@ -572,7 +573,7 @@ def option_chain(underlying, side=None, root_symbol=None):
             raise primary_error
         raise ProviderRequestError('Options feed returned no snapshots', endpoint=f'/options/snapshots/{underlying}')
     except Exception as primary_error:
-        if str(os.getenv('OPTIONS_CHAIN_FALLBACK','true')).lower() not in ('1','true','yes','on'):
+        if str(os.getenv('OPTIONS_CHAIN_FALLBACK','false')).lower() not in ('1','true','yes','on'):
             raise
         progress('options_chain_fallback', underlying=underlying, error=str(primary_error)[:300])
         try:
