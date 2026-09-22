@@ -468,6 +468,7 @@ def _status_text():
     meta=di.get('__meta__') if isinstance(di,dict) else {}
     meta=meta if isinstance(meta,dict) else {}
     c=meta.get('counters') or {}
+    diagnostic_top=list(meta.get('diagnostic_top_candidates') or meta.get('top_candidates') or s.get('last_top') or [])
     lines=[
         "🟢 BOT STATUS",
         f"Phase: {phase_label(phase())}",
@@ -498,6 +499,26 @@ def _status_text():
         f"Telegram last update: {td.get('telegram_last_update') if td.get('telegram_last_update') is not None else '—'}",
         f"Telegram last error: {td.get('telegram_last_error') or '—'}",
     ]
+    if diagnostic_top:
+        lines += ["", "🎯 TOP CANDIDATE DIAGNOSTICS"]
+        for i,x in enumerate(diagnostic_top[:10],1):
+            sc=float(x.get('score',0) or 0)
+            gap_s=x.get('score_gap_to_strong')
+            gap_h=x.get('score_gap_to_hero')
+            comps=x.get('score_component_summary') or x.get('score_components') or {}
+            comp_text=", ".join(f"{k}={float(v):.1f}" for k,v in list(comps.items())[:6] if isinstance(v,(int,float)))
+            lines.append(
+                f"{i}. {x.get('symbol','—')} {x.get('contract','—')} | {x.get('tier') or 'BELOW_WATCH'} | Score {sc:.1f}"
+            )
+            lines.append(
+                f"   Gap STRONG: {gap_s if gap_s is not None else max(0, float(os.getenv('STRONG_SCORE','70'))-sc):.1f} | Gap HERO: {gap_h if gap_h is not None else max(0, float(os.getenv('HERO_SCORE','85'))-sc):.1f} | DTE {x.get('dte','—')} | Premium ${x.get('premium','—')}"
+            )
+            lines.append(
+                f"   Dir {x.get('direction_evidence',0)} / Opp {x.get('opposite_evidence',0)} | Exp {x.get('explosive_score','—')} | Spread {x.get('spread_pct','—')}% | Vol {x.get('volume',0)} | OI {x.get('open_interest',0)}"
+            )
+            lines.append(f"   Components: {comp_text or '—'}")
+            reasons=x.get('reasons') or []
+            lines.append(f"   Why: {', '.join(reasons[:3]) or '—'}")
     if meta.get('zero_candidate_diagnostics'):
         z=meta['zero_candidate_diagnostics']
         lines += [
@@ -567,11 +588,13 @@ def _top_text(limit=10):
     for i,x in enumerate(top[:limit],1):
         lines += [
             f"{i}️⃣ {x.get('symbol','—')} {x.get('contract','—')}",
-            f"Score: {float(x.get('score',0) or 0):.1f} | Setup: {x.get('tier') or 'BELOW_WATCH'}",
+            f"Score: {float(x.get('score',0) or 0):.1f} | Setup: {x.get('tier') or 'BELOW_WATCH'} | Gap→STRONG: {x.get('score_gap_to_strong','—')} | Gap→HERO: {x.get('score_gap_to_hero','—')}",
             f"Underlying: {x.get('underlying','—')} | {x.get('signal','—')} | Strike: {x.get('strike','—')} | DTE: {x.get('dte','—')}",
             f"Premium: ${x.get('premium','—')} | Bid: {x.get('bid','—')} | Ask: {x.get('ask','—')} | Spread: {x.get('spread_pct','—')}%",
             f"Volume: {x.get('volume',0)} | OI: {x.get('open_interest',0)} | Quote: {x.get('quote_source','—')} age={x.get('quote_age_sec','—')}",
-            f"Reason: {', '.join(x.get('reasons',[])[:4]) or '—'}",
+            f"Dir/Opp: {x.get('direction_evidence',0)}/{x.get('opposite_evidence',0)} | Explosive: {x.get('explosive_score','—')} | Regime: {x.get('market_regime','—')}",
+            f"Components: {', '.join(f'{k}={float(v):.1f}' for k,v in list((x.get('score_component_summary') or x.get('score_components') or {}).items())[:6] if isinstance(v,(int,float))) or '—'}",
+            f"Reason: {', '.join(x.get('reasons',[])[:5]) or '—'}",
             ""
         ]
     return "\n".join(lines).strip()

@@ -1075,14 +1075,25 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
         if tier: qualified.append(item)
 
     scored_rows.sort(key=lambda x:(float(x.get('score') or 0),float(x.get('explosive_score') or 0),float(x.get('volume') or 0),float(x.get('open_interest') or 0)),reverse=True)
+    # Keep a richer global diagnostic pool so /top and /status can explain why
+    # the best contracts stopped at WATCH instead of forcing scoring changes.
+    top_n=max(10,int(os.getenv('TOP_DIAGNOSTIC_COUNT','10')))
     top_pool=scored_rows[:max(3,int(os.getenv('TOP_POOL_PER_UNDERLYING','3')))]
+    diagnostic_pool=scored_rows[:top_n]
+    for row in diagnostic_pool:
+        sc=float(row.get('score') or 0)
+        row['score_gap_to_strong']=round(max(0.0,STRONG_SCORE-sc),1)
+        row['score_gap_to_hero']=round(max(0.0,HERO_SCORE-sc),1)
+        comps=row.get('score_components') or {}
+        row['score_component_summary']={k:round(float(v),1) for k,v in comps.items() if isinstance(v,(int,float))}
+        row['diagnostic_next_tier']='HERO' if sc < HERO_SCORE and sc >= STRONG_SCORE else ('STRONG' if sc < STRONG_SCORE and sc >= WATCH_SCORE else ('WATCH' if sc >= WATCH_SCORE else 'BELOW_WATCH'))
     no_setup_reasons=[]
     if not rows: no_setup_reasons.append('No option-chain contracts returned')
     if normalized_count==0: no_setup_reasons.append('No contracts passed normalization')
     if quote_stage==0 and normalized_count>0: no_setup_reasons.append('No contracts reached quote stage')
     if quote_with_data==0 and quote_stage>0: no_setup_reasons.append('No usable quotes')
     if potential and not qualified: no_setup_reasons.append('Contracts scored but none reached WATCH threshold')
-    diag={'chain_items':received,'contracts_received':received,'normalized':normalized_count,'potential_setups':potential,'scored':len([x for x in scored_rows if x.get('score') is not None]),'quote_stage':quote_stage,'quotes_received':quotes_received,'scored_rows':len(scored_rows),'rejections':rej,'quote_metrics':{'with_data':quote_with_data,'fresh':quote_fresh,'stale':quote_stale,'bid_present':bid_present,'ask_present':ask_present,'last_present':last_present,'volume_present':volume_present,'oi_present':oi_present},'no_setup_reasons':no_setup_reasons,'chain_fallback':bool(chain.get('fallback')),'chain_pages':chain.get('pages',0),'contracts_discovered':chain.get('contracts_discovered',0),'primary_chain_error':chain.get('primary_error'),'underlying':chain_root,'option_source':'Alpaca options '+str(chain.get('feed_used') or os.getenv('ALPACA_OPTIONS_FEED','indicative')),'top_candidates':top_pool,'tier_counts':tier_counts,'dte_rejected':dte_rejected,'feed_used':chain.get('feed_used')}
+    diag={'chain_items':received,'contracts_received':received,'normalized':normalized_count,'potential_setups':potential,'scored':len([x for x in scored_rows if x.get('score') is not None]),'quote_stage':quote_stage,'quotes_received':quotes_received,'scored_rows':len(scored_rows),'rejections':rej,'quote_metrics':{'with_data':quote_with_data,'fresh':quote_fresh,'stale':quote_stale,'bid_present':bid_present,'ask_present':ask_present,'last_present':last_present,'volume_present':volume_present,'oi_present':oi_present},'no_setup_reasons':no_setup_reasons,'chain_fallback':bool(chain.get('fallback')),'chain_pages':chain.get('pages',0),'contracts_discovered':chain.get('contracts_discovered',0),'primary_chain_error':chain.get('primary_error'),'underlying':chain_root,'option_source':'Alpaca options '+str(chain.get('feed_used') or os.getenv('ALPACA_OPTIONS_FEED','indicative')),'top_candidates':top_pool,'diagnostic_top_candidates':diagnostic_pool,'tier_counts':tier_counts,'dte_rejected':dte_rejected,'feed_used':chain.get('feed_used')}
     # Authoritative tier counts come from the actual qualified rows. This avoids
     # any counter drift if a row is classified after the local counter update.
     tier_counts = {

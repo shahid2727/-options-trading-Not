@@ -1,0 +1,22 @@
+V14.7 CANDIDATE DIAGNOSTICS
+
+Based on V14.6 FINAL FIXES. This release does NOT change the scoring thresholds or
+market filters. It adds richer diagnostics so the best scored contracts can be
+inspected before any scoring changes are made.
+
+Added:
+- Top 10 diagnostic candidates retained after scoring.
+- Score gap to STRONG and HERO.
+- Score component summary.
+- Direction vs opposite evidence.
+- Explosive score, DTE, premium, spread, volume and OI in diagnostics.
+- /status now shows TOP CANDIDATE DIAGNOSTICS.
+- /top now shows score gaps and score components.
+
+Existing V14.6 fixes are retained:
+- Bars page timeout/retry handling.
+- Per-symbol continuation on provider failures.
+- SPXW independent scanning with SPY technical proxy.
+- Telegram polling independence.
+- Environment-controlled alert cooldown without forced 300s minimum.
+- Existing normalization, quote, filter, scoring and alert logic preserved.
