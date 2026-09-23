@@ -801,10 +801,39 @@ def _quote_timestamp(snap, quote, trade):
     return None
 
 
-def _classify(score, positive, opposite, risk_flags=None):
-    risk_flags = risk_flags or []
-    # Direction evidence influences score, but does not silently delete candidates.
-    if score >= HERO_SCORE and not risk_flags:
+def _classify(score, positive, opposite, risk_flags=None, explosive_score=0.0):
+    """Classify a setup without making every secondary imperfection fatal.
+
+    HERO has two routes:
+      1) the normal high-composite-score route;
+      2) a momentum/explosive route for setups with strong real-time
+         acceleration + volume/breakout evidence.
+
+    Wide spreads, stale quotes and genuinely thin liquidity still block HERO.
+    """
+    risk_flags = list(risk_flags or [])
+    hero_blockers = {'wide spread', 'thin option liquidity', 'stale quote'}
+    severe_risk = any(x in hero_blockers for x in risk_flags)
+
+    # Normal HERO: strong composite score with clear directional evidence.
+    normal_hero = (
+        score >= HERO_SCORE
+        and positive >= WATCH_MIN_DIRECTION
+        and opposite <= max(2, positive)
+        and not severe_risk
+    )
+
+    # Momentum HERO: allows a slightly lower composite score when the
+    # dedicated explosive detector independently confirms the setup.
+    momentum_hero = (
+        score >= 75.0
+        and explosive_score >= max(78.0, EXPLOSIVE_MIN_SCORE)
+        and positive >= WATCH_MIN_DIRECTION
+        and opposite <= max(3, positive + 1)
+        and not severe_risk
+    )
+
+    if normal_hero or momentum_hero:
         return 'HERO'
     if score >= STRONG_SCORE:
         return 'STRONG'
@@ -1056,7 +1085,9 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
         elif premium>preferred_cap: reasons.append('High premium — capital intensive')
         if explosive_score>=EXPLOSIVE_MIN_SCORE and m['regime'] not in ('SIDEWAYS','CHOPPY'):
             reasons.append('💥 Momentum/volume expansion setup'); reasons.extend(explosive_flags)
-        tier=_classify(score,positive,opposite,risk_flags if score>=HERO_SCORE else [])
+        tier=_classify(score,positive,opposite,risk_flags,explosive_score)
+        if tier == 'HERO' and score < HERO_SCORE and explosive_score >= max(78.0, EXPLOSIVE_MIN_SCORE):
+            reasons.append('🏆 HERO — explosive momentum route')
         if REQUIRE_4H_ALIGNMENT and not a4:
             if tier=='HERO': tier='STRONG'
             elif tier=='STRONG': tier='WATCH'
@@ -1080,7 +1111,20 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
         else: u_stop=u_tp1=u_tp2=u_tp3=projected_underlying=None; underlying_move=0
         projected_premium=max(0.01,premium+abs(delta)*underlying_move) if underlying_move>0 and abs(delta)>0 else None
         projected_upside_pct=round(max(0,(projected_premium/premium-1)*100),1) if projected_premium is not None else None
-        risk=max(((ask-bid)*1.5 if bid is not None and ask is not None and bid>0 and ask>0 else premium*0.20),0.05); stop=round(max(0.01,entry-risk),2); tp1=round(entry+risk,2); tp2=round(entry+2*risk,2); tp3=round(entry+3*risk,2)
+        risk=max(((ask-bid)*1.5 if bid is not None and ask is not None and bid>0 and ask>0 else premium*0.20),0.05); stop=round(max(0.01,entry-risk),2)
+        # Profit targets are percentage-based and intentionally >20% for every viable option.
+        # Use cent-ceiling so rounding can never turn a requested >20% target into <=20%.
+        import math
+        def _pct_target(pct):
+            raw=entry*(1.0+pct/100.0)
+            cents=max(0.01, math.ceil(raw*100.0-1e-9)/100.0)
+            # Ensure the rounded target is strictly above +20% whenever price granularity allows.
+            if pct>20 and cents <= entry*1.20:
+                cents=math.ceil((entry*1.20+0.000001)*100.0)/100.0
+            return round(cents,2)
+        tp1=max(_pct_target(25), round(entry+risk,2))
+        tp2=max(_pct_target(50), round(entry+2*risk,2), round(tp1+0.01,2))
+        tp3=max(_pct_target(100), round(entry+3*risk,2), round(tp2+0.01,2))
         contracts=max(0,int(RISK//(risk*100))); max_loss=round(risk*100*contracts,2); reward1=round(max(0,tp1-entry)*100*contracts,2); reward2=round(max(0,tp2-entry)*100*contracts,2); reward3=round(max(0,tp3-entry)*100*contracts,2)
         confidence=round(min(97,max(50,score*.92)),0)
         trend4='BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL'; trend1='BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL'; trend15='BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL'; trend5='BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL'

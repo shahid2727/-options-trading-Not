@@ -34,18 +34,39 @@ def diagnostics():
 def mark_polling_running(running=True):
     _set_diag(telegram_running=bool(running), telegram_polling=bool(running))
 
+def _split_telegram_text(text, limit=3800):
+    """Split long Telegram messages safely below Telegram's 4096-char limit."""
+    text = str(text or '')
+    if len(text) <= limit:
+        return [text]
+    parts = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < 500:
+            cut = limit
+        parts.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    if text:
+        parts.append(text)
+    return parts
+
 def send_message(text, chat_id=None):
     token = _token(); chat = chat_id or os.getenv('TELEGRAM_CHAT_ID')
     if not token or not chat:
         _set_diag(telegram_last_error='Telegram not configured')
         return False
     try:
-        r = _client().post(API.format(token, 'sendMessage'), json={'chat_id': chat, 'text': text}, timeout=10)
-        if not r.ok:
-            _set_diag(telegram_last_error=f'HTTP {r.status_code}: sendMessage')
-            return False
-        _set_diag(telegram_last_error=None)
-        return True
+        ok = True
+        parts = _split_telegram_text(text)
+        for part in parts:
+            r = _client().post(API.format(token, 'sendMessage'), json={'chat_id': chat, 'text': part}, timeout=10)
+            if not r.ok:
+                _set_diag(telegram_last_error=f'HTTP {r.status_code}: sendMessage')
+                ok = False
+                break
+        if ok:
+            _set_diag(telegram_last_error=None)
+        return ok
     except Exception as e:
         _set_diag(telegram_last_error=f'{type(e).__name__}: {e}')
         return False
