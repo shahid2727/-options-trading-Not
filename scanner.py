@@ -7,7 +7,7 @@ import requests
 ALPACA = 'https://data.alpaca.markets/v2'
 OPTIONS = 'https://data.alpaca.markets/v1beta1/options'
 STOCKS = [s.strip().upper() for s in os.getenv('STOCK_SYMBOLS','QQQ,NVDA,AMD,TSLA,AAPL,AMZN,META,MSFT,GOOGL,MU,AVGO,PLTR,SMCI,SPY,IWM').split(',') if s.strip()]
-INDEX_ROOTS = [s.strip().upper() for s in os.getenv('INDEX_ROOTS','SPXW').split(',') if s.strip()]
+INDEX_ROOTS = [s.strip().upper() for s in os.getenv('INDEX_ROOTS','SPXW,NDX,NDXP').split(',') if s.strip()]
 RISK = float(os.getenv('RISK_BUDGET','100'))
 MIN_PREMIUM = float(os.getenv('MIN_PREMIUM','0.05')); MAX_PREMIUM = float(os.getenv('MAX_PREMIUM','20.00'))
 # V14.3.1 scoring/config aliases. Existing V13.8 names remain supported.
@@ -801,39 +801,10 @@ def _quote_timestamp(snap, quote, trade):
     return None
 
 
-def _classify(score, positive, opposite, risk_flags=None, explosive_score=0.0):
-    """Classify a setup without making every secondary imperfection fatal.
-
-    HERO has two routes:
-      1) the normal high-composite-score route;
-      2) a momentum/explosive route for setups with strong real-time
-         acceleration + volume/breakout evidence.
-
-    Wide spreads, stale quotes and genuinely thin liquidity still block HERO.
-    """
-    risk_flags = list(risk_flags or [])
-    hero_blockers = {'wide spread', 'thin option liquidity', 'stale quote'}
-    severe_risk = any(x in hero_blockers for x in risk_flags)
-
-    # Normal HERO: strong composite score with clear directional evidence.
-    normal_hero = (
-        score >= HERO_SCORE
-        and positive >= WATCH_MIN_DIRECTION
-        and opposite <= max(2, positive)
-        and not severe_risk
-    )
-
-    # Momentum HERO: allows a slightly lower composite score when the
-    # dedicated explosive detector independently confirms the setup.
-    momentum_hero = (
-        score >= 75.0
-        and explosive_score >= max(78.0, EXPLOSIVE_MIN_SCORE)
-        and positive >= WATCH_MIN_DIRECTION
-        and opposite <= max(3, positive + 1)
-        and not severe_risk
-    )
-
-    if normal_hero or momentum_hero:
+def _classify(score, positive, opposite, risk_flags=None):
+    risk_flags = risk_flags or []
+    # Direction evidence influences score, but does not silently delete candidates.
+    if score >= HERO_SCORE and not risk_flags:
         return 'HERO'
     if score >= STRONG_SCORE:
         return 'STRONG'
@@ -1077,7 +1048,10 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
         risk_flags=[]
         if spread is not None and spread>max(MAX_SPREAD,RELAXED_MAX_SPREAD): risk_flags.append('wide spread')
         if (vol or 0)<MIN_VOL and (oi or 0)<MIN_OI: risk_flags.append('thin option liquidity')
-        if stale: risk_flags.append('stale quote')
+        # Staleness is surfaced as a data-quality warning, but is not mixed
+        # into the setup-quality tier calculation. Alert dispatch must still
+        # enforce freshness separately before sending an actionable entry.
+        if stale: reasons.append('⚠️ Quote stale/undated — verify live price before entry')
         if not greeks_available: reasons.append('Greeks unavailable — neutral score treatment')
         if vol is None: reasons.append('Volume unavailable — neutral score treatment')
         if oi is None: reasons.append('Open interest unavailable — neutral score treatment')
@@ -1085,9 +1059,7 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
         elif premium>preferred_cap: reasons.append('High premium — capital intensive')
         if explosive_score>=EXPLOSIVE_MIN_SCORE and m['regime'] not in ('SIDEWAYS','CHOPPY'):
             reasons.append('💥 Momentum/volume expansion setup'); reasons.extend(explosive_flags)
-        tier=_classify(score,positive,opposite,risk_flags,explosive_score)
-        if tier == 'HERO' and score < HERO_SCORE and explosive_score >= max(78.0, EXPLOSIVE_MIN_SCORE):
-            reasons.append('🏆 HERO — explosive momentum route')
+        tier=_classify(score,positive,opposite,risk_flags if score>=HERO_SCORE else [])
         if REQUIRE_4H_ALIGNMENT and not a4:
             if tier=='HERO': tier='STRONG'
             elif tier=='STRONG': tier='WATCH'
@@ -1111,20 +1083,7 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
         else: u_stop=u_tp1=u_tp2=u_tp3=projected_underlying=None; underlying_move=0
         projected_premium=max(0.01,premium+abs(delta)*underlying_move) if underlying_move>0 and abs(delta)>0 else None
         projected_upside_pct=round(max(0,(projected_premium/premium-1)*100),1) if projected_premium is not None else None
-        risk=max(((ask-bid)*1.5 if bid is not None and ask is not None and bid>0 and ask>0 else premium*0.20),0.05); stop=round(max(0.01,entry-risk),2)
-        # Profit targets are percentage-based and intentionally >20% for every viable option.
-        # Use cent-ceiling so rounding can never turn a requested >20% target into <=20%.
-        import math
-        def _pct_target(pct):
-            raw=entry*(1.0+pct/100.0)
-            cents=max(0.01, math.ceil(raw*100.0-1e-9)/100.0)
-            # Ensure the rounded target is strictly above +20% whenever price granularity allows.
-            if pct>20 and cents <= entry*1.20:
-                cents=math.ceil((entry*1.20+0.000001)*100.0)/100.0
-            return round(cents,2)
-        tp1=max(_pct_target(25), round(entry+risk,2))
-        tp2=max(_pct_target(50), round(entry+2*risk,2), round(tp1+0.01,2))
-        tp3=max(_pct_target(100), round(entry+3*risk,2), round(tp2+0.01,2))
+        risk=max(((ask-bid)*1.5 if bid is not None and ask is not None and bid>0 and ask>0 else premium*0.20),0.05); stop=round(max(0.01,entry-risk),2); tp1=round(entry+risk,2); tp2=round(entry+2*risk,2); tp3=round(entry+3*risk,2)
         contracts=max(0,int(RISK//(risk*100))); max_loss=round(risk*100*contracts,2); reward1=round(max(0,tp1-entry)*100*contracts,2); reward2=round(max(0,tp2-entry)*100*contracts,2); reward3=round(max(0,tp3-entry)*100*contracts,2)
         confidence=round(min(97,max(50,score*.92)),0)
         trend4='BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL'; trend1='BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL'; trend15='BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL'; trend5='BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL'
@@ -1255,22 +1214,35 @@ def scan_all(session):
             if err is not None:
                 progress('symbol_error',symbol=sym,error=str(err)[:300])
 
-    # SPXW is scanned independently using SPY only for technical context.
-    # SPX itself is an index and is never requested from the IEX stock-bars API.
-    if 'SPXW' in INDEX_ROOTS:
+    # Index options are scanned separately: use a liquid ETF for technical
+    # context, but request option chains for the actual index underlying.
+    # Provider entitlements still apply; failures are recorded per root.
+    index_specs = {
+        'SPXW': ('SPY', 'SPX'),
+        'NDX': ('QQQ', 'NDX'),
+        'NDXP': ('QQQ', 'NDX'),
+    }
+    for root in INDEX_ROOTS:
+        if root not in index_specs:
+            diagnostics[root] = {'error': 'Unsupported index root; configure SPXW, NDX, or NDXP', 'provider': 'Alpaca'}
+            continue
+        proxy, option_symbol = index_specs[root]
         try:
-            progress('underlying_scan',symbol='SPXW',state='started',proxy='SPY')
-            proxy_caches={k:dict(v or {}) for k,v in caches.items()}
-            r,d=scan_underlying('SPY',session,contract_prefix='SPXW',caches=proxy_caches,option_underlying='SPX')
+            progress('underlying_scan', symbol=root, state='started', proxy=proxy, option_underlying=option_symbol)
+            proxy_caches = {k: dict(v or {}) for k, v in caches.items()}
+            r, d = scan_underlying(proxy, session, contract_prefix=root, caches=proxy_caches,
+                                   option_underlying=option_symbol)
             for x in r:
-                x['symbol']='SPXW'; x['indicator_proxy']='SPY'; x['option_underlying']='SPX'
+                x['symbol'] = root
+                x['indicator_proxy'] = proxy
+                x['option_underlying'] = option_symbol
             results.extend(r)
-            diagnostics['SPXW']=d
+            diagnostics[root] = d
         except Exception as e:
-            diagnostics['SPXW']={'error':f'{type(e).__name__}: {e}','provider':'Alpaca',
-                'endpoint':getattr(e,'endpoint',''),'status_code':getattr(e,'status_code',None),
-                'retry_count':getattr(e,'retry_count',None),'detail':repr(e)}
-            progress('symbol_error',symbol='SPXW',error=str(e)[:300])
+            diagnostics[root] = {'error': f'{type(e).__name__}: {e}', 'provider': 'Alpaca',
+                'endpoint': getattr(e, 'endpoint', ''), 'status_code': getattr(e, 'status_code', None),
+                'retry_count': getattr(e, 'retry_count', None), 'detail': repr(e)}
+            progress('symbol_error', symbol=root, error=str(e)[:300])
 
     progress('scoring_complete', candidates=len(results))
     tier_rank={'HERO':4,'STRONG':3,'WATCH':2,'MOONSHOT':1}
