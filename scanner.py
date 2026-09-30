@@ -7,7 +7,7 @@ import requests
 ALPACA = 'https://data.alpaca.markets/v2'
 OPTIONS = 'https://data.alpaca.markets/v1beta1/options'
 STOCKS = [s.strip().upper() for s in os.getenv('STOCK_SYMBOLS','QQQ,NVDA,AMD,TSLA,AAPL,AMZN,META,MSFT,GOOGL,MU,AVGO,PLTR,SMCI,SPY,IWM').split(',') if s.strip()]
-INDEX_ROOTS = [s.strip().upper() for s in os.getenv('INDEX_ROOTS','SPXW,NDX,NDXP').split(',') if s.strip()]
+INDEX_ROOTS = [s.strip().upper() for s in os.getenv('INDEX_ROOTS','SPXW,NDX').split(',') if s.strip()]
 RISK = float(os.getenv('RISK_BUDGET','100'))
 MIN_PREMIUM = float(os.getenv('MIN_PREMIUM','0.05')); MAX_PREMIUM = float(os.getenv('MAX_PREMIUM','20.00'))
 # V14.3.1 scoring/config aliases. Existing V13.8 names remain supported.

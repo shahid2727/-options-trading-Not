@@ -649,12 +649,20 @@ def _find_setup(query):
     meta=di.get('__meta__') if isinstance(di,dict) else {}
     pool += list((meta or {}).get('top_candidates') or [])
     seen=set()
+    matches=[]
     for x in pool:
         key=str(x.get('contract','')).upper()
-        if key in seen: continue
+        sym=str(x.get('symbol','')).upper()
+        if not key or key in seen: continue
         seen.add(key)
-        if q in (key, str(x.get('symbol','')).upper()) or q==str(x.get('contract','')).upper():
+        if q == key:
             return x
+        if q == sym or (len(q) >= 2 and q in sym):
+            matches.append(x)
+    if matches:
+        # A ticker/company query should return its strongest available scanned setup.
+        matches.sort(key=lambda item:(float(item.get('score') or 0),float(item.get('explosive_score') or 0)),reverse=True)
+        return matches[0]
     return None
 
 def _analysis_text(x):
@@ -699,6 +707,13 @@ def telegram_command_loop():
                     text=(msg.get('text') or '').strip()
                     if not text: continue
                     cmd=text.split()[0].split('@')[0].lower()
+                    # Accept natural-language analysis requests as well as slash commands.
+                    if not cmd.startswith('/') and any(word in text.lower() for word in ('حلل','تحليل','analyze','analysis')):
+                        parts=text.split()
+                        arg=parts[-1] if len(parts)>1 else ''
+                        result=_find_setup(arg)
+                        send_message(_analysis_text(result) if result else f'لا توجد فرصة ممسوحة حاليًا للرمز {arg}. شغّل /scan ثم أعد طلب التحليل، أو أرسل رمز العقد كاملًا.',chat_id)
+                        continue
                     if cmd in ('/start','/help'):
                         send_message('🤖 Options Opportunity Bot V14\n\nAlert-only options scanner.\n/start — start\n/help — help\n/status — diagnostics\n/scan — manual scan\n/top — top setups\n/heroes — HERO setups\n/watchlist — WATCH setups\n/diagnostics — rejection diagnostics\n/analyze CONTRACT — detailed contract analysis\n/analysis CONTRACT — same as /analyze',chat_id); continue
                     if cmd=='/privacy':
