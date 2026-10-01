@@ -650,7 +650,7 @@ def _find_setup(query):
         'MICROSOFT': 'MSFT', 'مايكروسوفت': 'MSFT', 'GOOGLE': 'GOOGL', 'قوقل': 'GOOGL', 'جوجل': 'GOOGL', 'ALPHABET': 'GOOGL',
         'META PLATFORMS': 'META', 'FACEBOOK': 'META', 'ميتا': 'META', 'فيسبوك': 'META', 'ADVANCED MICRO DEVICES': 'AMD',
         'AMD': 'AMD', 'PALANTIR': 'PLTR', 'BROADCOM': 'AVGO', 'MICRON': 'MU',
-        'INTEL': 'INTC', 'NETFLIX': 'NFLX', 'QQQ': 'QQQ', 'SPY': 'SPY',
+        'BLOOM ENERGY': 'BE', 'BE': 'BE', 'INTEL': 'INTC', 'NETFLIX': 'NFLX', 'QQQ': 'QQQ', 'SPY': 'SPY',
         'RUSSELL 2000': 'IWM', 'IWM': 'IWM', 'ناسداك': 'NDX', 'ناسداك 100': 'NDX', 'ستاندرد اند بورز': 'SPXW'
     }
     q = aliases.get(q, q)
