@@ -47,3 +47,9 @@ V14 separates chain receipt, contract normalization, quote-stage validation, and
 
 
 V14.8: bounded options-feed retries, batch sizing, per-request timeout, overall chain deadline, partial-batch fallback, and feed telemetry. Scoring thresholds unchanged.
+
+## V14.8.2 reviewed fixes
+- Improved Telegram analysis parsing for Arabic requests such as `حلل شركة تسلا` and `تحليل ناسداك`, as well as plain ticker/company-name requests.
+- Added common company-name aliases (Tesla, Apple, NVIDIA, Amazon, etc.) and index aliases (NASDAQ/NDX, S&P 500/SPXW).
+- Analysis searches both scored candidates and diagnostic candidates from the latest scan, reducing false `Contract not found` responses.
+- Kept SPXW and NDX index-chain scanning enabled by default (`INDEX_ROOTS=SPXW,NDX`). Actual availability still depends on Alpaca credentials, feed entitlements, and returned market data; check `/diagnostics` for provider errors.

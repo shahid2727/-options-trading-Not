@@ -1,4 +1,4 @@
-import os, threading, time, uuid, multiprocessing
+import os, threading, time, uuid, multiprocessing, re
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request
@@ -641,29 +641,42 @@ def _diagnostics_text():
 
 
 def _find_setup(query):
-    q=str(query or '').strip().upper()
+    """Find a scanned setup by OCC contract, ticker, or common company name."""
+    q = str(query or '').strip().upper()
+    aliases = {
+        'NASDAQ': 'NDX', 'NASDAQ 100': 'NDX', 'NASDAQ100': 'NDX', 'NDX': 'NDX',
+        'SPX': 'SPXW', 'SPXW': 'SPXW', 'S&P 500': 'SPXW', 'SP500': 'SPXW',
+        'TESLA': 'TSLA', 'تسلا': 'TSLA', 'APPLE': 'AAPL', 'ابل': 'AAPL', 'آبل': 'AAPL', 'AMAZON': 'AMZN', 'أمازون': 'AMZN', 'امازون': 'AMZN', 'NVIDIA': 'NVDA', 'انفيديا': 'NVDA', 'إنفيديا': 'NVDA',
+        'MICROSOFT': 'MSFT', 'مايكروسوفت': 'MSFT', 'GOOGLE': 'GOOGL', 'قوقل': 'GOOGL', 'جوجل': 'GOOGL', 'ALPHABET': 'GOOGL',
+        'META PLATFORMS': 'META', 'FACEBOOK': 'META', 'ميتا': 'META', 'فيسبوك': 'META', 'ADVANCED MICRO DEVICES': 'AMD',
+        'AMD': 'AMD', 'PALANTIR': 'PLTR', 'BROADCOM': 'AVGO', 'MICRON': 'MU',
+        'INTEL': 'INTC', 'NETFLIX': 'NFLX', 'QQQ': 'QQQ', 'SPY': 'SPY',
+        'RUSSELL 2000': 'IWM', 'IWM': 'IWM', 'ناسداك': 'NDX', 'ناسداك 100': 'NDX', 'ستاندرد اند بورز': 'SPXW'
+    }
+    q = aliases.get(q, q)
     with lock:
-        top=list(state.get('last_top') or [])
-        di=dict(state.get('diagnostics') or {})
-    pool=list(top)
-    meta=di.get('__meta__') if isinstance(di,dict) else {}
-    pool += list((meta or {}).get('top_candidates') or [])
-    seen=set()
-    matches=[]
-    for x in pool:
-        key=str(x.get('contract','')).upper()
-        sym=str(x.get('symbol','')).upper()
-        if not key or key in seen: continue
+        top = list(state.get('last_top') or [])
+        di = dict(state.get('diagnostics') or {})
+    pool = list(top)
+    meta = di.get('__meta__') if isinstance(di, dict) else {}
+    for source in (meta or {}).get('top_candidates') or [], (meta or {}).get('diagnostic_top_candidates') or []:
+        pool.extend(source)
+    seen, matches = set(), []
+    for item in pool:
+        key = str(item.get('contract', '')).upper()
+        sym = str(item.get('symbol', '')).upper()
+        if not key or key in seen:
+            continue
         seen.add(key)
         if q == key:
-            return x
+            return item
         if q == sym or (len(q) >= 2 and q in sym):
-            matches.append(x)
+            matches.append(item)
     if matches:
-        # A ticker/company query should return its strongest available scanned setup.
-        matches.sort(key=lambda item:(float(item.get('score') or 0),float(item.get('explosive_score') or 0)),reverse=True)
+        matches.sort(key=lambda item: (float(item.get('score') or 0), float(item.get('explosive_score') or 0)), reverse=True)
         return matches[0]
     return None
+
 
 def _analysis_text(x):
     if not x: return "🔎 CONTRACT ANALYSIS\nContract not found in the latest scan. Use /top first or provide a contract that appeared in the latest scan."
@@ -708,12 +721,22 @@ def telegram_command_loop():
                     if not text: continue
                     cmd=text.split()[0].split('@')[0].lower()
                     # Accept natural-language analysis requests as well as slash commands.
-                    if not cmd.startswith('/') and any(word in text.lower() for word in ('حلل','تحليل','analyze','analysis')):
-                        parts=text.split()
-                        arg=parts[-1] if len(parts)>1 else ''
-                        result=_find_setup(arg)
-                        send_message(_analysis_text(result) if result else f'لا توجد فرصة ممسوحة حاليًا للرمز {arg}. شغّل /scan ثم أعد طلب التحليل، أو أرسل رمز العقد كاملًا.',chat_id)
-                        continue
+                    if not cmd.startswith('/'):
+                        lower = text.lower()
+                        intent_words = ('حلل', 'تحليل', 'analyze', 'analysis')
+                        if any(word in lower for word in intent_words):
+                            arg = text
+                            for word in intent_words:
+                                arg = re.sub(re.escape(word), ' ', arg, flags=re.IGNORECASE)
+                            arg = re.sub(r'\b(شركة|سهم|عقد|للشركة|عن|لي|من|فضلاً|لو|ممكن|ابي|أبي|ابغى|أبغى)\b', ' ', arg, flags=re.IGNORECASE).strip(' :،-')
+                            arg = re.sub(r'\s+', ' ', arg).strip()
+                            result = _find_setup(arg)
+                            send_message(_analysis_text(result) if result else f'لم أجد فرصة للرمز/الشركة: {arg or text}. تأكد من الرمز وشغّل /scan ثم أعد المحاولة.', chat_id)
+                            continue
+                        # Also accept a bare ticker or company name as a convenient analysis request.
+                        if _find_setup(text):
+                            send_message(_analysis_text(_find_setup(text)), chat_id)
+                            continue
                     if cmd in ('/start','/help'):
                         send_message('🤖 Options Opportunity Bot V14\n\nAlert-only options scanner.\n/start — start\n/help — help\n/status — diagnostics\n/scan — manual scan\n/top — top setups\n/heroes — HERO setups\n/watchlist — WATCH setups\n/diagnostics — rejection diagnostics\n/analyze CONTRACT — detailed contract analysis\n/analysis CONTRACT — same as /analyze',chat_id); continue
                     if cmd=='/privacy':
