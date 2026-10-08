@@ -8,15 +8,23 @@ ALPACA = 'https://data.alpaca.markets/v2'
 OPTIONS = 'https://data.alpaca.markets/v1beta1/options'
 STOCKS = [s.strip().upper() for s in os.getenv('STOCK_SYMBOLS','QQQ,NVDA,AMD,TSLA,AAPL,AMZN,META,MSFT,GOOGL,MU,AVGO,PLTR,SMCI,SPY,IWM').split(',') if s.strip()]
 INDEX_ROOTS = [s.strip().upper() for s in os.getenv('INDEX_ROOTS','SPXW,NDX').split(',') if s.strip()]
+DEFAULT_STOCKS = ['SPY','QQQ','IWM','NVDA','AMD','TSLA','AAPL','AMZN','META','MSFT','GOOGL','MU','AVGO','PLTR','SMCI']
+COMPANY_ALIASES = {
+    'TESLA':'TSLA','APPLE':'AAPL','AMAZON':'AMZN','NVIDIA':'NVDA','MICROSOFT':'MSFT','GOOGLE':'GOOGL','ALPHABET':'GOOGL',
+    'META PLATFORMS':'META','FACEBOOK':'META','ADVANCED MICRO DEVICES':'AMD','PALANTIR':'PLTR','BROADCOM':'AVGO','MICRON':'MU',
+    'BLOOM ENERGY':'BE','BLOOM':'BE','BERKSHIRE':'BRK.B','NETFLIX':'NFLX','INTEL':'INTC','SUPERMICRO':'SMCI',
+    'NASDAQ':'NDX','NASDAQ 100':'NDX','NASDAQ100':'NDX','ناسداك':'NDX','ناسداك 100':'NDX',
+    'S&P 500':'SPXW','SP500':'SPXW','SPX':'SPXW','ستاندرد اند بورز':'SPXW',
+}
 RISK = float(os.getenv('RISK_BUDGET','100'))
-MIN_PREMIUM = float(os.getenv('MIN_PREMIUM','0.05')); MAX_PREMIUM = float(os.getenv('MAX_PREMIUM','20.00'))
+MIN_PREMIUM = float(os.getenv('MIN_PREMIUM','0.20')); MAX_PREMIUM = float(os.getenv('MAX_PREMIUM','5.00'))
 # V14.3.1 scoring/config aliases. Existing V13.8 names remain supported.
 MIN_OPTION_VOLUME = int(os.getenv('MIN_OPTION_VOLUME', os.getenv('MIN_VOLUME','5')))
 MIN_OPEN_INTEREST = int(os.getenv('MIN_OPEN_INTEREST', os.getenv('MIN_OI','10')))
-MAX_SPREAD_PCT = float(os.getenv('MAX_SPREAD_PCT','50'))
-MIN_SCORE_HERO = float(os.getenv('MIN_SCORE_HERO', os.getenv('HERO_SCORE','85')))
-MIN_SCORE_STRONG = float(os.getenv('MIN_SCORE_STRONG', os.getenv('STRONG_SCORE','70')))
-MIN_SCORE_WATCH = float(os.getenv('MIN_SCORE_WATCH', os.getenv('WATCH_SCORE','55')))
+MAX_SPREAD_PCT = float(os.getenv('MAX_SPREAD_PCT','35'))
+MIN_SCORE_HERO = float(os.getenv('MIN_SCORE_HERO', os.getenv('HERO_SCORE','90')))
+MIN_SCORE_STRONG = float(os.getenv('MIN_SCORE_STRONG', os.getenv('STRONG_SCORE','80')))
+MIN_SCORE_WATCH = float(os.getenv('MIN_SCORE_WATCH', os.getenv('WATCH_SCORE','50')))
 MAX_QUOTE_AGE = int(os.getenv('MAX_QUOTE_AGE', os.getenv('QUOTE_STALE_SECONDS','300')))
 MAX_CONCURRENCY = max(1, int(os.getenv('MAX_CONCURRENCY','4')))
 DEBUG_SCANNER = os.getenv('DEBUG_SCANNER','false').strip().lower() in ('1','true','yes','on')
@@ -49,7 +57,7 @@ HTTP_CONNECT_TIMEOUT = max(1, float(os.getenv('ALPACA_CONNECT_TIMEOUT','3')))
 RETRIES = max(0, int(os.getenv('ALPACA_RETRIES','2')))
 STOCKS_PAGE_TIMEOUT = max(1, float(os.getenv('STOCKS_PAGE_TIMEOUT_SECONDS','12')))
 OPTIONS_PAGE_LIMIT = max(100, min(1000, int(os.getenv('OPTIONS_PAGE_LIMIT','1000'))))
-OPTIONS_MAX_PAGES = max(1, int(os.getenv('OPTIONS_MAX_PAGES','6')))
+OPTIONS_MAX_PAGES = max(1, int(os.getenv('OPTIONS_MAX_PAGES','100')))
 OPTIONS_MIN_INTERVAL = max(0.05, float(os.getenv('OPTIONS_MIN_INTERVAL_SECONDS','0.20')))
 OPTIONS_SNAPSHOT_BATCH_SIZE = max(10, min(50, int(os.getenv('OPTIONS_SNAPSHOT_BATCH_SIZE','25'))))
 OPTIONS_FEED_RETRIES = max(0, int(os.getenv('OPTIONS_FEED_RETRIES','1')))
@@ -242,7 +250,7 @@ def adx(bars,n=14):
 
 def fetch_bars(symbol,timeframe,days=45,limit=1000):
     end_dt=datetime.now(timezone.utc); start_dt=end_dt-timedelta(days=days)
-    data=req(f'{ALPACA}/stocks/{symbol}/bars', {'timeframe':timeframe,'start':start_dt.isoformat().replace('+00:00','Z'),'end':end_dt.isoformat().replace('+00:00','Z'),'limit':limit,'feed':'iex','sort':'asc'}, timeout=STOCKS_PAGE_TIMEOUT)
+    data=req(f'{ALPACA}/stocks/{symbol}/bars', {'timeframe':timeframe,'start':start_dt.isoformat().replace('+00:00','Z'),'end':end_dt.isoformat().replace('+00:00','Z'),'limit':limit,'feed':os.getenv('ALPACA_UNDERLYING_FEED','iex'),'sort':'asc'}, timeout=STOCKS_PAGE_TIMEOUT)
     return data.get('bars') or []
 
 def fetch_bars_batch(symbols,timeframe,days=45,limit=None):
@@ -263,7 +271,7 @@ def fetch_bars_batch(symbols,timeframe,days=45,limit=None):
             'start':start_dt.isoformat().replace('+00:00','Z'),
             'end':end_dt.isoformat().replace('+00:00','Z'),
             'limit':page_limit,
-            'feed':'iex',
+            'feed':os.getenv('ALPACA_UNDERLYING_FEED','iex'),
             'sort':'asc'
         }
         if page_token:
@@ -358,7 +366,7 @@ def _bars_for_symbol(symbol,timeframe,days,cache):
         progress('bars_symbol_fallback_failed',symbol=symbol,timeframe=timeframe,error=str(e)[:300])
     return bars, 'cache_partial'
 
-def frame_indicators(symbol,timeframe,days=45,cache=None):
+def frame_indicators(symbol,timeframe,days=45,cache=None,all_caches=None):
     bars,source=_bars_for_symbol(symbol,timeframe,days,cache)
     closes=[num(b.get('c')) for b in bars if num(b.get('c'))>0]
     if len(closes)<55:
@@ -370,7 +378,7 @@ def frame_indicators(symbol,timeframe,days=45,cache=None):
             lcache=None
             # The caller normally provides a multi-timeframe cache. Access it
             # through the temporary attribute installed by multi_tf.
-            allc=getattr(frame_indicators,'_all_caches',{}) or {}
+            allc=all_caches or {}
             lcache=allc.get({'5Min':'5m','15Min':'15m','1Hour':'1h'}.get(ltf,''))
             lower_bars,lower_source=_bars_for_symbol(symbol,ltf,ldays,lcache)
             if len([b for b in lower_bars if num(b.get('c'))>0])>=55:
@@ -411,11 +419,7 @@ def regime(f4,f1,f15,f5):
 
 def multi_tf(symbol,caches=None):
     caches=caches or {}
-    frame_indicators._all_caches=caches
-    try:
-        f5=frame_indicators(symbol,'5Min',7,caches.get('5m')); f15=frame_indicators(symbol,'15Min',20,caches.get('15m')); f1=frame_indicators(symbol,'1Hour',45,caches.get('1h')); f4=frame_indicators(symbol,'4Hour',180,caches.get('4h'))
-    finally:
-        frame_indicators._all_caches={}
+    f5=frame_indicators(symbol,'5Min',7,caches.get('5m'),caches); f15=frame_indicators(symbol,'15Min',20,caches.get('15m'),caches); f1=frame_indicators(symbol,'1Hour',45,caches.get('1h'),caches); f4=frame_indicators(symbol,'4Hour',180,caches.get('4h'),caches)
     vwap=session_vwap(f5['bars']) or f5['last']
     closes=[num(b.get('c')) for b in f5['bars']]; vols=[num(b.get('v')) for b in f5['bars']]
     avgvol=statistics.mean(vols[-21:-1]) if len(vols)>21 else max(statistics.mean(vols[:-1]),1)
@@ -427,7 +431,7 @@ def multi_tf(symbol,caches=None):
 
 def _options_feeds():
     """Return configured feed first, then safe public fallback when available."""
-    configured = str(os.getenv('ALPACA_OPTIONS_FEED','indicative')).strip().lower()
+    configured = str(os.getenv('ALPACA_OPTIONS_FEED','opra')).strip().lower()
     feeds = [configured]
     # OPRA can require a paid entitlement. If it fails, indicative is still
     # useful for discovery/scoring and prevents the entire scan from becoming
@@ -458,7 +462,7 @@ def _option_contracts_fallback(underlying, side=None, root_symbol=None):
     if side: params['type']=side.lower()
     if root_symbol: params['root_symbol']=root_symbol
     contracts=[]; page_token=None; pages=0
-    while pages < int(os.getenv('OPTIONS_CONTRACTS_MAX_PAGES','3')):
+    while pages < int(os.getenv('OPTIONS_CONTRACTS_MAX_PAGES','20')):
         q=dict(params)
         if page_token: q['page_token']=page_token
         data=req(f'{trading_base}/options/contracts',q)
@@ -526,7 +530,7 @@ def _option_contracts_fallback(underlying, side=None, root_symbol=None):
     return {'snapshots':merged,'pages':pages,'fallback':True,'contracts_discovered':len(symbols),
             'failed_batches':failed_batches,'feed_used':feed_used}
 
-def option_chain(underlying, side=None, root_symbol=None):
+def option_chain(underlying, side=None, root_symbol=None, strike_hint=None, expiration_hint=None, type_hint=None):
     """Fetch option snapshots with hard bounded time/retries; never let one feed hang the scan."""
     today=datetime.now(timezone.utc).date()
     base_params={
@@ -535,7 +539,12 @@ def option_chain(underlying, side=None, root_symbol=None):
         'expiration_date_lte':(today+timedelta(days=30)).isoformat(),
     }
     if side: base_params['type']=side.lower()
+    elif type_hint in ('CALL','PUT'): base_params['type']=type_hint.lower()
     if root_symbol: base_params['root_symbol']=root_symbol
+    if expiration_hint: base_params['expiration_date']=str(expiration_hint)
+    if strike_hint is not None:
+        sh=float(strike_hint); width=max(0.01, sh*0.0025)
+        base_params['strike_price_gte']=max(0,sh-width); base_params['strike_price_lte']=sh+width
     merged={}; page_token=None; pages=0; primary_error=None; feed_used=None
     deadline=time.monotonic()+OPTIONS_CHAIN_TIMEOUT
     try:
@@ -696,84 +705,80 @@ def _direction_state(m, direction):
     return checks, positive, opposite
 
 
-def score_setup(m, direction, spread, delta, vol, oi, dte=0, strike=None, is_spxw=False):
-    """Composite 0-100 score. Secondary quality signals are soft-scored."""
+def score_setup(m, direction, spread, delta, vol, oi, dte=0, strike=None, is_spxw=False,
+                premium=None, iv=None, theta=None, market_bias='NEUTRAL', gap_pct=0.0,
+                expected_move_pct=None):
+    """Composite 0-100 setup score using independent market, technical and option factors."""
     f5, f15, f1, f4 = m['5m'], m['15m'], m['1h'], m['4h']
     checks, positive, opposite = _direction_state(m, direction)
-    reasons = []
-    components = {}
-
-    # 20 Momentum
-    momentum_flags = sum(bool(checks[k]) for k in ('5M','15M','VWAP','BREAKOUT'))
-    components['momentum'] = min(20.0, momentum_flags * 5.0)
-    if checks['5M']: reasons.append('5M momentum aligned')
-    if checks['15M']: reasons.append('15M momentum aligned')
-    if checks['VWAP']: reasons.append('VWAP aligned')
-    if checks['BREAKOUT']: reasons.append('Breakout/Breakdown')
-
-    # 15 Volume/OI. Missing secondary data is neutral, not a rejection.
-    vr = max(0.0, float(m.get('volume_ratio',1.0) or 1.0))
-    vol_pts = min(8.0, max(0.0, (vr-0.8) * 5.0))
-    oi_pts = 7.0 if oi >= max(100, MIN_OI*5) else (5.0 if oi >= MIN_OI else (2.5 if oi > 0 else 1.5))
-    if vol <= 0:
-        vol_pts = 2.0
-    elif vol >= max(20, MIN_VOL*4):
-        vol_pts = max(vol_pts, 5.0)
-    components['volume_oi'] = min(15.0, vol_pts + oi_pts)
-    if vr >= 1.5: reasons.append('Volume expansion')
-    if oi >= max(100, MIN_OI*5): reasons.append('Strong open interest')
-
-    # 15 Spread. Very wide spreads are penalized, not automatically discarded.
-    if spread <= 5: spread_pts = 15
-    elif spread <= 10: spread_pts = 13
-    elif spread <= 20: spread_pts = 10
-    elif spread <= 35: spread_pts = 7
-    elif spread <= 50: spread_pts = 4
-    elif spread <= 100: spread_pts = 2
-    else: spread_pts = 0
-    components['spread'] = float(spread_pts)
-    if spread <= 12: reasons.append('Tight/usable spread')
-
-    # 10 Trend
-    trend_flags = sum(bool(checks[k]) for k in ('4H','1H','15M'))
-    components['trend'] = min(10.0, trend_flags * 3.333333)
-    if checks['4H']: reasons.append('4H trend aligned')
-    if checks['1H']: reasons.append('1H trend aligned')
-
-    # 10 Price action / volatility
-    atr_pct = (f5['atr'] / max(f5['last'], 1e-9)) * 100
-    price_pts = 4.0 if checks['5M'] else 1.5
-    price_pts += 3.0 if checks['BREAKOUT'] else (1.0 if abs(f5['slope']) >= max(f5['atr']*0.2, f5['last']*0.0005) else 0)
-    price_pts += min(3.0, max(0.0, atr_pct * 0.8))
-    components['price_action'] = min(10.0, price_pts)
-
-    # 10 Options activity / strike / DTE / delta
-    dte_score = 4.0 if dte in (0,1,2,3) else (3.5 if dte <= 7 else (3.0 if dte <= 21 else 1.0))
-    distance = abs(strike-f5['last']) / max(f5['last'],1e-9) if strike else None
-    strike_pts = 3.0 if distance is None else (3.0 if distance <= .03 else (2.5 if distance <= .06 else (1.5 if distance <= .10 else 0.5)))
-    delta_abs = abs(delta)
-    delta_pts = 3.0 if .35 <= delta_abs <= .70 else (2.0 if .20 <= delta_abs <= .80 else 1.0)
-    components['options_activity'] = min(10.0, dte_score + strike_pts + delta_pts)
-    if dte <= 7: reasons.append('Near-term DTE')
-    if .30 <= delta_abs <= .70: reasons.append('Useful delta')
-
-    # Regime adjustment is small and transparent.
-    regime_adj = {'TRENDING': 5, 'MIXED': 1, 'CHOPPY': -4, 'SIDEWAYS': -6}.get(m['regime'], 0)
-    components['regime_adjustment'] = regime_adj
-    if m['regime'] == 'TRENDING': reasons.append('Trend regime')
-    elif m['regime'] in ('SIDEWAYS','CHOPPY'): reasons.append(f'{m["regime"]} risk')
-
-    # Direction mismatch is a penalty, not a hard filter.
-    if positive < WATCH_MIN_DIRECTION:
-        components['direction_penalty'] = -8
-    elif opposite >= max(3, positive+1):
-        components['direction_penalty'] = -10
+    reasons=[]; c={}
+    bullish=direction=='CALL'
+    # Direction + market confirmation: 20
+    c['direction']=round(min(20.0, positive/6.0*15.0),1)
+    if market_bias in ('BULLISH','BEARISH'):
+        aligned=(market_bias=='BULLISH') == bullish
+        c['market_alignment']=5.0 if aligned else -3.0
+        reasons.append('Market bias confirms direction') if aligned else reasons.append('⚠️ Market bias opposes direction')
     else:
-        components['direction_penalty'] = 0
-
-    raw = sum(components.values())
-    score = max(0.0, min(100.0, raw))
-    return round(score,1), reasons, checks['4H'], checks['1H'], checks['15M'], checks['5M'], components, positive, opposite
+        c['market_alignment']=2.0
+    # Momentum: 12
+    mom=sum(bool(checks[k]) for k in ('5M','15M','VWAP','BREAKOUT'))
+    c['momentum']=round(min(12.0,mom*3.0),1)
+    if checks['BREAKOUT']: reasons.append('Breakout/breakdown trigger')
+    if checks['VWAP']: reasons.append('Price aligned with VWAP')
+    # Trend: 10
+    trend=sum(bool(checks[k]) for k in ('4H','1H','15M'))
+    c['trend']=round(min(10.0,trend*10/3),1)
+    if checks['4H'] and checks['1H']: reasons.append('Multi-timeframe trend alignment')
+    # Volume / RVOL: 10
+    vr=max(0.0,float(m.get('volume_ratio',1.0) or 1.0))
+    c['volume']=round(min(10.0,max(0.0,(vr-0.7)*5.0)),1)
+    if vr>=2: reasons.append(f'High RVOL {vr:.1f}x')
+    elif vr>=1.5: reasons.append(f'Positive RVOL {vr:.1f}x')
+    # Liquidity spread: 10
+    sp=spread if spread is not None else 40.0
+    c['spread']=10.0 if sp<=8 else 8.0 if sp<=15 else 6.0 if sp<=25 else 3.0 if sp<=35 else 0.0
+    if sp<=15: reasons.append('Usable bid/ask spread')
+    # OI/activity: 8
+    oi_n=max(0,oi or 0); vol_n=max(0,vol or 0)
+    c['open_interest']=6.0 if oi_n>=500 else 5.0 if oi_n>=100 else 3.5 if oi_n>=25 else 1.5 if oi_n>0 else 0.5
+    c['contract_volume']=2.0 if vol_n>=100 else 1.5 if vol_n>=25 else 1.0 if vol_n>=5 else 0.0
+    if oi_n>=100: reasons.append('Meaningful open interest')
+    # Delta: 6
+    da=abs(delta or 0)
+    c['delta']=6.0 if .45<=da<=.70 else 5.0 if .35<=da<=.80 else 3.0 if .20<=da<=.85 else 1.0
+    if .35<=da<=.75: reasons.append('Actionable delta')
+    # IV: 5 (high IV is not automatically good; score near a usable range)
+    ivn=float(iv or 0)
+    if ivn<=0: c['iv']=2.0
+    elif ivn<=0.80: c['iv']=4.0
+    elif ivn<=1.20: c['iv']=3.0
+    elif ivn<=2.0: c['iv']=2.0
+    else: c['iv']=1.0
+    # DTE: 4
+    d=int(dte or 0)
+    c['dte']=4.0 if 3<=d<=14 else 3.0 if d in (0,1,2,15,16,17,18,19,20,21) else 1.0
+    # Premium: 4, with the requested hard display band handled separately
+    p=float(premium or 0)
+    c['premium']=4.0 if .75<=p<=3.0 else 3.0 if .5<=p<=4.0 else 2.0
+    # Technical levels / expected move / gap: 5
+    atr_pct=(f5['atr']/max(f5['last'],1e-9))*100
+    level=0.0
+    if checks['BREAKOUT']: level+=2.0
+    elif abs(f5['last']-m['recent_high'])/max(f5['last'],1e-9)<.003 or abs(f5['last']-m['recent_low'])/max(f5['last'],1e-9)<.003: level+=1.5
+    if expected_move_pct is not None and atr_pct>0 and float(expected_move_pct)>atr_pct*.5: level+=1.0
+    if abs(gap_pct)>=1.0 and ((gap_pct>0)==bullish): level+=1.0
+    c['technical_levels']=min(5.0,level+min(1.0,max(0.0,atr_pct)))
+    if abs(gap_pct)>=1.0: reasons.append(f'Gap {gap_pct:+.1f}%')
+    # Regime penalty/bonus is included in a bounded 100-point total
+    c['regime']=5.0 if m['regime']=='TRENDING' else 2.0 if m['regime']=='MIXED' else -2.0 if m['regime']=='CHOPPY' else -4.0
+    if m['regime']=='TRENDING': reasons.append('Trending market regime')
+    # Opposite direction penalty: keep both sides available, but make conflict expensive
+    c['conflict']=-min(6.0,max(0.0,opposite-positive+1)*2.0)
+    if opposite>positive: reasons.append('⚠️ Opposing technical evidence')
+    raw=sum(c.values())
+    score=max(0.0,min(100.0,raw))
+    return round(score,1), reasons, checks['4H'], checks['1H'], checks['15M'], checks['5M'], c, positive, opposite
 
 def premium_quality(premium, is_spxw=False):
     """Soft premium quality score. Security caps are handled separately."""
@@ -853,32 +858,41 @@ def explosive_setup_score(m, direction, spread, delta, vol, oi, dte):
 
 
 
-def moonshot_qualification(premium, projected_upside_pct, score, explosive_score, dte, spread=None):
-    """Identify very-low-premium/high-upside setups without claiming a prediction.
-    A MOONSHOT is a model-detection label only; it is not a forecast or guarantee."""
+def moonshot_qualification(premium, projected_upside_pct, score, explosive_score, dte, spread=None,
+                           volume=0, oi=0, rvol=1.0, market_regime='MIXED'):
+    """MOONSHOT requires multiple simultaneous quality signals; cheap alone is never enough."""
     try:
         p=float(premium or 0); up=float(projected_upside_pct or 0); sc=float(score or 0)
-        ex=float(explosive_score or 0); d=int(dte or 0)
+        ex=float(explosive_score or 0); d=int(dte or 0); sp=float(spread) if spread is not None else 999
+        v=float(volume or 0); o=float(oi or 0); rv=float(rvol or 0)
     except Exception:
         return False, []
     flags=[]
-    if p >= MOONSHOT_MIN_PREMIUM and p <= MAX_AFFORDABLE_PREMIUM: flags.append('premium>=0.25')
-    else: return False, []
-    if up >= MOONSHOT_MIN_UPSIDE_PCT: flags.append('model-upside>=1000%')
-    if ex >= MOONSHOT_MIN_EXPLOSIVE_SCORE: flags.append('explosive-score')
-    if sc >= MOONSHOT_MIN_SCORE: flags.append('score')
-    if d <= EXPLOSIVE_MAX_DTE: flags.append('near-term')
-    if spread is not None and spread <= 35: flags.append('usable-spread')
-    qualified = up >= MOONSHOT_MIN_UPSIDE_PCT and (ex >= MOONSHOT_MIN_EXPLOSIVE_SCORE or sc >= MOONSHOT_MIN_SCORE)
-    return bool(qualified), flags
+    if not (MIN_PREMIUM <= p <= MAX_PREMIUM): return False, []
+    if not (0<=d<=EXPLOSIVE_MAX_DTE): return False, []
+    if sp>35: return False, []
+    if rv<1.5: return False, []
+    if v<5 and o<25: return False, []
+    if sc<60 or ex<70: return False, []
+    if market_regime in ('SIDEWAYS','CHOPPY'): return False, []
+    if up>=150: flags.append('model-upside>=150%')
+    else: flags.append('high convexity setup')
+    if p<=1.50: flags.append('low/medium premium')
+    if rv>=2: flags.append('RVOL>=2x')
+    if ex>=80: flags.append('explosive>=80')
+    if sp<=20: flags.append('spread<=20%')
+    if d<=7: flags.append('DTE<=7')
+    return True, flags
 
-def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_underlying=None):
+def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_underlying=None, market_context=None, strike_hint=None, expiration_hint=None, type_hint=None):
     """Scan one underlying. Validation is staged and every rejection is observable."""
     m = multi_tf(symbol, caches)
+    _attach_gap_and_expected_move(m)
     chain_root = option_underlying or symbol
     is_spxw = bool(contract_prefix and option_underlying == 'SPX')
     progress('fetching_options', symbol=chain_root)
-    chain = option_chain(chain_root, root_symbol=(contract_prefix if is_spxw else None))
+    market_context = market_context or {'bias':'NEUTRAL','breadth':None,'vix':None}
+    chain = option_chain(chain_root, root_symbol=(contract_prefix if is_spxw else None), strike_hint=strike_hint, expiration_hint=expiration_hint, type_hint=type_hint)
     rows = chain.get('snapshots') or {}
     received = len(rows)
     qualified, scored_rows = [], []
@@ -974,6 +988,14 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
             premium=last; quote_source='LAST'; quotes_received += 1; rej['quote_fallback'] += 1
         else:
             rej['missing_quote'] += 1
+            # Preserve the contract in diagnostics instead of silently dropping it.
+            scored_rows.append({'signal':typ,'tier':None,'symbol':symbol,'contract':contract,'underlying':m['5m']['last'],
+                                'option_underlying':chain_root,'expiration':exp,'dte':dte,'strike':round(strike,2),
+                                'premium':None,'bid':bid,'ask':ask,'last':last,'volume':0,'open_interest':0,
+                                'spread_pct':None,'score':FALLBACK_MIN_SCORE,'qualification':'DATA_INCOMPLETE',
+                                'quote_source':'NONE','quote_status':'INVALID','quote_is_stale':False,
+                                'delta':None,'theta':None,'iv':None,'iv_rank':None,
+                                'reasons':['Quote unavailable; contract retained for diagnostics and on-demand analysis.']})
             continue
         quote_with_data += 1
 
@@ -984,7 +1006,7 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
             stale_limit=AFTER_HOURS_STALE_SECONDS if str(session).upper() in ('AFTER_HOURS','CLOSED') else MAX_QUOTE_AGE
             stale=quote_age_sec>stale_limit
         else:
-            stale=True
+            stale=bool(REQUIRE_QUOTE_TIMESTAMP)
         if stale: quote_stale += 1; rej['quote_stale'] += 1
         else: quote_fresh += 1
 
@@ -1004,10 +1026,12 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
             rej['price'] += 1
             continue
 
-        preferred_floor=float(os.getenv('SPXW_MIN_PREMIUM','0.05')) if is_spxw else MIN_PREMIUM
-        preferred_cap=float(os.getenv('SPXW_MAX_PREMIUM','20.00')) if is_spxw else MAX_PREMIUM
-        if premium < preferred_floor: rej['premium_too_low'] += 1; rej['premium'] += 1
-        if premium > preferred_cap: rej['premium_too_high'] += 1; rej['premium'] += 1
+        preferred_floor=MIN_PREMIUM
+        preferred_cap=MAX_PREMIUM
+        if premium < preferred_floor:
+            rej['premium_too_low'] += 1; rej['premium'] += 1; continue
+        if premium > preferred_cap:
+            rej['premium_too_high'] += 1; rej['premium'] += 1; continue
         if premium > hard_premium_cap:
             rej['hard_premium'] += 1; continue
 
@@ -1036,14 +1060,21 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
             continue
 
         delta_raw=greeks.get('delta')
+        theta=_optional_float(greeks.get('theta'))
+        iv=_optional_float(greeks.get('iv'))
         greeks_available=delta_raw is not None and _optional_float(delta_raw) is not None
         delta=_optional_float(delta_raw)
         if delta is None:
             delta=0.25 if typ=='CALL' else -0.25
             rej['delta'] += 1
-        score,reasons,a4,a1,a15,a5,components,positive,opposite=score_setup(m,typ,spread if spread is not None else 20.0,delta,vol or 0,oi or 0,dte,strike,is_spxw=is_spxw)
+        gap_pct=float(m.get('gap_pct',0.0) or 0.0)
+        expected_move_pct=float(m.get('expected_move_pct',0.0) or 0.0) if m.get('expected_move_pct') is not None else None
+        score,reasons,a4,a1,a15,a5,components,positive,opposite=score_setup(
+            m,typ,spread if spread is not None else 40.0,delta,vol or 0,oi or 0,dte,strike,is_spxw=is_spxw,
+            premium=premium,iv=iv,theta=theta,market_bias=str(market_context.get('bias') or 'NEUTRAL'),
+            gap_pct=gap_pct,expected_move_pct=expected_move_pct)
         pscore,plabel=premium_quality(premium,is_spxw)
-        score=round(min(100.0,max(0.0,score+pscore-5.0)),1); components['premium']=round(pscore-5.0,1)
+        components['premium_quality']=round(pscore,1)
         explosive_score,explosive_flags=explosive_setup_score(m,typ,spread if spread is not None else 20.0,delta,vol or 0,oi or 0,dte)
         risk_flags=[]
         if spread is not None and spread>max(MAX_SPREAD,RELAXED_MAX_SPREAD): risk_flags.append('wide spread')
@@ -1059,7 +1090,15 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
         elif premium>preferred_cap: reasons.append('High premium — capital intensive')
         if explosive_score>=EXPLOSIVE_MIN_SCORE and m['regime'] not in ('SIDEWAYS','CHOPPY'):
             reasons.append('💥 Momentum/volume expansion setup'); reasons.extend(explosive_flags)
-        tier=_classify(score,positive,opposite,risk_flags if score>=HERO_SCORE else [])
+        # HERO requires both score and independent confirmation; a wide spread, missing quote freshness,
+        # opposing direction, or thin liquidity prevents HERO even when the raw score is high.
+        hero_blockers=[]
+        if spread is None or spread>20: hero_blockers.append('spread')
+        if stale: hero_blockers.append('stale_quote')
+        if (vol or 0)<MIN_VOL and (oi or 0)<MIN_OI: hero_blockers.append('liquidity')
+        if opposite>=positive: hero_blockers.append('direction_conflict')
+        if market_context.get('bias') in ('BULLISH','BEARISH') and ((market_context['bias']=='BULLISH') != (typ=='CALL')): hero_blockers.append('market_conflict')
+        tier=_classify(score,positive,opposite,hero_blockers)
         if REQUIRE_4H_ALIGNMENT and not a4:
             if tier=='HERO': tier='STRONG'
             elif tier=='STRONG': tier='WATCH'
@@ -1088,12 +1127,13 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
         confidence=round(min(97,max(50,score*.92)),0)
         trend4='BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL'; trend1='BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL'; trend15='BULLISH' if m['15m']['last']>m['15m']['ema20'] else 'BEARISH' if m['15m']['last']<m['15m']['ema20'] else 'NEUTRAL'; trend5='BULLISH' if m['5m']['last']>m['vwap'] and m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH' if m['5m']['last']<m['vwap'] and m['5m']['ema20']<m['5m']['ema50'] else 'NEUTRAL'
         moonshot, moonshot_flags = moonshot_qualification(
-            premium, projected_upside_pct, score, explosive_score, dte, spread
+            premium, projected_upside_pct, score, explosive_score, dte, spread, vol or 0, oi or 0,
+            m.get('volume_ratio',1.0), m.get('regime','MIXED')
         )
         if moonshot and not tier:
             tier = 'MOONSHOT'
             tier_counts['WATCH'] += 0
-        item={'signal':typ,'tier':tier,'market':'OPTIONS','symbol':symbol,'contract':contract,'dte':dte,'strike':round(strike,2),'expiration':exp,'premium':round(premium,2),'bid':round(bid,2) if bid is not None and bid>0 else None,'ask':round(ask,2) if ask is not None and ask>0 else None,'entry_low':entry_low,'entry_high':entry_high,'entry':round(entry,2),'stop_loss':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'affordable':contracts>0,'max_loss':max_loss,'expected_profit_tp1':reward1,'expected_profit_tp2':reward2,'expected_profit_tp3':reward3,'expected_loss_pct':round(risk/max(entry,0.01)*100,1),'expected_profit_pct':round((tp1/entry-1)*100,1),'risk_reward':round((tp1-entry)/risk,2) if risk else None,'underlying_entry':u_entry,'underlying_stop_loss':u_stop,'underlying_tp1':u_tp1,'underlying_tp2':u_tp2,'underlying_tp3':u_tp3,'atr_5m_points':round(atr_points,2) if atr_points else None,'score':score,'score_components':components,'direction_evidence':positive,'opposite_evidence':opposite,'explosive_score':explosive_score,'explosive_setup':bool(explosive_score>=EXPLOSIVE_MIN_SCORE and positive>=3),'moonshot':moonshot,'moonshot_flags':moonshot_flags,'explosive_flags':explosive_flags,'confidence':confidence,'projected_underlying_target':projected_underlying,'projected_premium':round(projected_premium,2) if projected_premium is not None else None,'projected_upside_pct':projected_upside_pct,'market_regime':m['regime'],'volume':vol or 0,'open_interest':oi or 0,'spread_pct':round(spread,1) if spread is not None else None,'delta':round(delta,3),'underlying':u_entry,'indicator_symbol':symbol,'indicator_proxy':symbol if not is_spxw else 'SPY','option_underlying':chain_root,'vwap_state':'BULLISH' if u_entry>m['vwap'] else 'BEARISH','ema_state':'BULLISH' if m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH','rsi':round(m['5m']['rsi'],1),'macd_state':'BULLISH' if m['5m']['macd_delta']>0 else 'BEARISH','volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout'],'trend_4h':trend4,'trend_1h':trend1,'trend_15m':trend15,'trend_5m':trend5,'adx_4h':round(m['4h']['adx'],1),'rsi_4h':round(m['4h']['rsi'],1),'reasons':reasons,'session':session,'data_mode':options_data_mode(),'premium_quality':round(pscore,1),'premium_quality_label':plabel,'quote_timestamp':qdt.isoformat() if qdt else None,'quote_source':quote_source,'quote_age_sec':round(quote_age_sec,1) if quote_age_sec is not None else None,'quote_is_stale':stale,'greeks_available':greeks_available,'qualification':tier or 'BELOW_WATCH'}
+        item={'signal':typ,'tier':tier,'market':'OPTIONS','symbol':symbol,'contract':contract,'dte':dte,'strike':round(strike,2),'expiration':exp,'premium':round(premium,2),'bid':round(bid,2) if bid is not None and bid>0 else None,'ask':round(ask,2) if ask is not None and ask>0 else None,'entry_low':entry_low,'entry_high':entry_high,'entry':round(entry,2),'stop_loss':stop,'tp1':tp1,'tp2':tp2,'tp3':tp3,'risk_dollars_per_contract':round(risk*100,2),'suggested_contracts':contracts,'affordable':contracts>0,'max_loss':max_loss,'expected_profit_tp1':reward1,'expected_profit_tp2':reward2,'expected_profit_tp3':reward3,'expected_loss_pct':round(risk/max(entry,0.01)*100,1),'expected_profit_pct':round((tp1/entry-1)*100,1),'risk_reward':round((tp1-entry)/risk,2) if risk else None,'underlying_entry':u_entry,'underlying_stop_loss':u_stop,'underlying_tp1':u_tp1,'underlying_tp2':u_tp2,'underlying_tp3':u_tp3,'atr_5m_points':round(atr_points,2) if atr_points else None,'score':score,'score_components':components,'direction_evidence':positive,'opposite_evidence':opposite,'explosive_score':explosive_score,'explosive_setup':bool(explosive_score>=EXPLOSIVE_MIN_SCORE and positive>=3),'moonshot':moonshot,'moonshot_flags':moonshot_flags,'explosive_flags':explosive_flags,'confidence':confidence,'projected_underlying_target':projected_underlying,'projected_premium':round(projected_premium,2) if projected_premium is not None else None,'projected_upside_pct':projected_upside_pct,'market_regime':m['regime'],'volume':vol or 0,'open_interest':oi or 0,'spread_pct':round(spread,1) if spread is not None else None,'delta':round(delta,3),'underlying':u_entry,'indicator_symbol':symbol,'indicator_proxy':symbol if not is_spxw else 'SPY','option_underlying':chain_root,'vwap_state':'BULLISH' if u_entry>m['vwap'] else 'BEARISH','ema_state':'BULLISH' if m['5m']['ema20']>m['5m']['ema50'] else 'BEARISH','rsi':round(m['5m']['rsi'],1),'macd_state':'BULLISH' if m['5m']['macd_delta']>0 else 'BEARISH','volume_ratio':round(m['volume_ratio'],2),'breakout':m['breakout'],'trend_4h':trend4,'trend_1h':trend1,'trend_15m':trend15,'trend_5m':trend5,'support':round(m.get('recent_low',0),2),'resistance':round(m.get('recent_high',0),2),'call_put_bias':typ,'gap_pct':gap_pct,'expected_move_pct':expected_move_pct,'adx_4h':round(m['4h']['adx'],1),'rsi_4h':round(m['4h']['rsi'],1),'reasons':reasons,'session':session,'data_mode':options_data_mode(),'premium_quality':round(pscore,1),'premium_quality_label':plabel,'quote_timestamp':qdt.isoformat() if qdt else None,'quote_source':quote_source,'quote_age_sec':round(quote_age_sec,1) if quote_age_sec is not None else None,'quote_is_stale':stale,'quote_status':('LIVE' if qdt and quote_age_sec is not None and quote_age_sec<=60 else 'FRESH' if not stale else 'STALE'),'greeks_available':greeks_available,'iv':iv,'theta':theta,'iv_rank':None,'expected_move_pct':expected_move_pct,'gap_pct':gap_pct,'market_bias':market_context.get('bias','NEUTRAL'),'market_breadth':market_context.get('breadth'),'vix':market_context.get('vix'),'qualification':tier or 'BELOW_WATCH'}
         scored_rows.append(item)
         if tier: qualified.append(item)
 
@@ -1116,7 +1156,7 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
     if quote_stage==0 and normalized_count>0: no_setup_reasons.append('No contracts reached quote stage')
     if quote_with_data==0 and quote_stage>0: no_setup_reasons.append('No usable quotes')
     if potential and not qualified: no_setup_reasons.append('Contracts scored but none reached WATCH threshold')
-    diag={'chain_items':received,'contracts_received':received,'normalized':normalized_count,'potential_setups':potential,'scored':len([x for x in scored_rows if x.get('score') is not None]),'quote_stage':quote_stage,'quotes_received':quotes_received,'scored_rows':len(scored_rows),'rejections':rej,'quote_metrics':{'with_data':quote_with_data,'fresh':quote_fresh,'stale':quote_stale,'bid_present':bid_present,'ask_present':ask_present,'last_present':last_present,'volume_present':volume_present,'oi_present':oi_present},'no_setup_reasons':no_setup_reasons,'chain_fallback':bool(chain.get('fallback')),'chain_pages':chain.get('pages',0),'contracts_discovered':chain.get('contracts_discovered',0),'primary_chain_error':chain.get('primary_error'),'underlying':chain_root,'option_source':'Alpaca options '+str(chain.get('feed_used') or os.getenv('ALPACA_OPTIONS_FEED','indicative')),'top_candidates':top_pool,'diagnostic_top_candidates':diagnostic_pool,'tier_counts':tier_counts,'dte_rejected':dte_rejected,'feed_used':chain.get('feed_used')}
+    diag={'chain_items':received,'contracts_received':received,'normalized':normalized_count,'potential_setups':potential,'scored':len([x for x in scored_rows if x.get('score') is not None]),'quote_stage':quote_stage,'quotes_received':quotes_received,'scored_rows':len(scored_rows),'rejections':rej,'quote_metrics':{'with_data':quote_with_data,'fresh':quote_fresh,'stale':quote_stale,'bid_present':bid_present,'ask_present':ask_present,'last_present':last_present,'volume_present':volume_present,'oi_present':oi_present},'no_setup_reasons':no_setup_reasons,'chain_fallback':bool(chain.get('fallback')),'chain_pages':chain.get('pages',0),'contracts_discovered':chain.get('contracts_discovered',0),'primary_chain_error':chain.get('primary_error'),'underlying':chain_root,'underlying_price':m['5m']['last'],'trend_4h':('BULLISH' if m['4h']['last']>m['4h']['ema20']>m['4h']['ema50'] else 'BEARISH' if m['4h']['last']<m['4h']['ema20']<m['4h']['ema50'] else 'NEUTRAL'),'trend_1h':('BULLISH' if m['1h']['last']>m['1h']['ema20']>m['1h']['ema50'] else 'BEARISH' if m['1h']['last']<m['1h']['ema20']<m['1h']['ema50'] else 'NEUTRAL'),'momentum':('BULLISH' if m['5m']['macd_delta']>0 and m['5m']['last']>m['vwap'] else 'BEARISH' if m['5m']['macd_delta']<0 and m['5m']['last']<m['vwap'] else 'NEUTRAL'),'volume_ratio':m.get('volume_ratio'),'gap_pct':m.get('gap_pct',0.0),'market_bias':market_context.get('bias','NEUTRAL'),'market_breadth':market_context.get('breadth'),'vix':market_context.get('vix'),'option_source':'Alpaca options '+str(chain.get('feed_used') or os.getenv('ALPACA_OPTIONS_FEED','opra')),'top_candidates':top_pool,'diagnostic_top_candidates':diagnostic_pool,'tier_counts':tier_counts,'dte_rejected':dte_rejected,'feed_used':chain.get('feed_used')}
     # Authoritative tier counts come from the actual qualified rows. This avoids
     # any counter drift if a row is classified after the local counter update.
     tier_counts = {
@@ -1127,6 +1167,159 @@ def scan_underlying(symbol, session, contract_prefix=None, caches=None, option_u
     diag['tier_counts'] = tier_counts
     diag['hero']=tier_counts['HERO']; diag['strong']=tier_counts['STRONG']; diag['watch']=tier_counts['WATCH']
     return qualified, diag
+
+def fetch_stock_snapshot(symbol):
+    """Best-effort latest stock snapshot; never required for the whole scan."""
+    try:
+        return req(f'{ALPACA}/stocks/{symbol}/snapshot', {'feed': os.getenv('ALPACA_UNDERLYING_FEED','iex')}, timeout=STOCKS_PAGE_TIMEOUT, retries=1)
+    except Exception as e:
+        progress('snapshot_failed',symbol=symbol,error=str(e)[:240])
+        return {}
+
+
+def _trend_from_frame(f):
+    return 'BULLISH' if f['last']>f['ema20']>f['ema50'] and f['macd_delta']>=0 else 'BEARISH' if f['last']<f['ema20']<f['ema50'] and f['macd_delta']<=0 else 'NEUTRAL'
+
+
+def market_context_from_caches(caches):
+    """Build a resilient market regime from SPY/QQQ/IWM plus optional VIX/VIXY proxy."""
+    rows=[]
+    for sym in ('SPY','QQQ','IWM'):
+        try:
+            m=multi_tf(sym,caches)
+            rows.append((_trend_from_frame(m['1h']),m))
+        except Exception as e:
+            progress('market_symbol_failed',symbol=sym,error=str(e)[:200])
+    bull=sum(1 for t,_ in rows if t=='BULLISH'); bear=sum(1 for t,_ in rows if t=='BEARISH')
+    breadth=round((bull-bear)/max(1,len(rows))*100,1) if rows else None
+    bias='BULLISH' if bull>bear and bull>=2 else 'BEARISH' if bear>bull and bear>=2 else 'NEUTRAL'
+    vix=None; vix_source=None
+    for sym in ('VIX','VIXY'):
+        try:
+            end_dt=datetime.now(timezone.utc); start_dt=end_dt-timedelta(days=3)
+            data=req(f'{ALPACA}/stocks/{sym}/bars', {'timeframe':'1Hour','start':start_dt.isoformat().replace('+00:00','Z'),'end':end_dt.isoformat().replace('+00:00','Z'),'limit':100,'feed':os.getenv('ALPACA_UNDERLYING_FEED','iex'),'sort':'asc'}, timeout=3, retries=0)
+            bars=data.get('bars') or []; closes=[num(b.get('c')) for b in bars if num(b.get('c'))>0]
+            if closes:
+                vix=round(closes[-1],2); vix_source=sym; break
+        except Exception:
+            continue
+    return {'bias':bias,'breadth':breadth,'vix':vix,'vix_source':vix_source,'symbols':len(rows),'bullish':bull,'bearish':bear}
+
+
+def _attach_gap_and_expected_move(m):
+    # Derive gap from the first/last daily bars when available; expected move is
+    # a conservative ATR-based proxy when an options-implied move is unavailable.
+    try:
+        bars=m['1h']['bars']; closes=[num(b.get('c')) for b in bars if num(b.get('c'))>0]
+        if len(closes)>=2:
+            prev=closes[-2]; last=closes[-1]; m['gap_pct']=round((last/prev-1)*100,2) if prev else 0.0
+        else: m['gap_pct']=0.0
+        m['expected_move_pct']=round((m['1h']['atr']/max(m['1h']['last'],1e-9))*100,2)
+    except Exception:
+        m['gap_pct']=0.0; m['expected_move_pct']=None
+    return m
+
+
+def resolve_underlying(value):
+    q=re.sub(r'\s+',' ',str(value or '').strip().upper())
+    q=COMPANY_ALIASES.get(q,q)
+    # Strip common punctuation from ticker-like requests only.
+    if q.endswith('$'): q=q[:-1]
+    if re.fullmatch(r'[A-Z][A-Z0-9.\-]{0,7}',q): return q
+    return COMPANY_ALIASES.get(q,q)
+
+
+def _parse_contract_query(query):
+    q=re.sub(r'\s+',' ',str(query or '').strip().upper())
+    # Exact OCC symbol
+    m=re.search(r'([A-Z]{1,6}\d{6}[CP]\d{8})',q)
+    if m:
+        sym=m.group(1); root=re.match(r'([A-Z]{1,6})',sym).group(1)
+        exp,strike,typ=parse_contract(sym,{})
+        under='SPX' if root=='SPXW' else ('NDX' if root.startswith('NDX') else root)
+        return {'contract':sym,'root':root,'underlying':under,'expiration':exp,'strike':strike,'type':typ}
+    # Friendly forms: TICKER [YYYY-MM-DD|YYMMDD] STRIKE C/P
+    m=re.match(r'^(SPXW|SPX|NDX|NDXP|[A-Z][A-Z0-9.\-]{0,7})\s+(?:(\d{4}-\d{2}-\d{2}|\d{6}|\d{1,2}/\d{1,2}(?:/\d{2,4})?)\s+)?([0-9]+(?:\.[0-9]+)?)\s*([CP])$',q)
+    if not m: return None
+    root=m.group(1); exp=m.group(2); strike=float(m.group(3)); typ='CALL' if m.group(4)=='C' else 'PUT'
+    if exp:
+        if re.fullmatch(r'\d{6}',exp): exp=f'20{exp[:2]}-{exp[2:4]}-{exp[4:6]}'
+        elif '/' in exp:
+            parts=exp.split('/'); year=int(parts[2]) if len(parts)==3 else datetime.now(timezone.utc).year; year=year+2000 if year<100 else year; exp=f'{year:04d}-{int(parts[0]):02d}-{int(parts[1]):02d}'
+    under='SPX' if root=='SPXW' else ('NDX' if root in ('NDX','NDXP') else root)
+    return {'contract':None,'root':root,'underlying':under,'expiration':exp,'strike':strike,'type':typ}
+
+
+def analyze_underlying(symbol, session='OPEN', market_context=None):
+    """On-demand analysis for any valid ticker, even if it is outside STOCK_SYMBOLS."""
+    symbol=resolve_underlying(symbol)
+    if market_context is None: market_context={'bias':'NEUTRAL','breadth':None,'vix':None}
+    if symbol in ('SPXW','SPX'): proxy='SPY'; option_underlying='SPX'; prefix='SPXW' if symbol=='SPXW' else None
+    elif symbol in ('NDX','NDXP'): proxy='QQQ'; option_underlying='NDX'; prefix=symbol if symbol!='NDX' else None
+    else: proxy=symbol; option_underlying=symbol; prefix=None
+    caches={}
+    for key,(tf,days) in {'5m':('5Min',7),'15m':('15Min',20),'1h':('1Hour',45),'4h':('4Hour',180)}.items():
+        try: caches[key]=fetch_bars_batch([proxy],tf,days)
+        except Exception: caches[key]={}
+    m=multi_tf(proxy,caches); _attach_gap_and_expected_move(m)
+    qualified,diag=scan_underlying(proxy,session,contract_prefix=prefix,caches=caches,option_underlying=option_underlying,market_context=market_context)
+    for x in qualified: x['symbol']=symbol; x['indicator_proxy']=proxy
+    diag['requested_symbol']=symbol; diag['indicator_proxy']=proxy; diag['market']=market_context
+    calls=[x for x in qualified if x.get('signal')=='CALL']; puts=[x for x in qualified if x.get('signal')=='PUT']
+    call_score=max([float(x.get('score') or 0) for x in calls] or [0]); put_score=max([float(x.get('score') or 0) for x in puts] or [0])
+    call_put_bias='CALL' if call_score-put_score>=5 else 'PUT' if put_score-call_score>=5 else 'NEUTRAL'
+    return {'symbol':symbol,'indicator_proxy':proxy,'underlying_price':m['5m']['last'],'trend_4h':_trend_from_frame(m['4h']),'trend_1h':_trend_from_frame(m['1h']),'trend_15m':_trend_from_frame(m['15m']),'trend_5m':_trend_from_frame(m['5m']),'momentum':'BULLISH' if m['5m']['macd_delta']>0 and m['5m']['last']>m['vwap'] else 'BEARISH' if m['5m']['macd_delta']<0 and m['5m']['last']<m['vwap'] else 'NEUTRAL','support':m['recent_low'],'resistance':m['recent_high'],'volume_ratio':m['volume_ratio'],'regime':m['regime'],'gap_pct':m.get('gap_pct',0.0),'expected_move_pct':m.get('expected_move_pct'),'market':market_context,'call_put_bias':call_put_bias,'candidates':qualified,'diagnostics':diag}
+
+
+def analyze_contract_query(query, session='OPEN', market_context=None):
+    parsed=_parse_contract_query(query)
+    if not parsed: return {'ok':False,'error':'Could not parse contract. Use OCC symbol or TICKER [EXPIRATION] STRIKE C/P.'}
+    market_context=market_context or {'bias':'NEUTRAL','breadth':None,'vix':None}
+    root=parsed['root']; under=parsed['underlying']; proxy='SPY' if under=='SPX' else 'QQQ' if under=='NDX' else under
+    if under=='NDX':
+        # Alpaca currently documents NDX/NQX index options as unsupported; still provide QQQ technical context.
+        try: base=analyze_underlying(proxy,session,market_context)
+        except Exception as e: base={'symbol':root,'indicator_proxy':proxy,'candidates':[],'error':str(e)}
+        return {'ok':False,'unsupported':True,'symbol':root,'proxy':proxy,'error':'Alpaca does not currently provide NDX index options at this API offering; QQQ technical proxy is available.', 'analysis':base}
+    try:
+        strike_hint=parsed.get('strike'); exp_hint=parsed.get('expiration'); type_hint=parsed.get('type')
+        # Need technical cache for the requested underlying.
+        caches={}
+        for key,(tf,days) in {'5m':('5Min',7),'15m':('15Min',20),'1h':('1Hour',45),'4h':('4Hour',180)}.items():
+            caches[key]=fetch_bars_batch([proxy],tf,days)
+        m=multi_tf(proxy,caches); _attach_gap_and_expected_move(m)
+        is_index=root=='SPXW'
+        chain=option_chain('SPX',root_symbol='SPXW' if is_index else None,strike_hint=strike_hint,expiration_hint=exp_hint,type_hint=type_hint)
+        rows=chain.get('snapshots') or {}
+        selected=[]; today=datetime.now(timezone.utc).date()
+        for contract,snap in rows.items():
+            n,reason=normalize_contract(snap,contract)
+            if not n: continue
+            if n['option_type']!=type_hint: continue
+            if strike_hint is not None and abs(n['strike']-strike_hint)>max(.01,strike_hint*.003): continue
+            if exp_hint and n['expiration']!=exp_hint: continue
+            dte=(datetime.fromisoformat(n['expiration']).date()-today).days
+            if dte<0 or dte>MAX_DTE: continue
+            selected.append((contract,snap,n,dte))
+        if not selected:
+            # If no exact expiration was specified, search the chain and choose nearest strike/expiry.
+            if exp_hint:
+                return {'ok':False,'error':'Contract not found in the available Alpaca chain after normalization.','symbol':under,'requested':query,'chain_pages':chain.get('pages',0),'provider_error':chain.get('primary_error')}
+            return {'ok':False,'error':'No matching strike/type found in the available chain.','symbol':under,'requested':query,'chain_pages':chain.get('pages',0),'provider_error':chain.get('primary_error')}
+        # Reuse scan engine by exact strike/expiry/type, then choose exact result or nearest.
+        qualified,diag=scan_underlying(proxy,session,contract_prefix='SPXW' if is_index else None,caches=caches,option_underlying='SPX' if is_index else proxy,market_context=market_context,strike_hint=parsed.get('strike'),expiration_hint=parsed.get('expiration'),type_hint=parsed.get('type'))
+        best=min(qualified,key=lambda x:abs(float(x.get('strike') or 0)-float(parsed.get('strike') or 0))) if qualified else None
+        if not best:
+            # Build a neutral analysis row from the exact snapshot instead of returning not-found.
+            contract,snap,n,dte=selected[0]; q=snap.get('latestQuote') or {}; tr=snap.get('latestTrade') or {}; g=snap.get('greeks') or {}
+            bid=_optional_float(q.get('bp')); ask=_optional_float(q.get('ap')); last=_optional_float(tr.get('p')); prem=(bid+ask)/2 if bid and ask and ask>=bid else last
+            iv=_optional_float(g.get('iv')); delta=_optional_float(g.get('delta')); theta=_optional_float(g.get('theta'))
+            best={'symbol':under,'contract':contract,'signal':n['option_type'],'expiration':n['expiration'],'dte':dte,'strike':n['strike'],'premium':prem,'bid':bid,'ask':ask,'delta':delta,'theta':theta,'iv':iv,'volume':_optional_int((snap.get('dailyBar') or {}).get('v')) or 0,'open_interest':_optional_int(n['details'].get('open_interest')) or 0,'spread_pct':round((ask-bid)/max((ask+bid)/2,1e-9)*100,1) if bid and ask and ask>=bid else None,'score':45.0,'tier':None,'reasons':['Exact contract identified; technical/quality score below WATCH or data incomplete.']}
+        best['market']=market_context; best['underlying_price']=m['5m']['last']; best['support']=m['recent_low']; best['resistance']=m['recent_high']; best['trend_4h']=_trend_from_frame(m['4h']); best['trend_1h']=_trend_from_frame(m['1h']); best['volume_ratio']=m['volume_ratio']; best['expected_move_pct']=m.get('expected_move_pct'); best['gap_pct']=m.get('gap_pct')
+        return {'ok':True,'result':best}
+    except Exception as e:
+        return {'ok':False,'error':f'{type(e).__name__}: {e}','symbol':under,'requested':query}
+
 
 def scan_all(session):
     if not headers():
@@ -1189,11 +1382,13 @@ def scan_all(session):
                 target_cache[sym]=agg
 
     progress('fetching_bars_complete', symbols=len(symbols), completed=completed)
+    market_ctx=market_context_from_caches(caches)
+    progress('market_analysis', bias=market_ctx.get('bias'), breadth=market_ctx.get('breadth'), vix=market_ctx.get('vix'))
     progress('underlying_scan', symbols=symbols)
 
     def _scan_one(sym):
         try:
-            r,d=scan_underlying(sym,session,caches=caches)
+            r,d=scan_underlying(sym,session,caches=caches,market_context=market_ctx)
             return sym,r,d,None
         except Exception as e:
             return sym,[],{'error':f'{type(e).__name__}: {e}','provider':'Alpaca',
@@ -1230,8 +1425,8 @@ def scan_all(session):
         try:
             progress('underlying_scan', symbol=root, state='started', proxy=proxy, option_underlying=option_symbol)
             proxy_caches = {k: dict(v or {}) for k, v in caches.items()}
-            r, d = scan_underlying(proxy, session, contract_prefix=root, caches=proxy_caches,
-                                   option_underlying=option_symbol)
+            r, d = scan_underlying(proxy, session, contract_prefix=root if root=='SPXW' else None, caches=proxy_caches,
+                                   option_underlying=option_symbol, market_context=market_ctx)
             for x in r:
                 x['symbol'] = root
                 x['indicator_proxy'] = proxy
@@ -1350,7 +1545,7 @@ def scan_all(session):
         'heroes':heroes,'strong':strongs,'watch':watchs,'moonshots':sum(1 for x in results if x.get('moonshot')),'top_candidates':top_candidates,
         'candidate_pool_size':len(top_candidates),'rejections':aggregate_rej,
         'counters':counters,'no_setup_reasons':list(dict.fromkeys(no_setup))[:10],
-        'provider':provider_status()
+        'provider':provider_status(),'market':market_ctx
     }
     if not results:
         meta['zero_candidate_diagnostics']={
@@ -1377,15 +1572,16 @@ def scan_all(session):
     return results,diagnostics
 
 def options_data_mode():
-    feed=str(os.getenv('ALPACA_OPTIONS_FEED','indicative')).strip().lower()
+    feed=str(os.getenv('ALPACA_OPTIONS_FEED','opra')).strip().lower()
     return {'opra':'LIVE','live':'LIVE','delayed':'DELAYED','indicative':'INDICATIVE'}.get(feed,'UNKNOWN')
 
 def provider_status():
-    feed=os.getenv('ALPACA_OPTIONS_FEED','indicative')
+    feed=os.getenv('ALPACA_OPTIONS_FEED','opra')
     mode=str(feed).lower()
     return {'name':'Alpaca','configured':bool(os.getenv('ALPACA_API_KEY') and os.getenv('ALPACA_API_SECRET')),
             'options_feed':feed,'effective_fallback':'indicative' if feed.lower()=='opra' else feed,
-            'underlying_feed':'iex','data_mode':options_data_mode(),
-            'note':'OPRA is attempted first; if the account/feed rejects it, the scanner can fall back to indicative discovery.' if feed.lower()=='opra' else
-                  ('Free Alpaca options data may be delayed/indicative; IEX equity feed is real-time.' if mode in ('indicative','delayed','snapshot')
+            'underlying_feed':os.getenv('ALPACA_UNDERLYING_FEED','iex'),'data_mode':options_data_mode(),
+            'index_options':{'SPXW':'supported_under_SPX','NDX':'not_currently_supported_at_Alpaca_index_options_offering'},
+            'note':'OPRA is attempted first; if the account/feed rejects it, the scanner falls back to indicative discovery. SPXW is requested under SPX; NDX is reported as provider-unsupported and uses QQQ only as a technical proxy.' if feed.lower()=='opra' else
+                  ('Options data may be delayed/indicative; underlying feed is IEX.' if mode in ('indicative','delayed','snapshot')
                    else 'Options feed mode is configured explicitly; verify entitlement before treating it as real-time.') }

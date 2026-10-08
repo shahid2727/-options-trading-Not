@@ -1,0 +1,19 @@
+V15.0.0
+
+Full scanner/analyzer rebuild from the supplied V14.8.2 project.
+
+1. SPXW is queried under SPX with root_symbol=SPXW and SPY is used only for technical context.
+2. NDX is attempted as a real index option underlier; when Alpaca rejects/does not expose it, the bot reports the provider limitation and uses QQQ only as a technical proxy.
+3. Option-chain pagination follows next_page_token with bounded page/deadline safeguards and early expiration/strike/type filters.
+4. OPRA is preferred and indicative is a controlled fallback.
+5. Missing Greeks/volume/OI are retained as N/A/neutral where possible; unusable quotes remain in diagnostics.
+6. Premium band is $0.20-$5.00 for alert candidates.
+7. Scoring was rebuilt to a 0-100 multi-factor model. HERO requires independent confirmation and cannot be produced by score alone.
+8. MOONSHOT requires momentum, RVOL, liquidity, spread, score and near-term conditions; cheap premium alone is insufficient.
+9. /analyze now performs on-demand underlying analysis for tickers/company names outside the scan universe, including BE/Bloom Energy.
+10. /contract recognizes OCC symbols and shorthand forms such as SPXW 7760C and NVDA 200C.
+11. Market context uses SPY/QQQ/IWM breadth plus optional VIX/VIXY proxy and is incorporated into ranking.
+12. Telegram polling remains independent from scanner execution; /status is non-blocking and reports real errors.
+13. Parallel scans no longer use a shared mutable multi-timeframe cache pointer.
+14. Manual scans are allowed when CLOSED for diagnostics; scheduled scans still honor phase enablement.
+15. Bot remains alert-only and contains no brokerage execution path.

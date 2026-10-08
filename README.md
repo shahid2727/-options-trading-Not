@@ -1,55 +1,58 @@
-# Options Opportunity Bot V14
+# Options Opportunity Bot V15.0.0
 
-SPXW final fix: technical indicators use SPY IEX bars while the real SPXW option chain is fetched from Alpaca under the SPX options root. SPXW failures are isolated from other symbols.
+Alert-only Telegram Options Scanner / Analyzer. **No brokerage order execution is implemented.**
 
-Includes Entry Low, Entry Zone, Stop Loss, TP1/TP2/TP3, suggested contracts, and profit targets in alerts.
+## What was rebuilt
 
-Run with the existing Docker/Render configuration and environment variables. Do not commit API keys or Telegram tokens.
+- Full multi-symbol scanner for SPY, QQQ, IWM, NVDA, AMD, TSLA, AAPL, AMZN, META, MSFT, GOOGL, MU, AVGO, PLTR and SMCI.
+- SPXW handled as an index-option chain under the SPX underlier, with SPY used only for technical context.
+- NDX/Nasdaq is detected and reported honestly when the provider does not expose NDX index options; QQQ remains the technical proxy. No fake NDX contracts are generated.
+- Options-chain pagination follows `next_page_token` and is bounded by an overall timeout/page safety limit. Early strike, expiration and type filters reduce unnecessary pages.
+- OPRA is preferred when configured; indicative data is a bounded fallback when the account/feed rejects OPRA.
+- Trading-API contract discovery is an optional fallback when market-data chain discovery fails.
+- Quote handling: Bid/Ask mid first, recent Last fallback, quote source/timestamp/age/status retained.
+- Missing Greeks, volume or OI are treated as N/A/neutral where possible; contracts without a usable quote remain visible in diagnostics instead of silently disappearing.
+- Premium display/alert band is $0.20–$5.00.
+- Composite 0–100 score uses direction, market alignment, momentum, trend, volume/RVOL, spread, OI, contract volume, delta, IV, DTE, premium, technical levels, gap/expected-move context and regime/conflict penalties.
+- HERO is independently gated; a high raw score alone cannot create HERO.
+- MOONSHOT requires multiple simultaneous conditions and cannot qualify only because the option is cheap.
+- On-demand `/analyze` works for tickers/company names outside the scanner universe, e.g. `BE`, `Bloom Energy`, `TSLA`, `NVIDIA`.
+- On-demand contract recognition supports OCC symbols and shorthand such as `SPXW 7760C`, `NVDA 200C`, and `NVDA 2026-10-15 200C`.
+- `/status` remains non-blocking while the scanner runs and exposes real provider/worker errors.
+- Telegram polling is independent from scanner execution.
+- One symbol/provider failure cannot terminate the complete scan.
+- Multi-timeframe cache access is thread-safe; no shared mutable cache pointer is used during parallel symbol scans.
+- Manual `/scan` is allowed outside market hours for diagnostics; automatic scheduling still respects the phase settings.
 
+## Commands
 
-V10.5 fixes Alpaca SPXW discovery by using the option-chain root_symbol=SPXW filter under the SPX underlier, rather than relying on contract-string prefixes. /status now exposes Prefix and BadContract rejection counts.
+`/start` `/help` `/status` `/scan` `/top` `/hero` `/heroes` `/moonshot` `/watchlist` `/analyze TICKER_OR_COMPANY` `/contract CONTRACT` `/watch CONTRACT` `/unwatch CONTRACT` `/clearwatch` `/diagnostics`
 
+Examples:
 
-### V13.3 chain recovery
-The scanner first uses Alpaca market-data option chains. If that request fails, it can fall back to Alpaca option-contract discovery followed by batched snapshots. Set `OPTIONS_CHAIN_FALLBACK=true`. `ALPACA_TRADING_BASE_URL` should match the account environment (paper or live).
+- `/analyze BE`
+- `/analyze Bloom Energy`
+- `/analyze NVDA`
+- `/contract SPXW 7760C`
+- `/contract NVDA 200C`
+- `/contract NVDA 2026-10-15 200C`
+- `/contract NVDA261015C00200000`
 
-## V13.4 Explosive Momentum Detector
-The scanner now separately scores high-momentum option setups using multi-timeframe alignment, breakouts, volume expansion, price acceleration, delta sensitivity, liquidity and near-term expiry. `explosive_score` is a setup-detection score, not a guarantee of profit. Alerts prioritize explosive setups first.
+## Render
 
+The included Dockerfile runs `python bot.py` on Render's `PORT` (default 10000). Set the environment variables from `.env.example` in Render. Do not commit secrets.
 
-## V13.5 fixes
-- OPRA -> indicative fallback when the configured options feed is rejected.
-- More detailed provider/HTTP diagnostics in `/status`.
-- One market-close HERO alert per trading day when a candidate exists.
+Important provider settings:
 
+- `ALPACA_OPTIONS_FEED=opra` (falls back to `indicative` if enabled and OPRA is unavailable)
+- `ALPACA_UNDERLYING_FEED=iex` by default; change only if your Alpaca subscription supports another underlying feed.
+- `OPTIONS_CHAIN_FALLBACK=true`
+- `ALPACA_TRADING_BASE_URL` must match the account environment if contract-discovery fallback is used.
 
-## V14 setup engine
-- Preserves the existing Alpaca/OPRA/IEX scanner, Telegram polling, worker timeout, SPXW proxy-chain architecture, caching, and alert-only risk controls.
-- Separates hard contract/quote safety filters from soft setup factors.
-- Premium, 4H alignment, regime, RSI, VWAP, volume, momentum and score are soft factors unless an explicit safety setting is enabled.
-- Adds explainable `HERO`, `STRONG`, and `WATCH` tiers with configurable thresholds.
-- Scores underlying direction once per symbol and reuses the indicators across its option chain.
-- CALLs and PUTs are directionally evaluated independently; SPXW uses separate weighting while using SPY IEX bars as its technical proxy and the real SPX option chain.
-- Adds per-symbol rejection/tier diagnostics and scan-wide no-setup reasons.
-- Alert cooldown is `symbol + direction + contract`; `MAX_ALERTS_PER_SCAN=5` prioritizes HERO, then STRONG, then WATCH.
-- End-of-day can send up to three HERO setups, including SPXW.
-- Quote validation rejects zero/invalid bid/ask and explicit stale quotes; missing timestamps are not treated as stale unless `REQUIRE_QUOTE_TIMESTAMP=true`.
-- Entry/stop/target levels are model-derived from current bid/ask and available ATR. When the required volatility data is unavailable, the alert reports the target as unavailable instead of inventing a number.
-- The bot never places brokerage orders.
+## Provider limitation: NDX
 
-## V14 pipeline validation
-V14 separates chain receipt, contract normalization, quote-stage validation, and scoring. Set `DEBUG_SCANNER=true`, `DEBUG_SAMPLE=true`, or `DEBUG_BYPASS_SCORING=true` to diagnose data flow without changing production scoring thresholds.
+Alpaca's current index-options documentation lists SPX/SPXW support but does not list NDX/NQX as supported index-option products. The bot therefore attempts the configured provider path, records the actual provider error, and uses QQQ only as a technical proxy rather than fabricating NDX contracts.
 
+## Safety
 
-## V14.2 reconciliation fix
-- Final scan counters and HERO/STRONG/WATCH totals are recomputed from actual result rows and per-symbol diagnostics.
-- Prevents a state/aggregation mismatch where candidates existed but summary counters displayed zero.
-
-
-V14.8: bounded options-feed retries, batch sizing, per-request timeout, overall chain deadline, partial-batch fallback, and feed telemetry. Scoring thresholds unchanged.
-
-## V14.8.2 reviewed fixes
-- Improved Telegram analysis parsing for Arabic requests such as `حلل شركة تسلا` and `تحليل ناسداك`, as well as plain ticker/company-name requests.
-- Added common company-name aliases (Tesla, Apple, NVIDIA, Amazon, etc.) and index aliases (NASDAQ/NDX, S&P 500/SPXW).
-- Analysis searches both scored candidates and diagnostic candidates from the latest scan, reducing false `Contract not found` responses.
-- Kept SPXW and NDX index-chain scanning enabled by default (`INDEX_ROOTS=SPXW,NDX`). Actual availability still depends on Alpaca credentials, feed entitlements, and returned market data; check `/diagnostics` for provider errors.
+This project analyzes and alerts only. It does not submit, modify, cancel or execute brokerage orders. Model-derived Entry/TP/SL levels are not guaranteed fills or outcomes.

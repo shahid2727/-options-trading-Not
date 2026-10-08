@@ -2,7 +2,7 @@ import os, threading, time, uuid, multiprocessing, re
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request
-from scanner import scan_all, provider_status, set_progress_callback
+from scanner import scan_all, provider_status, set_progress_callback, resolve_underlying, analyze_underlying, analyze_contract_query, market_context_from_caches
 from telegram_bot import send_message, get_updates, diagnostics as telegram_diagnostics, mark_polling_running
 
 app = Flask(__name__)
@@ -14,7 +14,7 @@ state = {
     'scan_running': False, 'scan_started': None, 'scan_finished': None,
     'scan_duration': None, 'scan_stage': 'idle', 'scan_stage_started': None, 'scan_stage_elapsed': None, 'fetching_page': 0, 'fetching_page_started': None, 'symbols_scanned': 0, 'contracts_scanned': 0, 'valid_contracts': 0, 'contracts_scored': 0,
     'last_top': [], 'diagnostics': {}, 'last_alert_keys': {}, 'weak_alert_keys': {}, 'alert_snapshots': {}, 'market_warning_sent': None,
-    'provider_errors': [], 'scan_process_pid': None, 'fetching_timeframe': None, 'fetching_completed': 0, 'fetching_total': 4, 'fetching_state': None, 'alert_diagnostics': {'candidates': []}, 'hero_sent_date': None
+    'provider_errors': [], 'scan_process_pid': None, 'market_context': {}, 'watchlist': {}, 'scan_started_monotonic': None, 'fetching_timeframe': None, 'fetching_completed': 0, 'fetching_total': 4, 'fetching_state': None, 'alert_diagnostics': {'candidates': []}, 'hero_sent_date': None
 }
 
 
@@ -22,17 +22,17 @@ def phase():
     n = datetime.now(TZ); t = n.time()
     if n.weekday() >= 5: return 'CLOSED'
     if dtime(4,0) <= t < dtime(9,30): return 'PRE_MARKET'
-    if dtime(9,30) <= t < dtime(16,0): return 'REGULAR'
+    if dtime(9,30) <= t < dtime(16,0): return 'OPEN'
     if dtime(16,0) <= t < dtime(20,0): return 'AFTER_HOURS'
     return 'CLOSED'
 
 
 def phase_label(p):
-    return {'PRE_MARKET':'🌅 PRE-MARKET','REGULAR':'🟢 REGULAR','AFTER_HOURS':'🌙 AFTER-HOURS','CLOSED':'⚪ CLOSED'}.get(p,p)
+    return {'PRE_MARKET':'🌅 PRE-MARKET','OPEN':'🟢 OPEN','REGULAR':'🟢 OPEN','AFTER_HOURS':'🌙 AFTER-HOURS','CLOSED':'⚪ CLOSED'}.get(p,p)
 
 
 def allowed(p):
-    env = {'PRE_MARKET':'PREMARKET_ENABLED','REGULAR':'REGULAR_ENABLED','AFTER_HOURS':'AFTERHOURS_ENABLED'}.get(p)
+    env = {'PRE_MARKET':'PREMARKET_ENABLED','OPEN':'REGULAR_ENABLED','REGULAR':'REGULAR_ENABLED','AFTER_HOURS':'AFTERHOURS_ENABLED','CLOSED':None}.get(p)
     return bool(env and os.getenv(env, 'false').lower() == 'true')
 
 
@@ -52,54 +52,34 @@ def points_text(target, entry):
 
 
 def format_alert(x):
-    tier=x.get('tier','STRONG')
-    badge={'HERO':'🏆 HERO SETUP','STRONG':'🟢 STRONG SETUP','WATCH':'🟡 WATCH','MOONSHOT':'🚀 MOONSHOT OPPORTUNITY'}.get(tier,'🔎 TOP CANDIDATE')
-    if x.get('moonshot'): badge += ' 🚀 MOONSHOT'
-    def money(v):
-        return f"${float(v):.2f}" if isinstance(v,(int,float)) else "—"
-    reasons=x.get('reasons') or []
-    spread=x.get('spread_pct')
-    spread_text=f"{float(spread):.1f}%" if spread is not None else "—"
-    risk=[]
-    if spread is not None and float(spread)>25: risk.append('Wide spread vs preferred threshold')
-    if x.get('volume',0)<5 and x.get('open_interest',0)<10: risk.append('Low option liquidity')
-    if x.get('trend_4h')=='NEUTRAL': risk.append('4H neutral')
-    if x.get('market_regime') in ('SIDEWAYS','CHOPPY'): risk.append(f"{x.get('market_regime')} regime")
-    if x.get('quote_is_stale'): risk.append('Quote is stale')
-    if not risk: risk.append('No major model risk flag')
-    return (
-        f"{badge}\n\n"
-        f"Underlying: {x.get('symbol','—')}\n"
-        f"Contract: {x.get('contract','—')}\n"
-        f"Direction: {x.get('signal','—')}\n"
-        f"Strike: {money(x.get('strike'))}\n"
-        f"Expiration/DTE: {x.get('dte','—')}\n\n"
-        f"Entry: {money(x.get('entry'))}\n"
-        f"Current: {money(x.get('premium'))}\n"
-        f"Bid: {money(x.get('bid'))} | Ask: {money(x.get('ask'))}\n"
-        f"Spread: {spread_text}\n"
-        f"Volume: {x.get('volume',0)} | OI: {x.get('open_interest',0)} | DTE: {x.get('dte','—')}\n\n"
-        f"Score: {float(x.get('score',0) or 0):.0f}/100 | Setup: {tier or 'BELOW_WATCH'}\n"
-        f"Liquidity: {x.get('score_components',{}).get('volume_oi','—')}\n"
-        f"Momentum: {x.get('score_components',{}).get('momentum','—')}\n"
-        f"Trend: {x.get('score_components',{}).get('trend','—')}\n"
-        f"Technical: {x.get('score_components',{}).get('price_action','—')}\n"
-        f"Options: {x.get('score_components',{}).get('options_activity','—')}\n\n"
-        f"🎯 TARGETS\nTP1: {money(x.get('tp1'))}\nTP2: {money(x.get('tp2'))}\nTP3: {money(x.get('tp3'))}\n\n"
-        f"🛑 STOP: {money(x.get('stop_loss'))}\n"
-        f"Risk/Reward: {x.get('risk_reward','—')}\n"
-        f"Expected Profit %: {x.get('expected_profit_pct','—')}\n"
-        f"Expected Loss %: {x.get('expected_loss_pct','—')}\n"
-        f"📈 Expected Move: {x.get('projected_upside_pct','—')}%\n\n"
-        f"🔥 Reasons:\n• " + "\n• ".join(reasons[:8] or ['—']) + "\n\n"
-        f"🚀 MOONSHOT MODEL: {'YES' if x.get('moonshot') else 'NO'}\n"
-        f"Moonshot flags: {', '.join(x.get('moonshot_flags',[])[:6]) or '—'}\n\n"
-        f"Risk flags:\n• " + "\n• ".join(risk) + "\n\n"
-        f"Quote source: {x.get('quote_source','—')}\n"
-        f"Quote age: {x.get('quote_age_sec','—')} sec\n"
-        f"Data mode: {x.get('data_mode','—')}\n"
-        f"⚠️ Analysis + alerts only. No brokerage execution. No guaranteed profit."
-    )
+    tier=str(x.get('tier') or 'WATCH').upper()
+    badge={'HERO':'🔥 HERO','STRONG':'🟢 STRONG','WATCH':'🟡 WATCH','MOONSHOT':'🚀 MOONSHOT'}.get(tier,'🔎 SETUP')
+    def v(name, default='—'):
+        value=x.get(name,default)
+        return default if value is None or value=='' else value
+    def money(value):
+        try: return f"${float(value):.2f}"
+        except Exception: return '—'
+    reasons=(x.get('reasons') or [])[:3]
+    invalid=[]
+    if x.get('market_bias') in ('BULLISH','BEARISH') and ((x.get('market_bias')=='BULLISH') != (x.get('signal')=='CALL')): invalid.append('Market bias changes against the setup.')
+    if x.get('breakout') in ('UP','DOWN') and ((x.get('breakout')=='UP') != (x.get('signal')=='CALL')): invalid.append('Breakout direction reverses.')
+    if x.get('quote_is_stale'): invalid.append('Quote becomes stale; recheck before entry.')
+    if not invalid: invalid.append('Underlying thesis/technical direction invalidates the setup.')
+    expected=x.get('expected_profit_pct')
+    rr=x.get('risk_reward')
+    return (f"{badge}\n\n"
+            f"Ticker: {v('symbol')}\nContract: {v('contract')}\nCALL/PUT: {v('signal')}\nExpiration: {v('expiration')}\nDTE: {v('dte')}\n\n"
+            f"Entry: {money(v('entry'))}\nTP1: {money(v('tp1'))}\nTP2: {money(v('tp2'))}\nSL: {money(v('stop_loss'))}\n\n"
+            f"Premium: {money(v('premium'))}\nDelta: {v('delta')}\nTheta: {v('theta')}\nIV: {v('iv')}\nIV Rank: {v('iv_rank')}\n"
+            f"Volume: {v('volume',0)}\nOI: {v('open_interest',0)}\nRVOL: {v('volume_ratio')}\nSpread: {v('spread_pct')}%\n\n"
+            f"Score: {float(x.get('score',0) or 0):.0f}/100\nConfidence: {v('confidence')}%\nRisk/Reward: {v('risk_reward')}\nExpected Gain: {expected if expected is not None else '—'}%\n\n"
+            f"WHY:\n• {reasons[0] if len(reasons)>0 else 'Multi-factor setup'}\n• {reasons[1] if len(reasons)>1 else 'Technical/options confirmation'}\n• {reasons[2] if len(reasons)>2 else 'Risk/liquidity within model limits'}\n\n"
+            f"INVALIDATION:\n• {'\n• '.join(invalid)}\n\n"
+            f"Market: {v('market_bias')} | Regime: {v('market_regime')} | Underlying trend: {v('trend_4h')}\n"
+            f"Support/Resistance: {v('support')} / {v('resistance')}\n"
+            f"Quote: {v('quote_status')} ({v('quote_source')}, age {v('quote_age_sec')}s)\n\n"
+            f"⚠️ Alert + analysis only. No brokerage execution and no guaranteed outcome.")
 
 def market_warning(diagnostics):
     regs=[d.get('market_regime') for d in diagnostics.values() if isinstance(d,dict) and d.get('market_regime')]
@@ -378,7 +358,7 @@ def _finalize_scan(p, scan_id, results, diagnostics, started_at, error=None):
         state.update(
             last_scan=now.isoformat(), last_candidates=len(results), last_alerts=alerts,
             last_error=error, last_session=p, scan_id=scan_id, scan_running=False,
-            scan_finished=now.isoformat(), scan_duration=round(duration,2),
+            scan_finished=now.isoformat(), scan_duration=round(duration,2), scan_started_monotonic=None,
             scan_stage='complete' if error is None else 'failed',
             last_top=(meta.get('top_candidates') or ordered[:10]), diagnostics=diagnostics or {},
             alert_diagnostics=alert_diag,
@@ -386,7 +366,7 @@ def _finalize_scan(p, scan_id, results, diagnostics, started_at, error=None):
             contracts_scanned=meta.get('contracts_scanned',state.get('contracts_scanned',0)),
             valid_contracts=meta.get('valid_contracts',state.get('valid_contracts',0)),
             contracts_scored=meta.get('contracts_scored',state.get('contracts_scored',0)),
-            provider_errors=provider_errors, scan_process_pid=None
+            provider_errors=provider_errors, scan_process_pid=None, market_context=meta.get('market') or {}
         )
 
 def _watch_scan(proc, conn, p, scan_id, started_at):
@@ -431,12 +411,14 @@ def _watch_scan(proc, conn, p, scan_id, started_at):
 
 
 def start_scan(p):
-    if p == 'CLOSED': return None, False
+    # Manual scans are allowed outside market hours so the bot can inspect
+    # chains/diagnostics; the scheduler still respects phase enablement.
+    if not p: p='CLOSED'
     with lock:
         if state['scan_running']: return None, False
         scan_id=uuid.uuid4().hex[:10]; started=datetime.now(TZ).isoformat()
-        state.update(scan_running=True, scan_id=scan_id, scan_started=started, scan_finished=None,
-                     scan_duration=None, scan_stage='starting', last_error=None, last_session=p,
+        state.update(scan_running=True, scan_id=scan_id, scan_started=started, scan_started_monotonic=time.monotonic(), scan_finished=None,
+                     scan_duration=None, scan_stage='starting', scan_stage_started=started, scan_stage_elapsed=0.0, last_error=None, last_session=p,
                      symbols_scanned=0, contracts_scanned=0, valid_contracts=0, contracts_scored=0, provider_errors=[], fetching_timeframe=None,
                      fetching_completed=0, fetching_total=4, fetching_state=None, last_candidates=0, hero_count=0, strong_count=0, watch_count=0, moonshot_count=0)
     ctx=multiprocessing.get_context('fork' if 'fork' in multiprocessing.get_all_start_methods() else 'spawn')
@@ -469,6 +451,11 @@ def _status_text():
     meta=meta if isinstance(meta,dict) else {}
     c=meta.get('counters') or {}
     diagnostic_top=list(meta.get('diagnostic_top_candidates') or meta.get('top_candidates') or s.get('last_top') or [])
+    live_stage_elapsed=s.get('scan_stage_elapsed')
+    if s.get('scan_running') and s.get('scan_stage_started'):
+        try: live_stage_elapsed=round((datetime.now(TZ)-datetime.fromisoformat(s['scan_stage_started'])).total_seconds(),1)
+        except Exception: pass
+    market=s.get('market_context') or meta.get('market') or {}
     lines=[
         "🟢 BOT STATUS",
         f"Phase: {phase_label(phase())}",
@@ -476,7 +463,7 @@ def _status_text():
         f"Running: {s.get('running',False)}",
         f"Scan running: {s.get('scan_running',False)}",
         f"Scan stage: {s.get('scan_stage') or '—'}",
-        f"Stage elapsed: {s.get('scan_stage_elapsed') if s.get('scan_stage_elapsed') is not None else '—'} s",
+        f"Stage elapsed: {live_stage_elapsed if live_stage_elapsed is not None else '—'} s",
         f"Bars page: {s.get('fetching_page') or '—'}",
         f"Scan ID: {s.get('scan_id') or '—'}",
         f"Symbols scanned: {meta.get('symbols_scanned',s.get('symbols_scanned',0)) or 0}",
@@ -498,6 +485,7 @@ def _status_text():
         f"Telegram polling: {bool(td.get('telegram_running'))}",
         f"Telegram last update: {td.get('telegram_last_update') if td.get('telegram_last_update') is not None else '—'}",
         f"Telegram last error: {td.get('telegram_last_error') or '—'}",
+        f"Market bias: {market.get('bias','—')} | Breadth: {market.get('breadth','—')} | VIX: {market.get('vix','—')}",
     ]
     if diagnostic_top:
         lines += ["", "🎯 TOP CANDIDATE DIAGNOSTICS"]
@@ -511,7 +499,7 @@ def _status_text():
                 f"{i}. {x.get('symbol','—')} {x.get('contract','—')} | {x.get('tier') or 'BELOW_WATCH'} | Score {sc:.1f}"
             )
             lines.append(
-                f"   Gap STRONG: {gap_s if gap_s is not None else max(0, float(os.getenv('STRONG_SCORE','70'))-sc):.1f} | Gap HERO: {gap_h if gap_h is not None else max(0, float(os.getenv('HERO_SCORE','85'))-sc):.1f} | DTE {x.get('dte','—')} | Premium ${x.get('premium','—')}"
+                f"   Gap STRONG: {gap_s if gap_s is not None else max(0, float(os.getenv('STRONG_SCORE','80'))-sc):.1f} | Gap HERO: {gap_h if gap_h is not None else max(0, float(os.getenv('HERO_SCORE','90'))-sc):.1f} | DTE {x.get('dte','—')} | Premium ${x.get('premium','—')}"
             )
             lines.append(
                 f"   Dir {x.get('direction_evidence',0)} / Opp {x.get('opposite_evidence',0)} | Exp {x.get('explosive_score','—')} | Spread {x.get('spread_pct','—')}% | Vol {x.get('volume',0)} | OI {x.get('open_interest',0)}"
@@ -641,71 +629,50 @@ def _diagnostics_text():
 
 
 def _find_setup(query):
-    """Find a scanned setup by OCC contract, ticker, or common company name."""
-    q = str(query or '').strip().upper()
-    aliases = {
-        'NASDAQ': 'NDX', 'NASDAQ 100': 'NDX', 'NASDAQ100': 'NDX', 'NDX': 'NDX',
-        'SPX': 'SPXW', 'SPXW': 'SPXW', 'S&P 500': 'SPXW', 'SP500': 'SPXW',
-        'TESLA': 'TSLA', 'تسلا': 'TSLA', 'APPLE': 'AAPL', 'ابل': 'AAPL', 'آبل': 'AAPL', 'AMAZON': 'AMZN', 'أمازون': 'AMZN', 'امازون': 'AMZN', 'NVIDIA': 'NVDA', 'انفيديا': 'NVDA', 'إنفيديا': 'NVDA',
-        'MICROSOFT': 'MSFT', 'مايكروسوفت': 'MSFT', 'GOOGLE': 'GOOGL', 'قوقل': 'GOOGL', 'جوجل': 'GOOGL', 'ALPHABET': 'GOOGL',
-        'META PLATFORMS': 'META', 'FACEBOOK': 'META', 'ميتا': 'META', 'فيسبوك': 'META', 'ADVANCED MICRO DEVICES': 'AMD',
-        'AMD': 'AMD', 'PALANTIR': 'PLTR', 'BROADCOM': 'AVGO', 'MICRON': 'MU',
-        'BLOOM ENERGY': 'BE', 'BE': 'BE', 'INTEL': 'INTC', 'NETFLIX': 'NFLX', 'QQQ': 'QQQ', 'SPY': 'SPY',
-        'RUSSELL 2000': 'IWM', 'IWM': 'IWM', 'ناسداك': 'NDX', 'ناسداك 100': 'NDX', 'ستاندرد اند بورز': 'SPXW'
-    }
-    q = aliases.get(q, q)
+    """Find an existing setup in the last scan without doing network I/O."""
+    q=resolve_underlying(query)
     with lock:
-        top = list(state.get('last_top') or [])
-        di = dict(state.get('diagnostics') or {})
-    pool = list(top)
-    meta = di.get('__meta__') if isinstance(di, dict) else {}
-    for source in (meta or {}).get('top_candidates') or [], (meta or {}).get('diagnostic_top_candidates') or []:
-        pool.extend(source)
-    seen, matches = set(), []
+        top=list(state.get('last_top') or []); di=dict(state.get('diagnostics') or {})
+    pool=list(top); meta=di.get('__meta__') if isinstance(di,dict) else {}
+    for source in ((meta or {}).get('top_candidates') or [], (meta or {}).get('diagnostic_top_candidates') or []): pool.extend(source)
+    seen=set(); matches=[]
     for item in pool:
-        key = str(item.get('contract', '')).upper()
-        sym = str(item.get('symbol', '')).upper()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        if q == key:
-            return item
-        if q == sym or (len(q) >= 2 and q in sym):
-            matches.append(item)
-    if matches:
-        matches.sort(key=lambda item: (float(item.get('score') or 0), float(item.get('explosive_score') or 0)), reverse=True)
-        return matches[0]
-    return None
+        key=str(item.get('contract','')).upper()
+        if not key or key in seen: continue
+        seen.add(key); sym=str(item.get('symbol','')).upper()
+        if q==key or q==sym or q in key: matches.append(item)
+    matches.sort(key=lambda x:(float(x.get('score') or 0),float(x.get('explosive_score') or 0)),reverse=True)
+    return matches[0] if matches else None
 
 
-def _analysis_text(x):
-    if not x: return "🔎 CONTRACT ANALYSIS\nContract not found in the latest scan. Use /top first or provide a contract that appeared in the latest scan."
-    entry=float(x.get('entry') or x.get('premium') or 0)
-    current=float(x.get('premium') or 0)
-    sl=float(x.get('stop_loss') or 0)
-    score=float(x.get('score') or 0)
-    explosive=float(x.get('explosive_score') or 0)
-    weak = bool(sl and current and current <= sl) or score < 50
-    change=((current/entry)-1)*100 if entry else 0
-    status='🔴 WEAK' if weak else ('🟡 WATCH' if score < 70 else '🟢 HEALTHY MODEL')
-    return (
-        f"🔎 CONTRACT ANALYSIS\n\n"
-        f"Contract: {x.get('contract','—')}\n"
-        f"Underlying: {x.get('symbol','—')} | {x.get('signal','—')}\n"
-        f"Status: {status}\n\n"
-        f"Entry: ${entry:.2f} | Current: ${current:.2f}\n"
-        f"Change from entry: {change:+.1f}%\n"
-        f"Stop Loss: ${sl:.2f}\n"
-        f"Score: {score:.0f}/100\n"
-        f"Explosive score: {explosive:.0f}/100\n"
-        f"Tier: {x.get('tier') or 'BELOW_WATCH'}\n"
-        f"Moonshot: {'🚀 YES' if x.get('moonshot') else 'NO'}\n\n"
-        f"4H/1H/15M/5M: {x.get('trend_4h','—')} / {x.get('trend_1h','—')} / {x.get('trend_15m','—')} / {x.get('trend_5m','—')}\n"
-        f"Volume ratio: {x.get('volume_ratio','—')} | Volume: {x.get('volume',0)} | OI: {x.get('open_interest',0)}\n"
-        f"Spread: {x.get('spread_pct','—')}%\n\n"
-        f"Reasons:\n• " + "\n• ".join((x.get('reasons') or [])[:8] or ['—']) +
-        "\n\n⚠️ Model analysis only; current quote must be rechecked before trading."
-    )
+def _company_analysis_text(data):
+    if not data: return '❌ Analysis unavailable.'
+    if data.get('error') and not data.get('candidates'): return f"❌ {data.get('error')}"
+    c=data.get('candidates') or []
+    lines=["🔎 UNDERLYING ANALYSIS", "", f"Ticker: {data.get('symbol','—')}", f"Price: ${float(data.get('underlying_price') or 0):.2f}",
+           f"Trend 4H/1H/15M/5M: {data.get('trend_4h','—')} / {data.get('trend_1h','—')} / {data.get('trend_15m','—')} / {data.get('trend_5m','—')}",
+           f"Momentum: {data.get('momentum','—')} | Call/Put bias: {data.get('call_put_bias','—')}", f"Support: {data.get('support','—')} | Resistance: {data.get('resistance','—')}",
+           f"RVOL: {data.get('volume_ratio','—')} | Gap: {data.get('gap_pct','—')}% | Expected move proxy: {data.get('expected_move_pct','—')}%",
+           f"Market: {(data.get('market') or {}).get('bias','—')} | Breadth: {(data.get('market') or {}).get('breadth','—')} | VIX: {(data.get('market') or {}).get('vix','—')}", ""]
+    if not c:
+        d=data.get('diagnostics') or {}
+        lines += ["No contract reached WATCH/STRONG/HERO.", f"Chain: {d.get('chain_items',0)} | Normalized: {d.get('normalized',0)} | Scored: {d.get('scored',0)}", f"Reason: {', '.join(d.get('no_setup_reasons') or ['No qualified setup'])}"]
+        return '\n'.join(lines)
+    lines.append("BEST CONTRACTS")
+    for i,x in enumerate(c[:3],1):
+        lines += [f"{i}. {x.get('tier') or 'BELOW_WATCH'} {x.get('contract')} {x.get('signal')} | Score {x.get('score','—')}",
+                  f"Entry {x.get('entry','—')} | TP1 {x.get('tp1','—')} | TP2 {x.get('tp2','—')} | SL {x.get('stop_loss','—')}",
+                  f"Delta {x.get('delta','—')} | Theta {x.get('theta','—')} | IV {x.get('iv','—')} | Vol {x.get('volume',0)} | OI {x.get('open_interest',0)} | Spread {x.get('spread_pct','—')}% | DTE {x.get('dte','—')}",
+                  f"Why: {', '.join((x.get('reasons') or [])[:3]) or '—'}", ""]
+    return '\n'.join(lines).strip()
+
+
+def _contract_analysis_text(data):
+    if not data: return '❌ Contract analysis unavailable.'
+    if data.get('unsupported'): return f"⚠️ {data.get('error')}\n\nTechnical proxy: {data.get('proxy','—')}"
+    if not data.get('ok'): return f"❌ {data.get('error','Contract not found')}"
+    x=data.get('result') or {}
+    return format_alert(x)
 
 def telegram_command_loop():
     offset=None; allowed_chat=str(os.getenv('TELEGRAM_CHAT_ID','')).strip(); mark_polling_running(True)
@@ -715,70 +682,68 @@ def telegram_command_loop():
                 updates=get_updates(offset=offset,timeout=20)
                 for u in updates:
                     offset=int(u.get('update_id',0))+1
-                    msg=u.get('message') or {}; chat=msg.get('chat') or {}; chat_id=str(chat.get('id','')).strip()
-                    if not chat_id: continue
-                    text=(msg.get('text') or '').strip()
-                    if not text: continue
-                    cmd=text.split()[0].split('@')[0].lower()
-                    # Accept natural-language analysis requests as well as slash commands.
-                    if not cmd.startswith('/'):
-                        lower = text.lower()
-                        intent_words = ('حلل', 'تحليل', 'analyze', 'analysis')
-                        if any(word in lower for word in intent_words):
-                            arg = text
-                            for word in intent_words:
-                                arg = re.sub(re.escape(word), ' ', arg, flags=re.IGNORECASE)
-                            arg = re.sub(r'\b(شركة|سهم|عقد|للشركة|عن|لي|من|فضلاً|لو|ممكن|ابي|أبي|ابغى|أبغى)\b', ' ', arg, flags=re.IGNORECASE).strip(' :،-')
-                            arg = re.sub(r'\s+', ' ', arg).strip()
-                            result = _find_setup(arg)
-                            send_message(_analysis_text(result) if result else f'لم أجد فرصة للرمز/الشركة: {arg or text}. تأكد من الرمز وشغّل /scan ثم أعد المحاولة.', chat_id)
-                            continue
-                        # Also accept a bare ticker or company name as a convenient analysis request.
-                        if _find_setup(text):
-                            send_message(_analysis_text(_find_setup(text)), chat_id)
-                            continue
+                    msg=u.get('message') or {}; chat=msg.get('chat') or {}; chat_id=str(chat.get('id','')).strip(); text=(msg.get('text') or '').strip()
+                    if not chat_id or not text: continue
+                    cmd=text.split()[0].split('@')[0].lower(); arg=text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1))>1 else ''
                     if cmd in ('/start','/help'):
-                        send_message('🤖 Options Opportunity Bot V14\n\nAlert-only options scanner.\n/start — start\n/help — help\n/status — diagnostics\n/scan — manual scan\n/top — top setups\n/heroes — HERO setups\n/watchlist — WATCH setups\n/diagnostics — rejection diagnostics\n/analyze CONTRACT — detailed contract analysis\n/analysis CONTRACT — same as /analyze',chat_id); continue
-                    if cmd=='/privacy':
-                        send_message('🔐 البوت Alert-only ولا ينفذ صفقات عبر وسيط.',chat_id); continue
-                    if not allowed_chat or chat_id != allowed_chat:
-                        continue
-                    if cmd=='/status':
-                        send_message(_status_text(),chat_id)
+                        send_message('🤖 Options Scanner — Alert-only\n\n/start /help /status /scan /top /hero /heroes /moonshot /watchlist /analyze TICKER|COMPANY /contract CONTRACT /diagnostics /watch CONTRACT /unwatch CONTRACT /clearwatch',chat_id); continue
+                    if not allowed_chat or chat_id != allowed_chat: continue
+                    if cmd=='/status': send_message(_status_text(),chat_id)
                     elif cmd=='/scan':
-                        p=phase(); sid,started=start_scan(p)
-                        send_message(f'🔎 Scan started\nPhase: {phase_label(p)}\nScan ID: {sid}' if started else f'⚠️ Scan already running\nScan ID: {state.get("scan_id")}',chat_id)
-                    elif cmd in ('/top','/heroes','/watchlist','/moonshots'):
-                        with lock: top=list(state.get('last_top') or [])
-                        if cmd=='/heroes':
-                            top=[x for x in top if x.get('tier')=='HERO']
+                        p=phase(); sid,started=start_scan(p); send_message(f'🔎 Scan started\nPhase: {phase_label(p)}\nScan ID: {sid}' if started else f'⚠️ Scan already running\nScan ID: {state.get("scan_id")}',chat_id)
+                    elif cmd=='/top': send_message(_top_text(10),chat_id)
+                    elif cmd in ('/hero','/heroes','/moonshot','/moonshots','/watchlist'):
+                        with lock: top=list(state.get('last_top') or []); watch=dict(state.get('watchlist') or {})
+                        if cmd in ('/hero','/heroes'): top=[x for x in top if x.get('tier')=='HERO']
+                        elif cmd in ('/moonshot','/moonshots'): top=[x for x in top if x.get('moonshot')]
                         elif cmd=='/watchlist':
-                            top=[x for x in top if x.get('tier')=='WATCH']
-                        elif cmd=='/moonshots':
-                            top=[x for x in top if x.get('moonshot')]
-                        if cmd=='/top':
-                            send_message(_top_text(10),chat_id)
-                        elif not top:
-                            send_message('ℹ️ لا توجد setups من هذا النوع في آخر scan.',chat_id)
+                            keys=set(watch); top=[x for x in top if x.get('contract') in keys]
+                        if not top: send_message('ℹ️ لا توجد نتائج لهذا الأمر في آخر scan.',chat_id)
                         else:
                             for x in top[:10]: send_message(format_alert(x),chat_id)
-                    elif cmd=='/diagnostics':
-                        send_message(_diagnostics_text(),chat_id)
+                    elif cmd=='/diagnostics': send_message(_diagnostics_text(),chat_id)
                     elif cmd in ('/analyze','/analysis'):
-                        arg=text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1))>1 else ''
-                        x=_find_setup(arg) if arg else None
-                        if not arg:
-                            send_message('استخدم: /analyze CONTRACT\nمثال: /analyze QQQ260923C00745000',chat_id)
+                        if not arg: send_message('استخدم: /analyze NVDA أو /analyze Tesla أو /analyze BE',chat_id); continue
+                        # First prefer a direct underlying analysis. If the user supplied a contract, use contract analysis.
+                        if _parse_contract_like(arg):
+                            data=analyze_contract_query(arg,phase())
+                            send_message(_contract_analysis_text(data),chat_id)
                         else:
-                            send_message(_analysis_text(x),chat_id)
+                            try: data=analyze_underlying(resolve_underlying(arg),phase())
+                            except Exception as e: data={'error':f'{type(e).__name__}: {e}'}
+                            send_message(_company_analysis_text(data),chat_id)
+                    elif cmd=='/contract':
+                        if not arg: send_message('استخدم: /contract SPXW 7760C أو /contract NVDA 200C أو /contract OCC_SYMBOL',chat_id); continue
+                        data=analyze_contract_query(arg,phase()); send_message(_contract_analysis_text(data),chat_id)
+                    elif cmd=='/watch':
+                        if not arg: send_message('استخدم: /watch CONTRACT',chat_id); continue
+                        with lock: state.setdefault('watchlist',{})[arg.upper()]=datetime.now(TZ).isoformat()
+                        send_message(f'👁️ Added to watchlist: {arg.upper()}',chat_id)
+                    elif cmd=='/unwatch':
+                        with lock: state.setdefault('watchlist',{}).pop(arg.upper(),None)
+                        send_message(f'👁️ Removed from watchlist: {arg.upper()}',chat_id)
+                    elif cmd=='/clearwatch':
+                        with lock: state['watchlist']={}
+                        send_message('👁️ Watchlist cleared.',chat_id)
                     else:
-                        send_message('الأوامر: /start /help /status /scan /top /heroes /watchlist /analyze CONTRACT /diagnostics',chat_id)
-            except Exception as e:
-                # Keep polling alive; the error is captured by telegram_bot diagnostics.
+                        # Natural language analysis
+                        lower=text.lower()
+                        if any(w in lower for w in ('حلل','تحليل','analyze','analysis')):
+                            cleaned=re.sub(r'(حلل|تحليل|analyze|analysis|شركة|سهم|عقد|للشركة|عن|لي|من|فضلاً|لو|ممكن|ابي|أبي|ابغى|أبغى)',' ',text,flags=re.I)
+                            cleaned=re.sub(r'\s+',' ',cleaned).strip(' :،-')
+                            try: data=analyze_contract_query(cleaned,phase()) if _parse_contract_like(cleaned) else analyze_underlying(resolve_underlying(cleaned),phase())
+                            except Exception as e: data={'error':f'{type(e).__name__}: {e}'}
+                            send_message(_contract_analysis_text(data) if _parse_contract_like(cleaned) else _company_analysis_text(data),chat_id)
+                        else: send_message('الأوامر: /status /scan /top /hero /moonshot /analyze TICKER /contract CONTRACT /watch /unwatch /clearwatch',chat_id)
+            except Exception:
                 time.sleep(2)
     finally:
         mark_polling_running(False)
 
+
+def _parse_contract_like(text):
+    q=str(text or '').strip().upper()
+    return bool(re.search(r'\b(?:SPXW|SPX|NDX|NDXP|[A-Z]{1,8})\s+(?:(?:\d{4}-\d{2}-\d{2}|\d{6})\s+)?\d+(?:\.\d+)?\s*[CP]\b',q) or re.search(r'[A-Z]{1,6}\d{6}[CP]\d{8}',q))
 
 def loop():
     interval=max(60,int(os.getenv('SCAN_INTERVAL_SECONDS','300')))
@@ -793,13 +758,13 @@ def loop():
         time.sleep(interval)
 
 @app.get('/')
-def root(): return jsonify({'service':'options-opportunity-bot','version':'14.4.0','status':'ok','docs':'/health','scan':'/scan','scan_status':'/scan/status'})
+def root(): return jsonify({'service':'options-opportunity-bot','version':'15.0.0','status':'ok','docs':'/health','scan':'/scan','scan_status':'/scan/status'})
 
 @app.get('/health')
 def health():
     with lock: s=dict(state)
     s['telegram_configured']=bool(os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID')); s['scan_secret_configured']=bool(os.getenv('SCAN_SECRET')); s['provider']=provider_status(); s['telegram']=telegram_diagnostics()
-    return jsonify({'service':'options-opportunity-bot','version':'14.4.0','status':'ok','phase':phase(),'scanner':s})
+    return jsonify({'service':'options-opportunity-bot','version':'15.0.0','status':'ok','phase':phase(),'scanner':s})
 
 @app.get('/status')
 def status(): return health()
